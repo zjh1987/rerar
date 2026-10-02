@@ -9,6 +9,10 @@
 //
 // 最后 3 条是控制方裁定后补齐的两个缺口（各一条用例 + 名字主干次序）：含空格的值必须整段成候选、
 // 紧贴形式（`解压密码123456`）必须与分隔形式一样被认出、名字主干必须排在标签值/URL 之后。
+//
+// 末尾 2 条是评审 I1 的回归：标签值里的半角 `,` / `;` 是**密码里的普通字符**，不能把值截断
+//（`解压密码：ab,cd` 必须产出 `ab,cd`），同时逗号后面的说明文字也不能把真值本身挤掉
+//（`解压密码：abc123, 请勿传播` 仍必须产出 `abc123`）。
 
 using System.Collections.Generic;
 using Rerar.Core;
@@ -92,5 +96,29 @@ internal sealed class PasswordCandidatesTests : TestBase
             AssertTrue(c.Contains("hello123"));
             AssertTrue(c.Contains("movie"));
             AssertTrue(c.IndexOf("movie") > c.IndexOf("hello123")); });
+
+        // 评审 I1：标签值里的半角 `,` / `;` 是密码里合法的字符，不是值的终点。旧行为把值截断成
+        // `my` / `ab`，真正的 `my, pass` / `ab,cd` 一条都不在清单里 —— 用户看着屏幕上的密码收到
+        // 「密码错误」，正是规格点名的最伤信任的一类消息。三种形状（含空格、紧贴、分号）都要整段在。
+        H.Run("Pwd.ClueKeepsValueWithHalfWidthCommaOrSemicolon", delegate {
+            List<string> spaced = new List<string>(PasswordCandidates.CluesFromTextFile("密码：my, pass"));
+            AssertTrue(spaced.Contains("my"));
+            AssertTrue(spaced.Contains("my, pass"));
+
+            List<string> comma = new List<string>(PasswordCandidates.CluesFromTextFile("解压密码：ab,cd"));
+            AssertTrue(comma.Contains("ab,cd"));
+
+            List<string> semicolon = new List<string>(PasswordCandidates.CluesFromTextFile("解压密码：ab;cd"));
+            AssertTrue(semicolon.Contains("ab;cd")); });
+
+        // 同一处改动的另一半（回归）：逗号后面的说明文字绝不能把 token 本身挤掉。
+        // 第二条特意**不留空格** —— 中文说明里半角逗号紧跟汉字很常见，而这一形状正是「把 `,`
+        // 从终止符集合里删掉」会弄丢 `abc123` 的地方（整段会取代它），所以修复必须走加法。
+        H.Run("Pwd.ClueKeepsTokenBeforeTrailingProse", delegate {
+            List<string> spacedProse = new List<string>(PasswordCandidates.CluesFromTextFile("解压密码：abc123, 请勿传播"));
+            AssertTrue(spacedProse.Contains("abc123"));
+
+            List<string> gluedProse = new List<string>(PasswordCandidates.CluesFromTextFile("密码:abc123,请勿外传"));
+            AssertTrue(gluedProse.Contains("abc123")); });
     }
 }
