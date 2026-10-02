@@ -34,6 +34,9 @@
 | V18 | **相对 `..` 穿越型软链目标在 26.01 上被遏制**：构造 `link -> ..\target` + 条目 `link\PWNED.txt`，7z `x` 返回 **exit 2**，目标目录零污染、既有文件未变。**但 7z 仍在输出目录内留下了那个 reparse point**。该遏制属**版本相关行为**，不可作为安全保证 | 【实测】 |
 | V19 | 本机**无需管理员即可创建符号链接**（Developer Mode 已启用）→ 软链向量在本环境是"活"的，不是纯理论 | 【实测】 |
 | V20 | 本机 `C:\Windows\System32\tar.exe` **不存在**（该 LTSC 版未含 bsdtar）；GNU tar 1.35 位于 `C:\Program Files\Git\usr\bin\tar.exe`，且 **MSYS tar 不接受 `C:\` 形式的绝对路径**（会被当作远端主机），必须用相对路径或 MSYS 路径 | 【实测】 |
+| V21 | **`DRIVE_REMOTE` 上 `SendToRecycleBin` 是"静默永久删除"**：`net use Z: \\localhost\C$`（`GetDriveType(Z:\)=4`）与 `\\localhost\C$\...`（`GetDriveType=4`）两种写法**都正常返回、不抛异常**，文件确实消失，而回收站计数不动（312→312）、按名核实不到。`GetDriveType` 对 UNC 一律给 `DRIVE_REMOTE(4)`，对不存在的盘符给 `DRIVE_NO_ROOT_DIR(1)`，对光驱给 `DRIVE_CDROM(5)` | 【实测·Task 9】 |
+| V22 | **超配额同样是"静默永久删除"**：一次性挂载的 64 MB NTFS 卷上 `MaxCapacity=2`(MB) + 8 MB 文件 → `DeleteFile` 正常返回、文件消失、计数不变、核实不到；随后 64 KB 文件仍能正常回收（回收站未被毒化，既有项未被清空）。全局计数只因两次成功回收 +2，用户既有 312 项分毫未动（测法与本机影响见第三节第 2 条） | 【实测·Task 9】 |
+| V23 | 本机 7 个 `BitBucket\Volume\{GUID}` 项 `NukeOnDelete` **全为 0**（无"删除时不回收"卷），配额为 3245/3276/7167/10534/12287/27647/54475 MB。**`$Recycle.Bin` 由外壳按需创建**：刚格式化并挂载的新卷可以在数秒内既无 `$Recycle.Bin` 也无 `BitBucket` 项。`GetVolumeNameForVolumeMountPoint("C:\")` 返回的 `{GUID}` 与注册表项名一一对应（转小写） | 【实测·Task 9】 |
 
 **推翻的审计结论（重要）**：打包审计断言"7z.exe 无 7z.dll 必然报 Can't load 7z.dll，故必须改用 7za.exe"。该结论对**旧版本**成立，对 7-Zip 26.01 **经实测不成立**（见 V10）。同时，另一审计称 `7za.exe` 不含 RAR —— 我们**不使用 7za.exe**，故该争议对本案无影响。仍建议同时嵌入 `7z.exe`+`7z.dll` 以消除版本差异风险。
 
@@ -174,14 +177,16 @@
 
 ## 三、必须在真机实测才能定论的行为（不可凭推理下结论）
 
-1. **映射网络盘 / UNC 上的回收站语义** —— `FileSystem.DeleteFile(..., SendToRecycleBin)` 是抛异常、失败，还是静默永久删除？
-2. **超过卷回收站配额时**，API 是抛异常还是静默永久删除？（本机已发现 3.2GB 小配额卷，值得直接构造大文件测试）
+1. ~~**映射网络盘 / UNC 上的回收站语义** —— `FileSystem.DeleteFile(..., SendToRecycleBin)` 是抛异常、失败，还是静默永久删除？~~ → **已实测结案（V21）**：在 `DRIVE_REMOTE` 上**不抛异常、不报失败，直接静默永久删除**（`net use Z: \\localhost\C$` 的映射盘写法与 `\\localhost\C$\...` 的 UNC 写法都一样：文件消失、回收站计数不变、按名核实不到）。限制：本机没有真实远端主机，用的是回环 SMB；该路径确实经 SMB 重定向器且 `GetDriveType=4`，但"远端主机自己的回收站会不会接住"**仍未验证（UNVERIFIED）**。对本案无影响 —— 本机回收站里核实不到就等于不可恢复。→ `RecycleBinGuard.Plan` 对 `DRIVE_REMOTE` 一律 `Refuse`，不依赖该未知项。
+2. ~~**超过卷回收站配额时**，API 是抛异常还是静默永久删除？（本机已发现 3.2GB 小配额卷，值得直接构造大文件测试）~~ → **已实测结案（V22）**：`DeleteFile` **正常返回、无异常**，文件被**静默永久删除**（回收站计数不变、按名核实不到）。测法刻意避开用户既有内容——不改用户卷的 `MaxCapacity`，而是临时挂载一个 64 MB 的一次性 NTFS 卷（VHD）并在其上设 `MaxCapacity=2` MB 再删 8 MB 文件；测完卸载并删除该 VHD 与其 `BitBucket` 项，用户 7 个卷项与回收站计数逐字节复原（证据见 task-9-report.md）。→ 删前查配额是硬要求，"删后 `VerifyInBin` 核实"是最后的诚实层。
 3. ~~**非提权 7z.exe 是否真的按 tar/zip 内的 symlink/hardlink 条目创建链接**，还是退化为普通文件？~~ → **已实测结案（V17/V18/V19）**：会创建 reparse point；相对穿越目标在 26.01 上被拒绝（exit 2）但链接本身留在输出树中。**hardlink 条目仍未实测**（手上无可靠构造手段）。
 4. **`-mcp=936` 是否影响解压出的文件名**（文档仅述其影响 ZIP 名代码页，未确认对 extract 的作用）。
 5. **7z.exe 内部 `\\?\` 处理**是否会让它成功写出 >260 路径，而我方 .NET 调用随后失败（V-F4 的不对称性）。
 6. **UAC VirtualStore 是否会重定向 7z.exe 的写入**（取决于二进制 manifest 与具体路径）。
 7. **`7za.exe` 是否真的不含 RAR**（本案不使用它，故仅作记录）。
 8. **本构建是否触发 Defender/360/火绒 启发式** —— 只能在真机矩阵上测，无法预先推断。
+9. **`NukeOnDelete=1`（"删除时不回收"）的卷上，回收站 API 的行为** → **本机不存在这种卷（V23：7 个 `BitBucket\Volume` 项全为 0）**，故真机语义无法观察。`RecycleBinGuard` 仍按"该卷不可回收 → 走隔离文件夹"实现该分支，并用一次性 `SetValue(NukeOnDelete,1)` + `finally` 复原 + 事后复核的方式**实测过本实现的行为**（`Plan` 返回 `Quarantine`、`Recycle` 返回 `false` 且文件原地未动、注册表复原成功）。**仍未验证**的是"外壳在 `NukeOnDelete=1` 下遇到删除请求到底怎么处理"，本实现不依赖它（直接在删前拦下）。
+10. **卷上还没有 `$Recycle.Bin` 时**（刚格式化/首次挂载的新卷：外壳**按需创建**该目录，实测新卷数秒内可同时没有 `$Recycle.Bin` 与 `BitBucket` 项，见 V23）→ 按 brief Step 3 判 `Refuse`（最保守：既不删也不动）。注意这与规格 §6.8"不满足 3/4 时提供隔离文件夹"存在张力：本卷内隔离其实可行，但 brief 明确写 `Refuse`，故从 brief；调用方（Task 12 的 UI）仍可自行提供隔离选项。`Plan` 的其余不确定输入（空/非法路径、盘符不存在、注册表项缺失）分别降级到 `Refuse` / 保守默认配额（1024 MB）+ `Quarantine`，**绝不降级到"照删"**。
 
 ---
 

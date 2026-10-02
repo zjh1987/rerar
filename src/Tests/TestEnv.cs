@@ -127,6 +127,85 @@ internal static class TestEnv
     }
 
     // ------------------------------------------------------------------
+    // 超配额夹具（Task 9 起）：一个「逻辑大小超过本卷回收站配额」的文件。
+    //
+    // 为什么不是真写一个大文件：本机临时目录所在卷（C:）的回收站配额是 3245 MB，真要造一个
+    // 超过它的普通文件就得实占 3 GB 以上磁盘。改用 NTFS **稀疏文件**：FSCTL_SET_SPARSE 之后
+    // SetEndOfFile 到 64 GiB —— FileInfo.Length（也就是 RecycleBinGuard.Plan 判定用的量）报的
+    // 是逻辑大小 64 GiB，而磁盘占用接近 0。对「体积 vs 配额」这个判定而言与真文件同形。
+    //
+    // brief 给的两种造法是「临时把 MaxCapacity 改小」或「如实跳过」。这里都不采用：改配额要动
+    // 用户注册表（留着没恢复就是真的坑），而稀疏文件一个字节的注册表都不碰 —— 偏离理由见
+    // task-9-report.md。造不出来（非 NTFS / 稀疏不支持）时抛 InvalidOperationException，
+    // 由用例打印 SKIPPED 行，绝不假 PASS。
+    //
+    // H.Run 每用例前都 Cleanup()，故这里绝不静态缓存，访问时按需重建（与 TestEnv 其余 fixture 一致）。
+    // ------------------------------------------------------------------
+    private const long OversizedFileLength = 64L * 1024 * 1024 * 1024;   // 64 GiB，远超任何常见回收站配额
+    private const uint FsctlSetSparse = 0x000900C4;
+
+    public static string OversizedFile
+    {
+        get
+        {
+            string path = Path.Combine(Tmp, "oversized_over_quota.bin");
+            if (File.Exists(path)) { return path; }
+
+            string root = Path.GetPathRoot(path);
+            try
+            {
+                DriveInfo drive = new DriveInfo(root);
+                if (!string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "临时目录所在卷 " + root + " 的文件系统是 " + drive.DriveFormat + "，不支持稀疏文件");
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "无法确认临时目录所在卷 " + root + " 的文件系统（" + ex.GetType().Name + "）：" + ex.Message, ex);
+            }
+
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                {
+                    uint returned;
+                    bool ok = DeviceIoControl(
+                        fs.SafeFileHandle.DangerousGetHandle(),
+                        FsctlSetSparse, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
+                    if (!ok)
+                    {
+                        throw new InvalidOperationException(
+                            "FSCTL_SET_SPARSE 失败（Win32 错误 " + Marshal.GetLastWin32Error() + "）");
+                    }
+                    fs.SetLength(OversizedFileLength);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("在 " + root + " 上造稀疏文件失败：" + ex.Message, ex);
+            }
+
+            long actual = new FileInfo(path).Length;
+            if (actual != OversizedFileLength)
+            {
+                throw new InvalidOperationException("稀疏文件逻辑大小是 " + actual + "，期望 " + OversizedFileLength);
+            }
+            return path;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 归档 fixture（Task 3 起）。两个都用 SevenZipRunner 调本机 7-Zip 现做，
     // 放在 %TEMP%\rerar-tests\fixtures 下；H.Run 每用例清空整个临时根，所以这里
     // 每次访问都会重建（惰性 + File.Exists 检查），绝不做静态缓存。
@@ -902,6 +981,14 @@ internal static class TestEnv
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateSymbolicLink(string lpSymlinkFileName, string lpTargetFileName, uint dwFlags);
+
+    // OversizedFile 用：把新建的文件标记为稀疏文件，之后 SetEndOfFile 到 64 GiB 也不占磁盘。
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        IntPtr hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize,
+        IntPtr lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
 
     // Git 自带 GNU tar 的常见位置（本机实测 C:\Program Files\Git\usr\bin\tar.exe），
     // 最后再查 PATH 兜底；能不能用由 BuildSymlinkTar 的自检决定，不靠猜。

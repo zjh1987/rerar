@@ -27,9 +27,13 @@ foreach ($stale in @((Join-Path $dist 'Rerar.exe'), (Join-Path $dist 'tests.exe'
 }
 
 # 编译一个目标，返回 csc 退出码（异常路径一律按失败返回 1）。
-# $extraRefs：可选的额外程序集引用（只给测试目标用）。测试需要 .NET 自带的
-#   System.IO.Compression（BCL，不是第三方包）：Task 5 的 wheel 回归夹具必须用 zip 写库
-#   逐条写**文件**、不写父目录条目 —— 7-Zip 打目录树会补写目录条目，造不出真实 wheel 的形状。
+# $extraRefs：可选的额外程序集引用（都是 .NET 自带的 BCL 程序集，不是第三方包、不装 NuGet）：
+#   * Microsoft.VisualBasic.dll —— Task 9 的 src\Core\RecycleBinGuard.cs 用
+#     FileSystem.DeleteFile(..., SendToRecycleBin) 走回收站删除（规格 §6.3 指定的机制）。
+#     src\Core\*.cs 同时编进两个目标，故**应用目标和测试目标都要引**；csc.rsp 的默认引用里
+#     没有 Microsoft.VisualBasic.dll，必须显式 /r:，否则 CS0234。
+#   * System.IO.Compression.dll（仅测试目标）—— Task 5 的 wheel 回归夹具必须用 zip 写库
+#     逐条写**文件**、不写父目录条目 —— 7-Zip 打目录树会补写目录条目，造不出真实 wheel 的形状。
 # 命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
 # （相对计划唯一的偏离：统一的 UTF-8 代码页开关，理由见文件头）。
 function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources, [string[]]$extraRefs) {
@@ -56,8 +60,12 @@ function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources,
     return $code
 }
 
+# Microsoft.VisualBasic：Task 9 起 src\Core\RecycleBinGuard.cs 需要它（回收站删除），
+# 而 src\Core\*.cs 两个目标都编，所以这条引用必须同时给两个目标。
+$bclRefs = @('/reference:Microsoft.VisualBasic.dll')
+
 # 目标 1：应用（GUI / CLI 双入口）
-$code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs')
+$code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs') $bclRefs
 if ($code -ne 0) {
     Write-Host ("FAIL: 应用目标 csc 退出码 " + $code)
     if ($code -gt 0) { exit $code }
@@ -72,8 +80,8 @@ if (-not (Test-Path -LiteralPath $exe)) {
 Write-Host ("OK: " + $exe)
 
 # 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
-# 额外引用只加在这里：应用目标不需要 zip 写库（见 Invoke-CscTarget 上的说明）。
-$code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs') @('/reference:System.IO.Compression.dll')
+# 测试目标比应用目标多一条引用：System.IO.Compression（zip 写库，见 Invoke-CscTarget 上的说明）。
+$code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs') ($bclRefs + @('/reference:System.IO.Compression.dll'))
 if ($code -ne 0) {
     Write-Host ("FAIL: 测试目标 csc 退出码 " + $code)
     if ($code -gt 0) { exit $code }
