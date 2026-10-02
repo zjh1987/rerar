@@ -88,6 +88,30 @@ internal static class TestEnv
         return Path.Combine(Tmp, name);
     }
 
+    // ------------------------------------------------------------------
+    // 报告 fixture（Task 8 起）：Reporter 的样本结果。
+    //
+    // 刻意**不做静态缓存**：每次调用都返回一个全新的 ArchiveResult，里面的路径由 Tmp/OutRoot
+    // 在调用时现算 —— H.Run 在每个用例开始前都会 Cleanup() 清空整个临时根，任何缓存下来的路径
+    // 到下一个用例就指向不存在的目录了（惰性重建是 TestEnv 的通用约定）。
+    // 归档名刻意用中文（用例里的「中文名.zip」）：Reporter 的 BOM/乱码回归靠它钉住
+    // 「中文名逐字节原样写进报告」。
+    // ------------------------------------------------------------------
+    public static ArchiveResult SampleResult(string archiveName)
+    {
+        if (archiveName == null) { throw new ArgumentNullException("archiveName"); }
+
+        ArchiveResult result = new ArchiveResult();
+        result.Path = Path.Combine(Tmp, archiveName);          // 源归档路径
+        result.Status = ArchiveStatus.CompletedWithFailures;   // 「归档已解出，但内部有成员失败」
+        result.Layers = 2;
+        result.Files = 5;
+        result.Failed = 1;
+        result.OutputDir = Path.Combine(OutRoot, archiveName);  // 解压去向
+        result.Message = "第 2 层有 1 个成员失败";
+        return result;
+    }
+
     // 删除并重建临时目录（Tmp + OutRoot）。由 H.Run 每用例调用，H.Main 收尾时再调一次。
     // 尽力而为、永不抛异常：清不掉的残留文件不该让整轮测试失败。
     public static void Cleanup()

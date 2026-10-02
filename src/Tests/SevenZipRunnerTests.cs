@@ -83,6 +83,27 @@ internal sealed class SevenZipRunnerTests : TestBase
             if (problem.Length == 0 && Check("58 1 - x.bin", out p) != -1) { problem = "没有 % 返回 " + p; }
             AssertEq(problem, ""); });
 
+        // ---- Task 8 补的两条 DISTINCT 用例：加固已在 Task 3 落地，这里只覆盖它没走到的分支 ----
+        // 上面那条覆盖了「无 %」「只有百分比」「成员名为空」，但没有任何一条走到
+        // ParseProgressLine 里 `line[i] != '-' && line[i] != '+'`（% 之后既不是数字也不是进度标记）
+        // 这个 return —— 它正是 brief Step 3 列的第 4 类输入（`%` 后非数字）。
+        H.Run("Runner.ParseProgress.IgnoresNonMarkerAfterPercent", delegate {
+            int p;
+            string problem = "";
+            if (Check("12%x - name.bin", out p) != -1) { problem = "% 后是字母却没有拒绝，返回 " + p; }
+            if (problem.Length == 0 && Check("100%done - x.bin", out p) != -1) { problem = "% 后紧跟文字却没有拒绝，返回 " + p; }
+            AssertEq(problem, ""); });
+
+        // 另一条无人覆盖的分支：百分比数值本身的上下界（`value < 0 || value > 100` 的 return）。
+        H.Run("Runner.ParseProgress.IgnoresPercentOutsideZeroToHundred", delegate {
+            int p;
+            string problem = "";
+            if (Check("150% - over.bin", out p) != -1) { problem = "150% 却没有拒绝，返回 " + p; }
+            if (problem.Length == 0 && Check("101% - over.bin", out p) != -1) { problem = "101% 却没有拒绝，返回 " + p; }
+            if (problem.Length == 0 && Check("0% - zero.bin", out p) != 0) { problem = "0% 是合法进度却被拒绝，返回 " + p; }
+            if (problem.Length == 0 && Check("100% - done.bin", out p) != 100) { problem = "100% 是合法进度却被拒绝，返回 " + p; }
+            AssertEq(problem, ""); });
+
         // ---- I5：没有 -p 的参数表必须在起进程之前就被拒（防止无人值守挂起）----
         H.Run("Runner.RejectsArgsWithoutPasswordSwitch", delegate {
             bool threw = false;
