@@ -4,11 +4,17 @@
 // 交给 7-Zip？指错成员，7-Zip 就报 "Cannot open file as archive"，于是工具和用户双双把
 //「下载文件是好的」误读成「压缩包损坏」。所以权威成员是**按族**决定的：
 //
-//   族          成员模式                     权威成员（交给 7-Zip 的那一个）
-//   新式 RAR    a.part1.rar … a.partN.rar    a.part1.rar（第一个）
-//   旧式 RAR    a.rar + a.r00/a.r01…         a.rar（第一个）
-//   ZIP 分卷    a.z01/a.z02… + a.zip         a.zip（**最后一个**：中央目录在它里面）
-//   7z 分卷     a.7z.001/a.7z.002…           a.7z.001（第一个）
+//   族             成员模式                      权威成员（交给 7-Zip 的那一个）
+//   新式 RAR       a.part1.rar … a.partN.rar     a.part1.rar（第一个）
+//   旧式 RAR       a.rar + a.r00/a.r01…          a.rar（第一个）
+//   ZIP 分卷       a.z01/a.z02… + a.zip          a.zip（**最后一个**：中央目录在它里面）
+//   7z 分卷        a.7z.001/a.7z.002…            a.7z.001（第一个）
+//   7-Zip zip 分卷 a.zip.001/a.zip.002…          a.zip.001（第一个）
+//
+// 最后一行（7-Zip zip 分卷）与它上面的 ZIP 分卷是**两套互不兼容**的方案，绝不是同一个族：
+// WinZip 方案把中央目录放在 **.zip**（故 .zip 是最后一卷），而 7-Zip 的 `a -tzip -v…` 把卷号
+// 缀在 .zip 之后（`vol.zip.001 …`），**.001 才是第一卷**。两族权威成员相反，若并成一个族，
+// 就会把 vol.zip.001 交给 7-Zip 之外的错误成员 —— 正是本任务要消弭的那条误报路径。
 //
 // 规格 §6.6 的其余三条规则：
 //   * 缺卷必须报**具体缺哪一个**（"缺 movie.7z.002"），而不是笼统说"损坏" —— 见 Missing；
@@ -31,6 +37,13 @@
 //   * a.part1.rar 与 a.part10.rar 仍属同一集（partN 不补零，"10" 就是数字 10 的写法）；
 //   * a.z01 … a.z99 与 a.z100 仍属同一集（Zip 到 100 卷自然多一位）；
 //   * 与参考位宽冲突的候选**不**被解析（返回 false，按独立文件处理），既不误并也不凭空报缺卷。
+//
+// 注意上一条只管「并成一个集」，**不**管缺卷名怎么写。合成缺卷名（含缺的权威成员）用的是族的
+// **最小**位宽 —— 新式 RAR 1 位、旧式 RAR / ZIP 分卷 2 位、7z 与 7-Zip zip 分卷 3 位 —— 数字超出
+// 位宽时按 10/100/1000 自然增长。拿参考位宽去补零会凭空造出**根本不存在**的文件名：movie.part10.rar
+// 的同伴会被叫成 movie.part01.rar（新式 RAR 从不补零），而卷 1–9 全缺、只有某个 ≥10 的卷在时，
+// 用户真正要去找的是 movie.part1.rar；报 movie.part01.rar 等于让他白找一趟（规格 §6.6 要的是
+// 报**具体**缺哪一个）。
 //
 // 数字之后的族 token 必须**终止**文件名（自带 ^$ 语义：x.part1.rar.bak、x.7z.001.tmp 都不是成员），
 // 基名必须完全一致（CD1.rar / CD2.rar 是两个独立影片：数字在基名里，不是分卷 token），
@@ -75,7 +88,9 @@ namespace Rerar.Core
         private const int MaxVolumes = 8192;
 
         // None 只作为安全默认值：Item 一律经 Parse/NewItem 构造，实际不会停在 None。
-        private enum Kind { None, ModernRar, LegacyRar, ZipSplit, SevenZipSplit }
+        // ZipNumericSplit 是 7-Zip 自己切 zip 分卷的命名（<base>.zip.<N>），与 WinZip 的
+        // ZipSplit（<base>.z<NN> + <base>.zip）是**两个** Kind：两者权威成员相反，见文件头。
+        private enum Kind { None, ModernRar, LegacyRar, ZipSplit, SevenZipSplit, ZipNumericSplit }
 
         // 一个解析出来的族成员。
         private sealed class Item
@@ -136,7 +151,8 @@ namespace Rerar.Core
             //    lead 成员（.rar / .zip）没有数字，不参与位宽判定。
             Item reference = NumberedReference(series);
             if (reference == null) { return false; }   // 只有 lead 成员 ⇒ 该集只有一个卷，本就不是分卷集
-            int width = reference.Width;
+            int width = reference.Width;               // 「位宽一致」的判定基准（参考成员）
+            int nameWidth = MinimumWidth(cand.Kind);   // 合成缺卷名用族的**最小**位宽（见文件头）
 
             List<Item> group = new List<Item>();
             foreach (Item item in series)
@@ -196,7 +212,7 @@ namespace Rerar.Core
                 }
                 else
                 {
-                    string name = SlotName(reference, cand.Kind, width, lastSlot, slot);
+                    string name = SlotName(reference, cand.Kind, nameWidth, lastSlot, slot);
                     string synthesized = Path.Combine(directory, name);
                     missing.Add(synthesized);
                     if (slot == authoritativeSlot) { authoritative = synthesized; }
@@ -281,8 +297,11 @@ namespace Rerar.Core
 
             if (name[start - 1] == '.')
             {
-                // 3a) 7z 分卷：<base>.7z.<N>（数字前必须是 .7z：裸 .001 不是 7z 分卷的证据）
+                // 3a) 容器名 + 数字后缀的分卷（数字前必须是一个**已知**的容器扩展名：
+                //     裸 .001 本身不是任何分卷方案的证据）。
                 string stem7 = name.Substring(0, start - 1);
+
+                // 7z 分卷：<base>.7z.<N>，权威成员是 .001（第一个卷）。
                 if (stem7.Length > 3 && stem7.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) && value >= 1)
                 {
                     Item seven = NewItem(given, name, Kind.SevenZipSplit, stem7.Substring(0, stem7.Length - 3));
@@ -293,6 +312,22 @@ namespace Rerar.Core
                     seven.HasDigits = true;
                     seven.Slot = value;
                     return seven;
+                }
+
+                // 7-Zip 自己的 zip 分卷：<base>.zip.<N>（`7z a -tzip -v1k vol.zip …` 实测产出
+                // vol.zip.001…；`7z x vol.zip.001` 成功、`7z x vol.zip.002` 报「无法作为压缩包打开」，
+                // 所以权威成员同样是**第一个卷 .001**）。基名必须非空，故要求比 ".zip" 更长。
+                // 这是**独立**于 3b 的 WinZip 方案（<base>.z01 + <base>.zip）的族，理由见文件头。
+                if (stem7.Length > 4 && stem7.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && value >= 1)
+                {
+                    Item zipNumeric = NewItem(given, name, Kind.ZipNumericSplit, stem7.Substring(0, stem7.Length - 4));
+                    zipNumeric.Token = stem7.Substring(stem7.Length - 4) + ".";   // ".zip."（原样大小写）
+                    zipNumeric.Digits = tail;
+                    zipNumeric.Number = value;
+                    zipNumeric.Width = tail.Length;
+                    zipNumeric.HasDigits = true;
+                    zipNumeric.Slot = value;
+                    return zipNumeric;
                 }
                 return null;
             }
@@ -359,8 +394,25 @@ namespace Rerar.Core
             return best;
         }
 
+        // 族的**最小**位宽：合成缺卷名时用的补零宽度（数字更长时由 Pad 自然增长）。
+        // 它取自族自身的命名约定，而**不是**参考成员的位宽：参考位宽只负责「位宽一致」的判定。
+        // 用参考位宽补零会造出不存在的名字（movie.part10.rar 的同伴被叫成 movie.part01.rar）。
+        private static int MinimumWidth(Kind kind)
+        {
+            switch (kind)
+            {
+                case Kind.ModernRar: return 1;        // partN 从不补零
+                case Kind.LegacyRar: return 2;        // .r00
+                case Kind.ZipSplit: return 2;         // .z01（>99 卷自然写 .z100）
+                case Kind.SevenZipSplit: return 3;    // .7z.001
+                case Kind.ZipNumericSplit: return 3;  // .zip.001
+                default: return 1;
+            }
+        }
+
         // 缺卷名：沿用参考成员（同集里卷序最小的数字成员）的基名、族 token 与尾扩展名写法，
-        // 数字按整集位宽左补零。只有 lead 成员（ZIP 的 .zip / 旧式 RAR 的 .rar）自己缺失时，
+        // 数字按**族的最小位宽**左补零（见 MinimumWidth；不是参考成员的位宽）。
+        // 只有 lead 成员（ZIP 的 .zip / 旧式 RAR 的 .rar）自己缺失时，
         // 才退回落款小写的 .zip / .rar 扩展名 —— 那种情况下列表里没有它的写法可参照。
         private static string SlotName(Item reference, Kind kind, int width, int lastSlot, int slot)
         {
@@ -371,6 +423,7 @@ namespace Rerar.Core
             return reference.Base + reference.Token + Pad(number, width) + reference.Extension;
         }
 
+        // 左补零到**至少** width 位；数字本身更长时原样返回（10/100/1000 各自然多一位）。
         private static string Pad(int number, int width)
         {
             string text = number.ToString(CultureInfo.InvariantCulture);

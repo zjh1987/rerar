@@ -11,6 +11,13 @@
 //   * 扩展名大小写不敏感；全路径原样保留；合成的缺卷名沿用同集成员的写法；
 //   * 单独一个完整成员不算分卷集（返回 false）；畸形卷数（part999999）被上界挡住而不是合成海量缺卷名。
 //
+// 末尾三条是**修复轮回归**（review 的两条 Important）：
+//   * 合成缺卷名按**族的最小位宽**补零（新式 RAR 1 位），不得沿用参考成员的位宽 —— 否则
+//     movie.part10.rar 会报出不存在的 movie.part01.rar（用户白找一趟）；
+//   * 补零族（ZIP 2 位、7z 3 位）同理不随参考位宽漂移：a.z100 → a.z01…、b.7z.1000 → b.7z.001…；
+//   * 7-Zip 自己切出的 zip 分卷 <base>.zip.<NNN> 自成一族（权威成员 .001），不与 WinZip 的
+//     <base>.z01 + <base>.zip（.zip 是最后一卷）并族。
+//
 // 本任务没有文件 fixture：输入全是名字列表，判定是纯字符串运算（不碰文件系统）。
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -240,5 +247,84 @@ internal sealed class VolumeFamilyTests : TestBase
             AssertFalse(VolumeFamily.TryResolve(TestEnv.F("c.7z.001", "c.7z.003"), "c.7z.001", out s,
                 allMembersHaveFullSignature: true));
             AssertTrue(s == null); });
+
+        // ---- 修复轮回归 1：合成缺卷名用**族的最小位宽**，而不是参考成员的位宽 ----
+        // 反例：movie.part10.rar 是参考成员（位宽 2），拿它补零会报出 movie.part01.rar …——
+        // 这些名字在磁盘上**根本不存在**，而用户要去找的是 movie.part1.rar …（新式 RAR 从不补零）。
+        H.Run("Volume.Part10AloneReportsPart1NotPart01", delegate {
+            VolumeSet s;
+            AssertTrue(VolumeFamily.TryResolve(TestEnv.F("movie.part10.rar", "movie.part11.rar"), "movie.part10.rar", out s));
+            AssertEq(Path.GetFileName(s.AuthoritativeMember), "movie.part1.rar");   // 权威成员同样不得被补零
+            AssertEq(s.Missing.Count, 9);
+            AssertEq(s.Missing[0], "movie.part1.rar");
+            AssertEq(s.Missing[8], "movie.part9.rar");
+
+            // 只有尾部若干卷在位（下载残缺时最常见的形状）：报 part1…part9，不是 part01…part09。
+            VolumeSet lone;
+            AssertTrue(VolumeFamily.TryResolve(TestEnv.F("movie.part10.rar"), "movie.part10.rar", out lone));
+            AssertEq(lone.AuthoritativeMember, "movie.part1.rar");
+            AssertEq(lone.Missing.Count, 9);
+            AssertEq(lone.Missing[0], "movie.part1.rar"); });
+
+        // 补零族的最小位宽同样是固定值（ZIP 2 位、7z 3 位），不随「最小的那个卷恰好多一位」漂移：
+        // 单独的 a.z100 报 a.z01…a.z99（真实 WinZip 命名）而不是 a.z001…；b.7z.1000 报 b.7z.001…。
+        H.Run("Volume.PaddedFamiliesUseMinimumWidth", delegate {
+            VolumeSet zip;
+            AssertTrue(VolumeFamily.TryResolve(TestEnv.F("a.z100"), "a.z100", out zip));
+            AssertEq(zip.Missing.Count, 100);                                    // a.z01…a.z99 + 缺的 a.zip
+            AssertEq(zip.Missing[0], "a.z01");
+            AssertEq(zip.Missing[98], "a.z99");
+            AssertEq(zip.Missing[99], "a.zip");
+
+            VolumeSet seven;
+            AssertTrue(VolumeFamily.TryResolve(TestEnv.F("b.7z.1000"), "b.7z.1000", out seven));
+            AssertEq(seven.Missing.Count, 999);
+            AssertEq(seven.Missing[0], "b.7z.001");
+            AssertEq(seven.Missing[998], "b.7z.999"); });
+
+        // ---- 修复轮回归 2：7-Zip 自己切出的 zip 分卷 <base>.zip.<NNN>（规格 §6.6 表的缺项）----
+        // 本机 7-Zip 26.01 实测：`7z a -tzip -v1k vol.zip …` → vol.zip.001…006；`7z x vol.zip.001`
+        // 退出 0，`7z x vol.zip.002` 报「无法作为压缩包打开」。所以权威成员是 .001，且这一族
+        // **不能**并进 WinZip 的 <base>.z01 + <base>.zip（那一族 .zip 才是最后一卷）。
+        H.Run("Volume.ZipNumericVolumesUse001AsAuthoritative", delegate {
+            VolumeSet s;
+            string[] files = TestEnv.F("vol.zip.001", "vol.zip.003");
+            AssertTrue(VolumeFamily.TryResolve(files, "vol.zip.003", out s));
+            AssertEq(s.AuthoritativeMember, "vol.zip.001");
+            AssertEq(s.Members.Count, 2);
+            AssertEq(s.Missing.Count, 1);
+            AssertEq(s.Missing[0], "vol.zip.002");
+
+            // 只有尾卷在位时同样必须报出缺的 .001 —— 那正是不能交给 7-Zip 的那一个。
+            VolumeSet tail;
+            AssertTrue(VolumeFamily.TryResolve(TestEnv.F("vol.zip.003"), "vol.zip.003", out tail));
+            AssertEq(tail.AuthoritativeMember, "vol.zip.001");
+            AssertEq(tail.Missing.Count, 2);
+            AssertEq(tail.Missing[0], "vol.zip.001");
+            AssertEq(tail.Missing[1], "vol.zip.002");
+
+            // 与 WinZip 方案绝不并族：同一目录里两者各自成集，权威成员根本不同。
+            VolumeSet mixed;
+            string[] both = TestEnv.F("a.zip", "a.z01", "a.z01.zip.001", "a.z01.zip.002");
+            AssertTrue(VolumeFamily.TryResolve(both, "a.z01", out mixed));
+            AssertEq(mixed.AuthoritativeMember, "a.zip");
+            AssertEq(mixed.Members.Count, 2);
+            AssertTrue(VolumeFamily.TryResolve(both, "a.z01.zip.002", out mixed));
+            AssertEq(mixed.AuthoritativeMember, "a.z01.zip.001");
+            AssertEq(mixed.Members.Count, 2);
+
+            // 位宽一致规则对新族照样生效：.zip.001/.002 与 .zip.01 不是同一集。
+            VolumeSet widthed;
+            string[] widths = TestEnv.F("w2.zip.001", "w2.zip.002", "w2.zip.01");
+            AssertTrue(VolumeFamily.TryResolve(widths, "w2.zip.001", out widthed));
+            AssertEq(widthed.Members.Count, 2);
+            AssertFalse(widthed.Members.Contains("w2.zip.01"));
+            AssertFalse(VolumeFamily.TryResolve(widths, "w2.zip.01", out widthed));
+
+            // 单独一个 .zip.<N> 且不缺卷 ⇒ 不是分卷集（与其它族同一条语义）；
+            // 终止式 token 不变：q.zip.001.bak 不是族成员。
+            VolumeSet single;
+            AssertFalse(VolumeFamily.TryResolve(TestEnv.F("q.zip.001"), "q.zip.001", out single));
+            AssertFalse(VolumeFamily.TryResolve(TestEnv.F("r.zip.001.bak"), "r.zip.001.bak", out single)); });
     }
 }
