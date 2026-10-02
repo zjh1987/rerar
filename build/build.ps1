@@ -1,6 +1,10 @@
 ﻿# Rerar 构建脚本：直接调系统自带的 csc.exe（无 MSBuild、无 NuGet、无第三方库）。
-# 编译失败时以非 0 退出，供 tests\smoke.ps1 等验收脚本判定。
-# 说明：源码一律保存为「UTF-8 带 BOM」，csc 与 PowerShell 5.1 才能正确读取中文。
+# 一次编译两个目标：
+#   dist\Rerar.exe  ← src\Core\*.cs + src\App\*.cs    （GUI/CLI 程序）
+#   dist\tests.exe  ← src\Core\*.cs + src\Tests\*.cs  （无框架单元测试运行器）
+# 任一目标编译失败即以非 0 退出，供 tests\smoke.ps1 等验收脚本判定。
+# 说明：源码一律保存为「UTF-8 带 BOM」；csc 另加 /codepage:65001，
+#       中文解码不再单靠「每个文件都恰好带 BOM」这一脆弱前提。
 
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -16,41 +20,65 @@ if (-not (Test-Path -LiteralPath $dist)) {
 }
 
 # 先删旧产物：编译失败时不会留下过期 exe 让冒烟测试误判通过。
-$exe = Join-Path $dist 'Rerar.exe'
-if (Test-Path -LiteralPath $exe) {
-    Remove-Item -LiteralPath $exe -Force
+foreach ($stale in @((Join-Path $dist 'Rerar.exe'), (Join-Path $dist 'tests.exe'))) {
+    if (Test-Path -LiteralPath $stale) {
+        Remove-Item -LiteralPath $stale -Force
+    }
 }
 
-# 构建命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
-# 本任务只用第一式，且暂不加 /win32manifest: 与 /resource:（由后续任务补）。
-$cscArgs = @(
-    '/nologo'
-    '/target:winexe'
-    '/out:dist\Rerar.exe'
-    'src\Core\*.cs'
-    'src\App\*.cs'
-)
+# 编译一个目标，返回 csc 退出码（异常路径一律按失败返回 1）。
+# 命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
+# （相对计划唯一的偏离：统一的 UTF-8 代码页开关，理由见文件头）。
+function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources) {
+    $cscArgs = @(
+        '/nologo'
+        '/codepage:65001'
+        ('/target:' + $target)
+        ('/out:dist\' + $outName)
+    ) + $sources
 
-$code = 1   # 保守默认值：异常路径一律按失败处理，避免 exit $null（= 0）
-Push-Location $root
-try {
-    $log = & $csc @cscArgs 2>&1 | Out-String
-    $code = $LASTEXITCODE
-} finally {
-    Pop-Location
+    $code = 1   # 保守默认值：异常路径一律按失败处理，避免 exit $null（= 0）
+    Push-Location $root
+    try {
+        $log = & $csc @cscArgs 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+
+    if ($log.Trim().Length -gt 0) { Write-Host $log.Trim() }
+    if ($null -eq $code) { return 1 }
+    return $code
 }
 
-if ($log.Trim().Length -gt 0) { Write-Host $log.Trim() }
-
+# 目标 1：应用（GUI / CLI 双入口）
+$code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs')
 if ($code -ne 0) {
-    Write-Host ("FAIL: csc 退出码 " + $code)
-    exit $code
+    Write-Host ("FAIL: 应用目标 csc 退出码 " + $code)
+    if ($code -gt 0) { exit $code }
+    exit 1
 }
 
+$exe = Join-Path $dist 'Rerar.exe'
 if (-not (Test-Path -LiteralPath $exe)) {
     Write-Host ("FAIL: csc 未生成 " + $exe)
     exit 1
 }
-
 Write-Host ("OK: " + $exe)
+
+# 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
+$code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs')
+if ($code -ne 0) {
+    Write-Host ("FAIL: 测试目标 csc 退出码 " + $code)
+    if ($code -gt 0) { exit $code }
+    exit 1
+}
+
+$testExe = Join-Path $dist 'tests.exe'
+if (-not (Test-Path -LiteralPath $testExe)) {
+    Write-Host ("FAIL: csc 未生成 " + $testExe)
+    exit 1
+}
+Write-Host ("OK: " + $testExe)
+
 exit 0
