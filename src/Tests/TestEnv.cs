@@ -10,7 +10,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Rerar.Core;
@@ -117,6 +119,33 @@ internal static class TestEnv
         get { return Fixture("aes.zip", BuildAesZip); }
     }
 
+    // 只含两个文件的 zip（Task 4 的完整性基线用例 Index.ReadsEntryCountAndBytes）。
+    // 成员数据是 7-Zip 用 -pSECRET 加密的（ZipCrypto，实测）：Runner 的 I5 强制参数表必须带 -p，
+    // 而 7z 的 a 命令在 -p 为空值时会弹密码提示，所以构造夹具时躲不开 -p；
+    // zip 的中央目录是明文，`l` 不需要密码 —— 下面自检里用空 -p 真列一次来钉住这点。
+    public static string TwoFileZip
+    {
+        get { return Fixture("two-file.zip", BuildTwoFileZip); }
+    }
+
+    // 头部加密（-mhe=on）的 7z，密码 SECRET（Task 4 的 Index.EncryptedHeadersReported）。
+    // 控制方裁定：7-Zip 造不出 rar（只有 WinRAR 能），用头部加密的 7z 复现同一个歧义 ——
+    // 错密码 / 损坏 / 非归档在 `l` 的输出上无法区分，正是 HasEncryptedHeaders 要消解的那件事。
+    public static string HeaderEncrypted7z
+    {
+        get { return Fixture("header-encrypted.7z", BuildHeaderEncrypted7z); }
+    }
+
+    // 含真实软链（reparse point）条目的 tar（Task 4 的 Index.DetectsReparsePointEntry）。
+    // 必须用真软链：7-Zip 只有在 tar 里存了「符号链接」条目时才打印非空的 `Symbolic Link = …`。
+    // 本机实测可用：Developer Mode 已开启，建软链无需管理员；归档用 Git 自带的 GNU tar。
+    // 注意 GNU tar 是 MSYS 程序，它把 `C:\...` 当远程主机（`C:` 被解析成 host），
+    // 所以下面一律用相对名字 + WorkingDirectory 建包，成功后再搬到 fixture 路径。
+    public static string SymlinkTar
+    {
+        get { return Fixture("symlink.tar", BuildSymlinkTar); }
+    }
+
     // 惰性 fixture 统一入口：先造到 <名字>.building，成功后再改名到位，
     // 这样半成品绝不会被后续用例当成可复用的 fixture。
     private static string Fixture(string fileName, Action<string> build)
@@ -177,6 +206,213 @@ internal static class TestEnv
         string[] args = new string[] { "a", "-tzip", archivePath, seedPath, "-pSECRET", "-mem=AES256", "-y" };
         RunResult r = RunSevenZip(args);
         if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 fixture", args, r); }
+    }
+
+    // 两个成员的 zip：内容故意取 3 字节与 5 字节，Task 4 因此可以断言总字节「精确等于 8」。
+    private static void BuildTwoFileZip(string targetPath)
+    {
+        string first = SeedFile("two-file-a.txt", "abc");
+        string second = SeedFile("two-file-b.txt", "12345");
+        string[] args = new string[] { "a", "-tzip", targetPath, first, second, "-pSECRET", "-y" };
+        RunResult r = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 TwoFileZip fixture", args, r); }
+
+        // 自检：不带密码（空 -p）也必须列得出条目来 —— Task 4 就是用 password: null 读这个包的。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode) ||
+            listed.StdOut == null || listed.StdOut.IndexOf("----------", StringComparison.Ordinal) < 0)
+        {
+            FixtureFailed("校验 TwoFileZip fixture（不带密码也必须列得出来）", listArgs, listed);
+        }
+    }
+
+    private static void BuildHeaderEncrypted7z(string targetPath)
+    {
+        string seed = SeedFile("header-encrypted-seed.txt", "Rerar HeaderEncrypted7z fixture (password is SECRET)\r\n");
+        string[] args = new string[] { "a", "-t7z", "-mhe=on", targetPath, seed, "-pSECRET", "-y" };
+        RunResult r = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 HeaderEncrypted7z fixture", args, r); }
+
+        // 自检 1：错密码必须打不开（否则它就不是「头部加密」，Task 4 的用例会失去意义）。
+        string[] wrongArgs = new string[] { "l", "-slt", targetPath, "-pWRONG", "-y" };
+        RunResult wrong = RunSevenZip(wrongArgs);
+        if (SevenZipRunner.IsSuccess(wrong.ExitCode)) { FixtureFailed("校验 HeaderEncrypted7z fixture（错密码竟然列出来了）", wrongArgs, wrong); }
+
+        // 自检 2：正确密码必须列得出来。
+        string[] rightArgs = new string[] { "l", "-slt", targetPath, "-pSECRET", "-y" };
+        RunResult right = RunSevenZip(rightArgs);
+        if (!SevenZipRunner.IsSuccess(right.ExitCode)) { FixtureFailed("校验 HeaderEncrypted7z fixture（正确密码打不开）", rightArgs, right); }
+    }
+
+    private static void BuildSymlinkTar(string targetPath)
+    {
+        string tarExe = LocateTar();
+        string srcDir = Path.Combine(_root, "fixtures", "symlink-src");
+        if (Directory.Exists(srcDir)) { Directory.Delete(srcDir, true); }
+        Directory.CreateDirectory(srcDir);
+
+        string target = Path.Combine(srcDir, "target.txt");
+        string link = Path.Combine(srcDir, "link.txt");
+        File.WriteAllText(target, "Rerar SymlinkTar fixture\r\n", new UTF8Encoding(false));
+        CreateFileSymlink(link, "target.txt");
+
+        // 自检：软链真的建出来了。Developer Mode 关掉时 CreateSymbolicLink 会失败，
+        // 那时这里抛出的异常就是使用该 fixture 的用例的 FAIL 原因 —— 绝不悄悄退化成普通文件。
+        FileAttributes attributes = File.GetAttributes(link);
+        if ((attributes & FileAttributes.ReparsePoint) == 0)
+        {
+            throw new InvalidOperationException("SymlinkTar fixture 构造失败：" + link + " 不是 reparse point（软链）");
+        }
+
+        // 相对名字 + WorkingDirectory：MSYS 版 GNU tar 不接受 `C:\` 形式的绝对路径。
+        string built = Path.Combine(srcDir, "symlink.tar");
+        RunTar(tarExe, srcDir, new string[] { "-cf", "symlink.tar", "link.txt", "target.txt" });
+        if (!File.Exists(built)) { throw new InvalidOperationException("SymlinkTar fixture 构造失败：GNU tar 未生成 " + built); }
+
+        if (File.Exists(targetPath)) { File.Delete(targetPath); }
+        File.Move(built, targetPath);
+
+        // 自检：7-Zip 必须把它报成符号链接条目。tar 若把软链当普通文件存了（例如 -h），
+        // fixture 就名不副实，当场报错而不是让 Task 4 的用例以「找不到 reparse point」失败。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 SymlinkTar fixture", listArgs, listed); }
+        if (!HasNonEmptyValue(listed.StdOut, "Symbolic Link ="))
+        {
+            throw new InvalidOperationException(
+                "SymlinkTar fixture 构造失败：l -slt 里没有非空的 Symbolic Link 行；stdout=[" + Head(listed.StdOut) + "]");
+        }
+    }
+
+    // tar 只是**测试夹具的构造工具**，不是产品路径：SevenZipRunner 是「7-Zip 的唯一进程入口」，
+    // 它钉死了 7-Zip 的契约（强制 -p、注入 -sccUTF-8、7-Zip 的退出码语义），无法用来启动 GNU tar
+    //（tar 既不认 -scc* 开关，也无法接受 -p）。所以这里直接起进程，但把边界收死：
+    // 固定超时、超时即杀、异步读干两个管道、不碰 stdin、失败时把退出码与输出带进异常。
+    private static void RunTar(string tarExe, string workingDir, string[] args)
+    {
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = tarExe;
+        psi.WorkingDirectory = workingDir;
+        psi.Arguments = string.Join(" ", args);      // 本类自己给的参数都不含空白，无需引号转义
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+
+        StringBuilder stdOut = new StringBuilder();
+        StringBuilder stdErr = new StringBuilder();
+        Process process = new Process();
+        process.StartInfo = psi;
+        // 读事件的挂接放在 Start 之前：BeginOutputReadLine 一开就要能收到数据（进程一起就跑）。
+        process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) { stdOut.Append(e.Data).Append('\n'); } };
+        process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) { stdErr.Append(e.Data).Append('\n'); } };
+        try
+        {
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            if (!process.WaitForExit(30000))
+            {
+                try { process.Kill(); } catch (Exception) { }
+                process.WaitForExit();
+                throw new InvalidOperationException("SymlinkTar fixture 构造失败：GNU tar 30 秒未返回（已杀掉）");
+            }
+            process.WaitForExit();     // 无参重载：等异步读事件处理完，stdout/stderr 才是完整的
+
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "SymlinkTar fixture 构造失败：tar 退出码 " + process.ExitCode +
+                    "；stdout=[" + Head(stdOut.ToString()) + "]；stderr=[" + Head(stdErr.ToString()) + "]");
+            }
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
+    // `-slt` 输出里有没有「<键> = <非空值>」的行。Symbolic Link / Hard Link 这些键对普通文件是
+    // 「键 = 空」，只有真软链才有值，所以必须看值而不是只看键。
+    private static bool HasNonEmptyValue(string text, string keyPrefix)
+    {
+        if (text == null) { return false; }
+        foreach (string rawLine in text.Split('\n'))
+        {
+            string line = rawLine.Trim();
+            if (!line.StartsWith(keyPrefix, StringComparison.Ordinal)) { continue; }
+            if (line.Substring(keyPrefix.Length).Trim().Length > 0) { return true; }
+        }
+        return false;
+    }
+
+    // .NET Framework 的 BCL 没有 File.CreateSymbolicLink（那是 .NET 6+ 才有的），所以直接调 Win32。
+    // 先带 ALLOW_UNPRIVILEGED_CREATE（Developer Mode）；老系统不认这个标志（ERROR_INVALID_PARAMETER）
+    // 时退回 0（进程持有 SeCreateSymbolicLinkPrivilege 时同样能建）。绝不提权。
+    private static void CreateFileSymlink(string linkPath, string targetPath)
+    {
+        if (CreateSymbolicLink(linkPath, targetPath, SymlinkFlagAllowUnprivilegedCreate)) { return; }
+
+        int firstError = Marshal.GetLastWin32Error();
+        if (CreateSymbolicLink(linkPath, targetPath, 0)) { return; }
+
+        throw new InvalidOperationException(
+            "SymlinkTar fixture 构造失败：创建软链 " + linkPath + " -> " + targetPath +
+            " 失败（Win32 错误 " + firstError + " / " + Marshal.GetLastWin32Error() +
+            "）。需要 Developer Mode 或 SeCreateSymbolicLinkPrivilege。");
+    }
+
+    private const uint SymlinkFlagAllowUnprivilegedCreate = 0x2;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateSymbolicLink(string lpSymlinkFileName, string lpTargetFileName, uint dwFlags);
+
+    // Git 自带 GNU tar 的常见位置（本机实测 C:\Program Files\Git\usr\bin\tar.exe），
+    // 最后再查 PATH 兜底；能不能用由 BuildSymlinkTar 的自检决定，不靠猜。
+    private static string LocateTar()
+    {
+        List<string> candidates = new List<string>();
+
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (programFiles.Length > 0) { candidates.Add(Path.Combine(programFiles, @"Git\usr\bin\tar.exe")); }
+
+        string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        if (programFilesX86.Length > 0) { candidates.Add(Path.Combine(programFilesX86, @"Git\usr\bin\tar.exe")); }
+
+        string programW6432 = Environment.GetEnvironmentVariable("ProgramW6432");
+        if (!string.IsNullOrEmpty(programW6432)) { candidates.Add(Path.Combine(programW6432, @"Git\usr\bin\tar.exe")); }
+
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (localAppData.Length > 0) { candidates.Add(Path.Combine(localAppData, @"Programs\Git\usr\bin\tar.exe")); }
+
+        List<string> tried = new List<string>();
+        foreach (string candidate in candidates)
+        {
+            if (File.Exists(candidate)) { return candidate; }
+            tried.Add(candidate);
+        }
+
+        string pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(pathEnv))
+        {
+            foreach (string rawDir in pathEnv.Split(';'))
+            {
+                string dir = rawDir.Trim();
+                if (dir.Length == 0) { continue; }
+                string candidate = Path.Combine(dir, "tar.exe");
+                if (File.Exists(candidate)) { return candidate; }
+                tried.Add(candidate);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "未找到 GNU tar（SymlinkTar fixture 需要它把真软链存进 tar）：" +
+            "请安装 Git for Windows（https://git-scm.com/）或把 tar.exe 所在目录加入 PATH。已查找：" +
+            string.Join("；", tried.ToArray()));
     }
 
     private static RunResult RunSevenZip(string[] args)
