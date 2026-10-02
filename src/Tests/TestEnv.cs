@@ -12,6 +12,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Threading;
+using Rerar.Core;
 
 internal static class TestEnv
 {
@@ -95,6 +97,114 @@ internal static class TestEnv
         {
         }
         EnsureDirs();
+    }
+
+    // ------------------------------------------------------------------
+    // 归档 fixture（Task 3 起）。两个都用 SevenZipRunner 调本机 7-Zip 现做，
+    // 放在 %TEMP%\rerar-tests\fixtures 下；H.Run 每用例清空整个临时根，所以这里
+    // 每次访问都会重建（惰性 + File.Exists 检查），绝不做静态缓存。
+    // ------------------------------------------------------------------
+
+    // 损坏的 zip（7z 打不开，退出码 2）：Runner.CorruptArchiveExitsTwo 的输入。
+    public static string CorruptZip
+    {
+        get { return Fixture("corrupt.zip", BuildCorruptZip); }
+    }
+
+    // AES-256 加密的 zip，密码 SECRET（Task 10 断言 SECRET 成功、WRONG 得到 SkippedNeedsPassword）。
+    public static string AesZip
+    {
+        get { return Fixture("aes.zip", BuildAesZip); }
+    }
+
+    // 惰性 fixture 统一入口：先造到 <名字>.building，成功后再改名到位，
+    // 这样半成品绝不会被后续用例当成可复用的 fixture。
+    private static string Fixture(string fileName, Action<string> build)
+    {
+        string finalPath = FixturePath(fileName);
+        if (File.Exists(finalPath)) { return finalPath; }
+
+        string tempPath = finalPath + ".building";
+        if (File.Exists(tempPath)) { File.Delete(tempPath); }
+
+        build(tempPath);
+
+        if (!File.Exists(tempPath)) { throw new InvalidOperationException("fixture 构造失败，未生成 " + tempPath); }
+        if (File.Exists(finalPath)) { File.Delete(finalPath); }
+        File.Move(tempPath, finalPath);
+        return finalPath;
+    }
+
+    private static string FixturePath(string fileName)
+    {
+        string dir = Path.Combine(_root, "fixtures");
+        if (!Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+        return Path.Combine(dir, fileName);
+    }
+
+    // 先用 7-Zip 造一个真 zip，再把文件截断到只剩开头 40 字节（局部头没写完）。
+    // 结果是一个「PK\x03\x04 开头但打不开」的文件：7z x 对它返回退出码 2。
+    private static void BuildCorruptZip(string targetPath)
+    {
+        string seed = SeedFile("corrupt-seed.txt", "Rerar CorruptZip fixture\r\n");
+        string full = targetPath + ".full.zip";
+        CreateZipWithPassword(full, seed);
+
+        byte[] bytes = File.ReadAllBytes(full);
+        int keep = bytes.Length < 40 ? bytes.Length : 40;
+        if (keep <= 0) { throw new InvalidOperationException("7-Zip 未生成 " + full); }
+
+        byte[] head = new byte[keep];
+        Array.Copy(bytes, head, keep);
+        File.WriteAllBytes(targetPath, head);
+    }
+
+    private static void BuildAesZip(string targetPath)
+    {
+        string seed = SeedFile("aes-seed.txt", "Rerar AesZip fixture (password is SECRET)\r\n");
+        CreateZipWithPassword(targetPath, seed);
+
+        // 自检：拿 SECRET 真跑一次 t。fixture 若是「没加密」或「密码不对」，Task 10 会莫名其妙地失败，
+        // 所以在这里就如实报错（惰性构造的异常会成为使用该 fixture 的用例的 FAIL 原因）。
+        RunResult check = RunSevenZip(new string[] { "t", targetPath, "-pSECRET", "-y" });
+        if (!SevenZipRunner.IsSuccess(check.ExitCode)) { FixtureFailed("校验 AesZip fixture", new string[] { "t", targetPath, "-pSECRET", "-y" }, check); }
+    }
+
+    // 注意：Runner 强制要求参数里带 -p（不变式 I5），而 7-Zip 的 a 命令在 -p 为空值时会
+    // 真的弹密码提示（实测），所以构造 fixture 一律给真密码 SECRET + AES256。
+    private static void CreateZipWithPassword(string archivePath, string seedPath)
+    {
+        string[] args = new string[] { "a", "-tzip", archivePath, seedPath, "-pSECRET", "-mem=AES256", "-y" };
+        RunResult r = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 fixture", args, r); }
+    }
+
+    private static RunResult RunSevenZip(string[] args)
+    {
+        return SevenZipRunner.Run(SevenZip, args, null, CancellationToken.None);
+    }
+
+    private static void FixtureFailed(string what, string[] args, RunResult r)
+    {
+        throw new InvalidOperationException(
+            what + "失败：7z " + string.Join(" ", args) + " 退出码 " + r.ExitCode +
+            "；stdout=[" + Head(r.StdOut) + "]；stderr=[" + Head(r.StdErr) + "]");
+    }
+
+    private static string Head(string s)
+    {
+        if (string.IsNullOrEmpty(s)) { return ""; }
+        string flat = s.Replace("\r", " ").Replace("\n", " ").Trim();
+        return flat.Length <= 300 ? flat : flat.Substring(0, 300) + "…";
+    }
+
+    private static string SeedFile(string fileName, string content)
+    {
+        string dir = Path.Combine(_root, "fixture-seed");
+        if (!Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+        string path = Path.Combine(dir, fileName);
+        File.WriteAllText(path, content, new UTF8Encoding(false));
+        return path;
     }
 
     private static void EnsureDirs()
