@@ -146,6 +146,61 @@ internal static class TestEnv
         get { return Fixture("symlink.tar", BuildSymlinkTar); }
     }
 
+    // 分卷（split）的 7z：`-v1k` + 5120 字节不可压缩内容 → 真的切成多个卷；返回 **.001** 这个
+    // 权威成员（规格 §6.6 / 计划 Task 6 交给 7-Zip 的就是它）。Task 4 用它钉住 Finding 1：
+    // 分卷清单里 7-Zip 会多打印两个段标记（`----` 与第二个 `--`），把「卷/包自己的属性块」当成
+    // 条目，基线就会凭空多出 2 个文件、多算一个包的字节数。
+    //
+    // 不能走 Fixture()：分卷是**多个文件**，而 Fixture() 只搬迁单个 .building 文件。
+    public static string SplitVolume7z
+    {
+        get
+        {
+            string dir = Path.Combine(_root, "fixtures", "split");
+            string first = Path.Combine(dir, "vol.7z.001");
+            string second = Path.Combine(dir, "vol.7z.002");
+
+            if (File.Exists(first) && File.Exists(second)) { return first; }
+
+            // 半成品/残留一律先清掉，避免上一轮失败留下的卷被当成可复用 fixture。
+            if (Directory.Exists(dir)) { Directory.Delete(dir, true); }
+            Directory.CreateDirectory(dir);
+
+            string seed = SeedBinary("big.bin", 5120);
+            string baseName = Path.Combine(dir, "vol.7z");
+            string[] args = new string[] { "a", "-t7z", "-v1k", baseName, seed, "-pSECRET", "-y" };
+            RunResult r = RunSevenZip(args);
+            if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 SplitVolume7z fixture", args, r); }
+
+            // 自检 1：真的切开了（至少两个卷）。没切开就测不到分卷形状，必须当场报错，
+            // 绝不能让用例在一个「其实是单卷」的 fixture 上悄悄变成弱断言。
+            if (!File.Exists(first) || !File.Exists(second))
+            {
+                throw new InvalidOperationException(
+                    "SplitVolume7z fixture 构造失败：没有切成多个卷（" + first + " 与 " + second + " 不都存在）");
+            }
+
+            // 自检 2：.001 必须列得出来，且带条目段标记（Task 4 就用 password: null 读它）。
+            string[] listArgs = new string[] { "l", "-slt", first, "-p", "-y" };
+            RunResult listed = RunSevenZip(listArgs);
+            if (!SevenZipRunner.IsSuccess(listed.ExitCode) ||
+                listed.StdOut == null || listed.StdOut.IndexOf("----------", StringComparison.Ordinal) < 0)
+            {
+                FixtureFailed("校验 SplitVolume7z fixture", listArgs, listed);
+            }
+
+            return first;
+        }
+    }
+
+    // 单流格式（bzip2）样例：这种归档**不存成员名**，`l -slt` 的条目块连 Path 行都没有
+    //（实测 `Size = ` 也是空的），唯一可用的基线是 `x`/`t` 尾部的汇总。Task 4 用它钉住
+    // 「0 条目 ≠ 已完整」与「汇总里只有 Size: 是必然出现的」这两件事。
+    public static string SingleStreamBz2
+    {
+        get { return Fixture("single-stream.bz2", BuildSingleStreamBz2); }
+    }
+
     // 惰性 fixture 统一入口：先造到 <名字>.building，成功后再改名到位，
     // 这样半成品绝不会被后续用例当成可复用的 fixture。
     private static string Fixture(string fileName, Action<string> build)
@@ -282,6 +337,30 @@ internal static class TestEnv
         {
             throw new InvalidOperationException(
                 "SymlinkTar fixture 构造失败：l -slt 里没有非空的 Symbolic Link 行；stdout=[" + Head(listed.StdOut) + "]");
+        }
+    }
+
+    // 单流格式（bzip2）：-tbzip2 根本不支持加密，但 I5 逼着 a 命令也必须带 -p，
+    // 实测 `-pSECRET` 被 bzip2 忽略（包照常生成、`l -slt -p` 也照常成功），所以这里给真密码。
+    private static void BuildSingleStreamBz2(string targetPath)
+    {
+        string seed = SeedFile("single-stream-seed.txt", "xyz");
+        string[] args = new string[] { "a", "-tbzip2", targetPath, seed, "-pSECRET", "-y" };
+        RunResult r = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 SingleStreamBz2 fixture", args, r); }
+
+        // 自检：它必须真的是「条目段里没有 Path 行」的形状。注意属性段里有 `Path = <包自己>`，
+        // 所以只看条目段标记之后的部分 —— 否则这条自检会把正常输出误判成失败。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 SingleStreamBz2 fixture", listArgs, listed); }
+
+        int marker = listed.StdOut == null ? -1 : listed.StdOut.IndexOf("----------", StringComparison.Ordinal);
+        if (marker < 0 || listed.StdOut.IndexOf("Path =", marker, StringComparison.Ordinal) >= 0)
+        {
+            throw new InvalidOperationException(
+                "SingleStreamBz2 fixture 构造失败：条目段里出现了 Path 行，它不再是「无成员名」的形状；stdout=[" +
+                Head(listed.StdOut) + "]");
         }
     }
 
@@ -440,6 +519,20 @@ internal static class TestEnv
         if (!Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
         string path = Path.Combine(dir, fileName);
         File.WriteAllText(path, content, new UTF8Encoding(false));
+        return path;
+    }
+
+    // 固定种子的伪随机二进制内容：7-Zip 压不动它，5120 字节才会真的被 `-v1k` 切成多个卷
+    //（内容取重复模式的话包会小到只剩一个卷，分卷形状就测不到了）。固定种子保证每台机器
+    // 每次构造出的包形状一致；用例只断言条目的条目数与字节数，不依赖包的大小。
+    private static string SeedBinary(string fileName, int length)
+    {
+        string dir = Path.Combine(_root, "fixture-seed");
+        if (!Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+        string path = Path.Combine(dir, fileName);
+        byte[] bytes = new byte[length];
+        new Random(20261003).NextBytes(bytes);
+        File.WriteAllBytes(path, bytes);
         return path;
     }
 

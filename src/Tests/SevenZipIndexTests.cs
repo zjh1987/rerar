@@ -14,6 +14,7 @@
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
 using System;
+using System.Threading;
 using Rerar.Core;
 
 internal sealed class SevenZipIndexTests : TestBase
@@ -56,19 +57,34 @@ internal sealed class SevenZipIndexTests : TestBase
         // 这正是 HasEncryptedHeaders 存在的意义：只有加密特征串才让它为真。
         H.Run("Index.CorruptArchiveIsNotMistakenForEncryptedHeaders", delegate {
             ArchiveIndex ix = SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.CorruptZip, null);
-            AssertFalse(ix.HasEncryptedHeaders); });
+            AssertFalse(ix.HasEncryptedHeaders);
+            // 【Finding 3】失败必须能被看见：损坏包同样是 0 条目 / 0 字节，但它是「没有基线」。
+            AssertTrue(ix.ListingFailed);
+            AssertEq(ix.ExitCode, 2); });
 
-        // ---- 空清单：没有任何输出 / 有归档但没有条目，都必须得到「0 条目、0 字节」----
+        // ---- 空清单：`l` 成功但没有任何带 Path 的条目，必须得到「0 条目、0 字节」----
+        // 【Finding 3】必须走 Read，不能直接喂 ParseListing：HasEncryptedHeaders 只有 Read 才会计算，
+        // 直接喂解析器时它恒为 false —— 原来的写法里那条断言永远不可能失败（等于没断言）。
         H.Run("Index.EmptyListingYieldsZeroCounts", delegate {
-            ArchiveIndex nothing = SevenZipIndex.ParseListing(null);
-            ArchiveIndex noEntries = SevenZipIndex.ParseListing(Listing(""));
+            // 单流格式（bz2）：`l` 成功（退出码 0），但条目块没有 Path 行 → 0 条目 / 0 字节。
+            ArchiveIndex noEntries = SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SingleStreamBz2, null);
+            AssertEq(noEntries.FileCount, 0);
+            AssertEq(noEntries.TotalBytes, 0L);
+            AssertEq(noEntries.Entries.Count, 0);
+            AssertFalse(noEntries.HasEncryptedHeaders);
 
+            // null 输入（调用方根本没拿到 stdout）也必须得到一个空索引，而不是崩溃。
+            ArchiveIndex nothing = SevenZipIndex.ParseListing(null);
             string problem = "";
             if (nothing == null || nothing.Entries == null) { problem = "ParseListing(null) 返回 null 或 Entries 为 null"; }
             else if (nothing.FileCount != 0 || nothing.TotalBytes != 0 || nothing.Entries.Count != 0) { problem = "null 清单不为空"; }
-            else if (noEntries.FileCount != 0 || noEntries.TotalBytes != 0 || noEntries.Entries.Count != 0) { problem = "空条目段不为空"; }
-            else if (nothing.HasEncryptedHeaders || noEntries.HasEncryptedHeaders) { problem = "无输出的清单被当成头部加密"; }
-            AssertEq(problem, ""); });
+            AssertEq(problem, "");
+
+            // 合成的「有属性段、但条目段是空的」清单同样必须为空（这一段只覆盖解析器本身）。
+            ArchiveIndex emptySection = SevenZipIndex.ParseListing(Listing(""));
+            AssertEq(emptySection.FileCount, 0);
+            AssertEq(emptySection.TotalBytes, 0L);
+            AssertEq(emptySection.Entries.Count, 0); });
 
         // ---- 被截断的最后一块：stdout 末尾没有空行、甚至最后一个键写了一半 ----
         // 最后一个条目必须照样算进基线（少算 = Verifier 可能放过半成品）。
@@ -122,9 +138,90 @@ internal sealed class SevenZipIndexTests : TestBase
             ArchiveIndex plainFile = SevenZipIndex.ParseListing(Listing(
                 "Path = plain.txt\nFolder = -\nSize = 4\nSymbolic Link = \nAttributes = A\n"));
             AssertFalse(plainFile.Entries[0].IsReparsePoint); });
+
+        // ---- 【Finding 1】分卷清单：7-Zip 对 `x.7z.001` 会打印**四个**段标记 ----
+        // 实测形状：`--` / `----` / `--` / `----------`。中间那两个属性块里也有 `Path = `，
+        // 一旦被当成条目，基线就会凭空多 2 个文件、多算一整个包的字节数 —— 于是所有分卷归档
+        //（规格 §9 用例 6/7）都永远对不上磁盘，而 `.7z.001` 正是指挥部交给 7-Zip 的权威成员
+        //（规格 §6.6 / 计划 Task 6）。这里走真 Read + 真分卷夹具（夹具自检保证它真的切开了），
+        // 不用合成的 Listing() —— 那个辅助固定写两个标记，正是这条 bug 溜过去的原因。
+        H.Run("Index.SplitVolumeListingHasNoPhantomEntries", delegate {
+            ArchiveIndex ix = SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SplitVolume7z, null);
+
+            AssertEq(ix.FileCount, 1);                   // 真相：包里只有 big.bin 一个文件
+            AssertEq(ix.TotalBytes, 5120L);              // 且正好 5120 字节
+            AssertEq(ix.Entries.Count, 1);               // 卷列表与包属性块都不是条目
+            AssertEq(ix.Entries[0].Path, "big.bin");
+            AssertFalse(ix.Entries[0].IsDirectory);
+            AssertFalse(ix.HasEncryptedHeaders); });
+
+        // ---- 【Finding 2】真实的 `t` 汇总：0 个目录时 7-Zip **不打印 `Folders:` 行** ----
+        // 原实现要求 Folders:/Files:/Size: 三行齐全，于是在「本该靠汇总兜底」的归档上全部返回 false。
+        H.Run("Index.ParsesSummaryWithoutFoldersLine", delegate {
+            RunResult tested = RunSevenZip("t", TestEnv.TwoFileZip, "-pSECRET", "-y");
+            AssertTrue(SevenZipRunner.IsSuccess(tested.ExitCode));
+
+            // 形状自检：本用例存在的理由就是「真实输出里没有 Folders: 行」。若将来 7-Zip 开始打印它，
+            // 这里当场说明「本用例不再是它要覆盖的形状」，而不是默默失去意义。
+            if (tested.StdOut != null && tested.StdOut.IndexOf("Folders:", StringComparison.Ordinal) >= 0)
+            {
+                AssertEq("7-Zip 现在会打印 Folders: 行 —— 本用例已不再是「缺 Folders:」的形状", "");
+            }
+
+            int d; int f; long s;
+            AssertTrue(SevenZipIndex.TryParseSummary(tested.StdOut, out d, out f, out s));
+            AssertEq(d, 0);                              // 那一行不存在 → 0，而不是「整份汇总不可用」
+            AssertEq(f, 2);                              // 真夹具：two-file-a.txt + two-file-b.txt
+            AssertEq(s, 8L); });                         // 真夹具：3 + 5 字节
+
+        // ---- 【Finding 2】单流格式：连 `Files:` 也不打印，只有 `Size:` 是必然出现的 ----
+        // 这是 bz2/xz 唯一可用的基线（它们的 `-slt` 索引是 0 条目），所以它必须可用；
+        // 同时钉住语义：7-Zip 不把这条无名流算成一个文件，所以 files 是 0 而不是 1。
+        H.Run("Index.SingleStreamSummaryCarriesOnlyByteTotal", delegate {
+            RunResult tested = RunSevenZip("t", TestEnv.SingleStreamBz2, "-p", "-y");
+            AssertTrue(SevenZipRunner.IsSuccess(tested.ExitCode));
+
+            int d; int f; long s;
+            AssertTrue(SevenZipIndex.TryParseSummary(tested.StdOut, out d, out f, out s));
+            AssertEq(f, 0);                              // 7-Zip 不把无名流算成文件
+            AssertEq(d, 0);
+            AssertEq(s, 3L); });                         // 解压后的真实字节数：单流格式唯一有意义的数
+
+        // ---- 【Finding 3】「读不到清单」必须能被看见，否则 0/0 与真基线不可分 ----
+        // 实测：bz2 / xz（`l` 成功但格式没有成员名）、非归档文本文件、被截断的 7z —— 这四种
+        // 在读 `l` 的结果前完全同形（0 条目 / 0 字节）。前者的「0」是格式使然，后三者的「0」是
+        // 压根没读到清单。计划 line 634 的判定是「条目数/字节比对」，若两者不可分，失败归档的
+        // 「磁盘 0 个文件 == 索引 0 个文件」就会被读成「完整」→ 删除原包（本项目最怕的方向）。
+        H.Run("Index.ListingFailureIsDistinguishableFromNamelessSingleStream", delegate {
+            // 单流格式：`l` 成功、0 条目 —— 这不是失败，只是这个格式不存成员名。
+            ArchiveIndex nameless = SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SingleStreamBz2, null);
+            AssertEq(nameless.FileCount, 0);
+            AssertEq(nameless.ExitCode, 0);
+            AssertFalse(nameless.ListingFailed);
+            AssertFalse(nameless.HasEncryptedHeaders);
+
+            // 根本不是压缩包：`l` 失败（实测退出码 2），索引同样是 0 条目 —— 但这次是「没有基线」。
+            string notArchive = TestEnv.MakeFile("not-an-archive.txt", "这不是压缩包，只是纯文本。\r\n");
+            ArchiveIndex failed = SevenZipIndex.Read(TestEnv.SevenZip, notArchive, null);
+            AssertEq(failed.FileCount, 0);
+            AssertEq(failed.TotalBytes, 0L);
+            AssertEq(failed.ExitCode, 2);
+            AssertTrue(failed.ListingFailed);            // ← 没有这个字段，它与上面的 nameless 完全同形
+            AssertFalse(failed.HasEncryptedHeaders);     // 它是失败了，但不是「缺密码」
+
+            // 两张索引的条目数与字节数一模一样，唯一的区别就是 ListingFailed / ExitCode。
+            AssertEq(failed.FileCount, nameless.FileCount);
+            AssertEq(failed.TotalBytes, nameless.TotalBytes); });
     }
 
     // ---------------- 辅助 ----------------
+
+    // 真跑一次 7-Zip 并把完整结果交给调用方：汇总是「x/t 尾部那一块」，它的形状必须是**真实**输出，
+    // 合成文本不算证据（brief 的 Index.ParsesExtractSummary 用合成文本，这里补上真实输出这一层）。
+    private static RunResult RunSevenZip(params string[] args)
+    {
+        return SevenZipRunner.Run(TestEnv.SevenZip, args, null, CancellationToken.None);
+    }
 
     // 合成一份 `l -slt` 的 stdout：前言 + 归档属性段（Path = 包自己）+ 条目段标记，形状逐字抄自
     // 本机 7-Zip 26.01 的实测输出（只保留解析器关心的部分）。entriesBody 是条目段正文。

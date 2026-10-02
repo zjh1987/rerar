@@ -28,6 +28,33 @@
 //   Path = b.txt
 //   ...
 //
+// 分卷归档（交给 7-Zip 的权威成员是 `.7z.001`，规格 §6.6 / 计划 Task 6）的清单形状**不同**，
+// 实测（7-Zip 26.01）有**四个**标记：
+//
+//   --                                  ← 分卷容器（Split）属性
+//   Path = …\vol.7z.001
+//   Type = Split
+//   Physical Size = 1024
+//   Volumes = 6
+//   Total Physical Size = 5246
+//   ----                                ← 卷列表（这一段同样是**包的属性**，不是条目）
+//   Path = vol.7z
+//   Size = 5246
+//   --                                  ← 包自己的属性（同样不是条目）
+//   Path = vol.7z
+//   Type = 7z
+//   Physical Size = 5246
+//   Headers Size = 122
+//   …
+//   ----------                          ← 到这里才是条目段
+//   Path = big.bin
+//   Size = 5120
+//
+// 所以「进入条目段」的判据只能是**长标记本身**（10 个连字符），不能是「第几个标记」：
+// 一旦按累计个数触发，第二个标记（`----`）就会把「卷列表」与「包属性」两个块读成条目 ——
+// 实测一个只含 5120 字节单文件的分卷包会被算成 3 个文件 / 10410 字节，即条目数与字节数全错，
+// 而分卷归档（规格 §9 用例 6/7）正是规格点名的输入类型。
+//
 // 每条解析规则都对应一种实测到的畸形输出：
 //   * 只有条目段标记之后的块才算条目。第一个标记后的「归档属性段」里也有 `Path = `（包自己），
 //     当成条目会让 FileCount 永远多 1；错密码 / 损坏 / 非归档时 7z 根本不打印条目段标记。
@@ -57,6 +84,16 @@ namespace Rerar.Core
 
     // 一个归档的清单 + 完整性基线。
     //
+    // 【不变式，I1 的核心】FileCount == 0 ⇒ **没有可用基线**：调用方绝不能用「磁盘上也是 0 个文件 /
+    // 0 字节」去判成功（0 == 0 不是证据）。读到 0 条目有三种完全不同的原因，每一种都必须走
+    //「无法校验」路径，而不是「已完整」：
+    //   * 单流格式（bz2 / xz）本来就不存成员名 —— `l` 是成功的（ListingFailed == false），
+    //     字节基线只能取 TryParseSummary；
+    //   * `l` 失败（ListingFailed == true）：缺密码（另见 HasEncryptedHeaders）/ 包损坏 /
+    //     根本不是压缩包 —— 三者都是「没读到清单」；
+    //   * 归档里确实一个文件都没有。
+    // 需要区分它们时看 ListingFailed / ExitCode / HasEncryptedHeaders。
+    //
     // FileCount / TotalBytes 只统计**文件**（非目录）条目，Entries 则包含目录在内的全部条目：
     // 7-Zip 自己的汇总也是分开报「Folders: N / Files: M / Size: S」（实测 `7z t` 尾部），
     // Verifier 拿这两个数字跟磁盘上的文件数、字节数比对；把目录算进 FileCount 会让
@@ -67,6 +104,19 @@ namespace Rerar.Core
         public long TotalBytes;
         public int FileCount;
         public bool HasEncryptedHeaders;
+
+        // 产出本索引的那次 `l` 的退出码（7z 语义：0 = 正常，1 = 完成但有警告，2 及以上 = 错误）。
+        // ParseListing 直接造出来的索引没有真跑 7-Zip，保持 0（那种索引只用于解析器白盒测试）。
+        public int ExitCode;
+
+        // 那次 `l` 是否**失败**（= !SevenZipRunner.IsSuccess(ExitCode)，即退出码 >= 2）。
+        //
+        // 没有这个字段，调用方无法区分四种都表现为「0 条目 / 0 字节」的情况：单流格式的
+        // 「无名」（成功、但只能靠汇总）与「缺密码 / 损坏 / 不是压缩包」（失败、没有任何基线）。
+        // 计划 line 634 的判定是「条目数/字节比对」，若失败与「无名」不可分，「磁盘 0 个文件 ==
+        // 索引 0 个文件」就会被读成「完整」，接着删除原包 —— 正是本项目最怕的方向。控制方已核准
+        // 这一扩展（brief 的四字段是下限，不是上限）。
+        public bool ListingFailed;
     }
 
     public static class SevenZipIndex
@@ -84,6 +134,10 @@ namespace Rerar.Core
 
         // 读一次清单。任何失败都**不抛异常**：返回一个（可能只有 HasEncryptedHeaders 为真的）索引，
         // 由调用方按 I1 的语义决定跳过还是重试（Task 10 的 SkippedNeedsPassword 就靠这个标志）。
+        //
+        // 无论成功失败，索引都会如实带上这次 `l` 的 ExitCode 与 ListingFailed —— 没有它们，
+        //「成功但没有成员名」（bz2/xz）与「压根没读到清单」（缺密码 / 损坏 / 不是压缩包）
+        // 在返回值上完全一样（都是 0 条目 / 0 字节），调用方无法实现「0 条目 = 没有基线」这条规则。
         public static ArchiveIndex Read(string sevenZipPath, string archivePath, string password)
         {
             if (sevenZipPath == null) { throw new ArgumentNullException("sevenZipPath"); }
@@ -96,6 +150,8 @@ namespace Rerar.Core
             RunResult result = SevenZipRunner.Run(sevenZipPath, args, null, CancellationToken.None);
 
             ArchiveIndex index = ParseListing(result.StdOut);
+            index.ExitCode = result.ExitCode;
+            index.ListingFailed = !SevenZipRunner.IsSuccess(result.ExitCode);
 
             // 消解「头部加密」的歧义：`l` 失败 **且** 输出里有加密特征 → 缺密码，而不是包坏了。
             // stdout 与 stderr 都要看：实测加密错误在 stderr，而损坏包的 ERRORS: 块会混进 stdout。
@@ -116,8 +172,24 @@ namespace Rerar.Core
         //   Size:       7
         //   Compressed: 429
         // 逐行扫描、行首匹配（7z 把这些行顶格打印）；同名行出现多次时以**最后一次**为准
-        //（尾部的汇总才是整轮的结果）。任何一项缺失或解析不出数字都返回 false，
-        // 此时三个 out 一律为 0 —— 调用方据此判定「没有可用的汇总」，而不是拿半截数字去比对。
+        //（尾部的汇总才是整轮的结果）。
+        //
+        // **只有 `Size:` 是必然出现的**（实测 7-Zip 26.01）：
+        //   * 归档里 0 个目录时 7-Zip 干脆**不打印 `Folders:`** —— 实测 `t two.zip`（2 个文件、
+        //     8 字节）只给 `Files: 2 / Size: 8 / Compressed: 298`。要求三行齐全，等于让汇总在
+        //     「没有目录」这个最常见的形状上全部失效；
+        //   * 单流格式（bz2 / xz）连 `Files:` 也不打印 —— 实测 `x a.txt.bz2` 只有
+        //     `Size: 3 / Compressed: 38`，`t a.txt.xz` 只有 `Size: 3 / Compressed: 56`。
+        //     这两种格式的 `-slt` 索引是 **0 条目**（条目块里根本没有 Path 行），汇总因此是
+        //     **唯一**可用的基线 —— 只有它可用的时候它必须真的可用。
+        //
+        // 语义（单流格式的调用方必须知道）：对 bz2/xz 这种无成员名的格式，只有 `size` 有意义。
+        // 7-Zip 不把这条流算成一个文件，所以 `files` 是 0 —— 它是「没有被计数」，
+        // 不是「包里没有文件」，调用方不得据此把归档判成空包。
+        //
+        // 因此：只要解析出一个 `Size:` 就算可用；缺失的 `Folders:` / `Files:` 一律按 0 返回。
+        // 连 `Size:` 都缺失或解析不出数字时才返回 false，此时三个 out 一律为 0 —— 调用方据此判定
+        // 「没有可用的汇总」，而不是拿半截数字去比对。
         public static bool TryParseSummary(string stdOut, out int folders, out int files, out long size)
         {
             folders = 0;
@@ -128,8 +200,6 @@ namespace Rerar.Core
             int parsedFolders = 0;
             int parsedFiles = 0;
             long parsedSize = 0;
-            bool gotFolders = false;
-            bool gotFiles = false;
             bool gotSize = false;
 
             int lineStart = 0;
@@ -146,13 +216,11 @@ namespace Rerar.Core
                     int.TryParse(line.Substring("Folders:".Length).Trim(), out intValue))
                 {
                     parsedFolders = intValue;
-                    gotFolders = true;
                 }
                 else if (line.StartsWith("Files:", StringComparison.OrdinalIgnoreCase) &&
                     int.TryParse(line.Substring("Files:".Length).Trim(), out intValue))
                 {
                     parsedFiles = intValue;
-                    gotFiles = true;
                 }
                 else if (line.StartsWith("Size:", StringComparison.OrdinalIgnoreCase) &&
                     long.TryParse(line.Substring("Size:".Length).Trim(), out longValue))
@@ -162,7 +230,9 @@ namespace Rerar.Core
                 }
             }
 
-            if (!gotFolders || !gotFiles || !gotSize) { return false; }
+            // 只要求 Size:（唯一必然出现的行）。Folders: / Files: 缺失时保持 0：
+            // 「没打印这一行」不是「汇总不可用」，而是「这一项在这个格式/这个归档上没有意义」。
+            if (!gotSize) { return false; }
 
             folders = parsedFolders;
             files = parsedFiles;
@@ -180,7 +250,6 @@ namespace Rerar.Core
             if (string.IsNullOrEmpty(stdOut)) { return index; }
 
             bool inEntries = false;
-            int separators = 0;
             IndexEntry pending = null;
 
             int lineStart = 0;
@@ -195,11 +264,15 @@ namespace Rerar.Core
                 if (IsSeparator(line))
                 {
                     Flush(index, ref pending);
-                    separators++;
 
-                    // 正常形状：第一个标记（`--`）结束前言，第二个标记（`----------`）才开始条目段。
-                    // 只打印一个长标记的格式（属性段缺失）同样要能开始收集，所以长度也算一个条件。
-                    if (separators >= 2 || line.Trim().Length >= EntriesSeparatorLength) { inEntries = true; }
+                    // 进入条目段的唯一判据是**长**标记（实测 10 个连字符）。
+                    // 刻意不用「第几个标记」的累计计数：分卷清单有四个标记
+                    //（`--` / `----` / `--` / `----------`），累计到第二个就会把「卷列表」与
+                    // 「包属性」两个块当成条目（实测 1 个文件被算成 3 个、5120 字节被算成 10410）。
+                    // 而「只有长标记」在另一个方向是安全的：万一某个格式的条目段标记没被认出来，
+                    // 结果是 0 条目 —— 按 FileCount == 0 ⇒ 没有基线 的规则，调用方会拒绝判定成功，
+                    // 绝不会因为多算而放过半成品。
+                    if (line.Trim().Length >= EntriesSeparatorLength) { inEntries = true; }
                     continue;
                 }
 
