@@ -12,6 +12,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -260,7 +261,7 @@ internal static class TestEnv
         get { return GaterIndex("gater-epub.zip", BuildEpubZip); }
     }
 
-    // ---- 以下 6 个夹具属于「规格 §6.4 表被裁定为欠包含」之后补的规则（不变式 I4 是权威）----
+    // ---- 以下 8 个夹具属于「规格 §6.4 表被裁定为欠包含」之后补的规则（不变式 I4 是权威）----
     // 全部都是**一个标记就够**的形状：表里原来只写了常见形状（`+`）或干脆没写（其余 ⇒ 放行），
     // 于是这些真容器会一路走到 Allow —— 开了「解压成功后删除原包」就是用户文档被销毁且全程 exit 0。
 
@@ -296,11 +297,22 @@ internal static class TestEnv
         get { return GaterIndex("gater-apk-manifest-only.zip", BuildApkManifestOnlyZip); }
     }
 
-    // Python wheel：`<name>-<ver>.dist-info/` 是 wheel 规范要求的路径段（dist-info 目录本身
-    // 与它下面的 METADATA/RECORD 都带这个段，所以任一条目都能触发）。
+    // Python wheel：`<name>-<ver>.dist-info` 是 wheel 规范要求的路径段。
+    // 注意这一份是 `7z a <seed>\*` 打出来的：7-Zip 会给目录树补写目录条目（`Folder = +`），
+    // 所以它只代表「带目录条目的 zip 形状」，**不代表真实 wheel**（见下面 IndexWheelNoDirEntries）。
     public static ArchiveIndex IndexWheel
     {
         get { return GaterIndex("gater-wheel.zip", BuildWheelZip); }
+    }
+
+    // Python wheel 的**真实**布局（pip / setuptools 用 python zipfile 打出来的包）：
+    // 包里**一个目录条目都没有**，`.dist-info` 只作为**文件路径**里的一个路径段出现
+    //（`mypkg-1.0.dist-info/METADATA`、`…/RECORD`、`…/WHEEL`）。7-Zip 打目录树时会补写目录条目，
+    // 造不出这个形状，所以这份夹具逐条写文件、不写父目录条目（见 BuildWheelNoDirEntriesZip）。
+    // 上一版规则只看目录条目，对这种形状永不触发 ⇒ 落到「其余 ⇒ 放行」；这份夹具就是那个缺口的回归。
+    public static ArchiveIndex IndexWheelNoDirEntries
+    {
+        get { return GaterIndex("gater-wheel-flat.zip", BuildWheelNoDirEntriesZip); }
     }
 
     // VSIX（VS 扩展包）：根级 extension.vsixmanifest。
@@ -456,6 +468,66 @@ internal static class TestEnv
         SeedText(src, "mypkg-1.0.dist-info/METADATA", "Name: mypkg\r\nVersion: 1.0\r\n");
         SeedText(src, "mypkg-1.0.dist-info/RECORD", "mypkg/__init__.py,,\r\n");
         ZipSeedDir(targetPath, src);
+    }
+
+    // 真实 wheel 形状：用 zip 写库（.NET 的 System.IO.Compression）逐条添加**文件**，不添加任何父目录
+    // 条目 —— 这正是 pip / setuptools 用 python zipfile 打 wheel 时的行为（实测真实 wheel 里
+    // `Folder = +` 行数为 0）。绝不能用 `7z a <seed>\*` 造这份夹具：7-Zip 会替目录树补写目录条目，
+    // 那样造出来的就不是 wheel 的形状 —— 前一轮的覆盖用例正是因此变成假通过。
+    private static void BuildWheelNoDirEntriesZip(string targetPath)
+    {
+        string[] names = new string[] {
+            "mypkg/__init__.py",
+            "mypkg-1.0.dist-info/METADATA",
+            "mypkg-1.0.dist-info/RECORD",
+            "mypkg-1.0.dist-info/WHEEL" };
+        string[] contents = new string[] {
+            "# fixture package\r\n",
+            "Name: mypkg\r\nVersion: 1.0\r\n",
+            "mypkg/__init__.py,,\r\n",
+            "Wheel-Version: 1.0\r\n" };
+
+        if (File.Exists(targetPath)) { File.Delete(targetPath); }
+        using (FileStream stream = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
+        using (ZipArchive zip = new ZipArchive(stream, ZipArchiveMode.Create))
+        {
+            for (int i = 0; i < names.Length; i++) { AddZipFile(zip, names[i], contents[i]); }
+        }
+
+        // 自检 1：夹具必须真的**没有目录条目**。这正是本轮回归要钉住的形状；一旦写库版本替我们补上
+        // 父目录条目，这份夹具就退化成 IndexWheel（旧规则也能拒它），回归用例又变假通过 —— 所以这里
+        // 拿 7-Zip 自己的清单当场核一遍，不合格就报错，绝不让用例悄悄通过。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 wheel（无目录条目）fixture", listArgs, listed); }
+
+        int dirEntries = CountOccurrences(listed.StdOut, "Folder = +");
+        if (dirEntries != 0)
+        {
+            throw new InvalidOperationException(
+                "wheel（无目录条目）fixture 构造失败：清单里出现了 " + dirEntries +
+                " 个目录条目（Folder = +），它已经不是真实 wheel 的形状；stdout=[" + Head(listed.StdOut) + "]");
+        }
+
+        // 自检 2：.dist-info 段只出现在**文件路径**里 —— 没有任何一条 `Path = ` 行的末段就是它本身。
+        if (HasPathEndingWithSegment(listed.StdOut, "mypkg-1.0.dist-info"))
+        {
+            throw new InvalidOperationException(
+                "wheel（无目录条目）fixture 构造失败：清单里出现了以 .dist-info 段结尾的 Path 行；stdout=[" +
+                Head(listed.StdOut) + "]");
+        }
+    }
+
+    // 往 zip 里写一个**文件**条目（不写父目录条目）。条目名用 '/'（wheel 规范/zip 的写法），
+    // 7-Zip 的清单会按本机习惯回显成 '\' —— Judge 两种分隔符都切，所以两边都对得上。
+    private static void AddZipFile(ZipArchive zip, string entryName, string content)
+    {
+        ZipArchiveEntry entry = zip.CreateEntry(entryName);
+        using (Stream stream = entry.Open())
+        using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+        {
+            writer.Write(content);
+        }
     }
 
     private static void BuildVsixZip(string targetPath)
@@ -751,6 +823,37 @@ internal static class TestEnv
             string line = rawLine.Trim();
             if (!line.StartsWith(keyPrefix, StringComparison.Ordinal)) { continue; }
             if (line.Substring(keyPrefix.Length).Trim().Length > 0) { return true; }
+        }
+        return false;
+    }
+
+    // 一个子串在文本里出现了几次（夹具自检用：数 `l -slt` 清单里的目录条目行 `Folder = +`）。
+    private static int CountOccurrences(string text, string needle)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(needle)) { return 0; }
+
+        int count = 0;
+        int at = text.IndexOf(needle, StringComparison.Ordinal);
+        while (at >= 0)
+        {
+            count++;
+            at = text.IndexOf(needle, at + needle.Length, StringComparison.Ordinal);
+        }
+        return count;
+    }
+
+    // `l -slt` 清单里有没有一条 `Path = ` 行的**末段**就是这个段名（用来证明 .dist-info 只出现在
+    // 文件路径的中间位置，而不是作为一条目录条目/以它结尾的路径出现）。
+    private static bool HasPathEndingWithSegment(string listing, string segment)
+    {
+        if (string.IsNullOrEmpty(listing)) { return false; }
+        foreach (string rawLine in listing.Split('\n'))
+        {
+            string line = rawLine.Trim();
+            if (!line.StartsWith("Path = ", StringComparison.Ordinal)) { continue; }
+
+            string value = line.Substring("Path = ".Length).Trim().TrimEnd('\\', '/');
+            if (value.EndsWith(segment, StringComparison.OrdinalIgnoreCase)) { return true; }
         }
         return false;
     }

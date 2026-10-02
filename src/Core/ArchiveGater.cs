@@ -15,7 +15,7 @@
 //   4. APK（AndroidManifest.xml **或** classes.dex，任一单独出现即够）⇒ 拒绝
 //   5. JAR（META-INF/MANIFEST.MF **或** 任一 .class，任一单独出现即够）⇒ 拒绝
 //   6. EPUB/ODF（mimetype 标记条目）⇒ 拒绝
-//   7. Python wheel（任一 *.dist-info/ 路径段）⇒ 拒绝
+//   7. Python wheel（**任一**条目的任一以 *.dist-info 结尾的路径段；真实 wheel 里一个目录条目都没有）⇒ 拒绝
 //   8. VSIX（extension.vsixmanifest）⇒ 拒绝
 //   9. 其余 ⇒ 放行（视为普通归档，允许递归）
 //
@@ -24,6 +24,8 @@
 // 文档；表里的 JAR/APK 写成合取（`+`），于是 Ant `<zip>` 打的 jar（有 .class、无 MANIFEST.MF）、
 // 只含清单的资源 jar、无 dex 的 split APK 都会整包放行。漏判的代价是用户文档被销毁且全程 exit 0，
 // 多判的代价只是少递归一层（界面提供逐项「强制按压缩包尝试」）—— 两侧完全不对称，所以一律按拒绝。
+// 第 7 条的判定范围在本轮修复里从「只看目录条目」扩到**全部条目**：真实 wheel 里没有目录条目，
+// 只看目录条目等于对真实 wheel 永不触发（详见 HasDistInfoSegment 的注释与回归用例）。
 //
 // 三处刻意的判定取舍，方向一律是「宁可少递归一层，也绝不拆散用户文档」：
 //   * **标记按任意深度的路径段匹配，不是只匹配根级**：规格的标记名是真实容器里的根级条目名，但一个
@@ -249,16 +251,23 @@ namespace Rerar.Core
             return HasSegmentPair(entries, IWorkMetadataDirSegment, IWorkIdentifierName);
         }
 
-        // Python wheel：任一条目的路径段里有一个以 .dist-info 结尾（`mypkg-1.0.dist-info`）。
-        // **只看目录条目**不是疏忽：wheel 的元数据必然在 `<name>-<ver>.dist-info/` 这个目录下，
-        // 目录条目（7-Zip 默认就会写入）本身带着这个段。要求「段名比后缀长」是为了不把
-        // 恰好叫 `.dist-info` 的文件当成 wheel 身份。
+        // Python wheel：**任一条目**（文件或目录）的**任意路径段**以 .dist-info 结尾（`mypkg-1.0.dist-info`）。
+        //
+        // 为什么不能只看目录条目：真实 wheel（pip / setuptools 用 python zipfile 打的包）里**一个目录
+        // 条目都没有** —— 本机实测 %LOCALAPPDATA%\pip\cache\wheels 下的 4 个真实 wheel：`7z l -slt` 的
+        // `Folder = +` 行数为 0，59 条 Path 里没有一条以分隔符结尾，`.dist-info` 只作为**文件路径**里的
+        // 一个路径段出现（`jieba-0.42.1.dist-info\METADATA`）。`7z a <目录>\*` 确实会给目录树补写目录
+        // 条目（那种形状才带 `Folder = +`），但那是 7-Zip 的形状，不是 wheel 的形状；把「目录条目存在」
+        // 当成前提，这条规则就会对真实 wheel 永不触发，一路掉到末行「其余 ⇒ 放行」—— 正是 I4 要挡住的
+        // 方向（用户的 wheel 被递归拆散；开了删除原包还会连原文件一起销毁，而每步 exit 0）。
+        // 扫描**全部**条目是「只扫目录条目」的严格超集：只会多拒绝，不会放走任何东西。
+        // 要求「段名比后缀长」是为了不把恰好叫 `.dist-info` 的文件/目录当成 wheel 身份。
         private static bool HasDistInfoSegment(List<IndexEntry> entries)
         {
             for (int i = 0; i < entries.Count; i++)
             {
                 IndexEntry entry = entries[i];
-                if (entry == null || !entry.IsDirectory) { continue; }
+                if (entry == null) { continue; }
 
                 string[] segments = Segments(entry.Path);
                 for (int s = 0; s < segments.Length; s++)

@@ -10,7 +10,8 @@
 // 尾部另有一组用例属于「规格 §6.4 特征表被裁定为欠包含」之后补上的规则（不变式 I4 是权威）：
 //   * Apple iWork（Index/Document.iwa、Metadata/DocumentIdentifier）；
 //   * JAR / APK 的两个标记**各自单独**就够（原表写成合取，会让真容器整包放行）；
-//   * Python wheel（*.dist-info/ 路径段）、VSIX（extension.vsixmanifest）。
+//   * Python wheel（*.dist-info 路径段；按**全部条目**匹配，因为真实 wheel 里没有目录条目）、
+//     VSIX（extension.vsixmanifest）。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -51,7 +52,7 @@ internal sealed class ArchiveGaterTests : TestBase
         H.Run("Gater.RefusesEpubMimetypeMarker", delegate {
             string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexEpub, out why), GateVerdict.ContainerDocument); });
 
-        // ---- 规格 §6.4 表被裁定为「欠包含」之后补的 6 条（不变式 I4 是约束权威，不是表里那一行）----
+        // ---- 规格 §6.4 表被裁定为「欠包含」之后补的 8 条（不变式 I4 是约束权威，不是表里那一行）----
         // 共同形状：单凭一个标记就足以拒绝。漏判的一侧是「用户的文档被拆散 + 原文件被删」，
         // 多判的一侧只是「少递归一层，用户可在界面上强制按压缩包尝试」，两侧代价完全不对称。
 
@@ -81,9 +82,18 @@ internal sealed class ArchiveGaterTests : TestBase
             AssertEq(TestEnv.IndexApkManifestOnly.FileCount, 1);
             string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexApkManifestOnly, out why), GateVerdict.ContainerDocument); });
 
-        // Python wheel：任一 *.dist-info/ 路径段。
+        // Python wheel：任一 *.dist-info 路径段。**真实 wheel 里一个目录条目都没有**
+        //（pip / setuptools 用 python zipfile 打的包：`7z l -slt` 的 `Folder = +` 行数为 0，
+        // `.dist-info` 只作为文件路径里的一个段出现），所以规则必须扫**全部**条目 ——
+        // 只看目录条目就会对真实 wheel 永不触发，一路掉到「其余 ⇒ 放行」。
+        // 上面那条 IndexWheel 是 `7z a <seed>\*` 打的、**带**目录条目的形状（7-Zip 补的），
+        // 只靠它覆盖这条规则就会漏掉真实 wheel；下面这条才是真实形状的回归。
         H.Run("Gater.RefusesPythonWheel", delegate {
             string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexWheel, out why), GateVerdict.ContainerDocument);
+            AssertTrue(why.IndexOf("dist-info", StringComparison.Ordinal) >= 0); });
+
+        H.Run("Gater.RefusesWheelWithoutDirectoryEntries", delegate {
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexWheelNoDirEntries, out why), GateVerdict.ContainerDocument);
             AssertTrue(why.IndexOf("dist-info", StringComparison.Ordinal) >= 0); });
 
         // VSIX：extension.vsixmanifest。

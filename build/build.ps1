@@ -27,15 +27,20 @@ foreach ($stale in @((Join-Path $dist 'Rerar.exe'), (Join-Path $dist 'tests.exe'
 }
 
 # 编译一个目标，返回 csc 退出码（异常路径一律按失败返回 1）。
+# $extraRefs：可选的额外程序集引用（只给测试目标用）。测试需要 .NET 自带的
+#   System.IO.Compression（BCL，不是第三方包）：Task 5 的 wheel 回归夹具必须用 zip 写库
+#   逐条写**文件**、不写父目录条目 —— 7-Zip 打目录树会补写目录条目，造不出真实 wheel 的形状。
 # 命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
 # （相对计划唯一的偏离：统一的 UTF-8 代码页开关，理由见文件头）。
-function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources) {
+function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources, [string[]]$extraRefs) {
     $cscArgs = @(
         '/nologo'
         '/codepage:65001'
         ('/target:' + $target)
         ('/out:dist\' + $outName)
-    ) + $sources
+    )
+    if ($extraRefs) { $cscArgs += $extraRefs }
+    $cscArgs += $sources
 
     $code = 1   # 保守默认值：异常路径一律按失败处理，避免 exit $null（= 0）
     Push-Location $root
@@ -67,7 +72,8 @@ if (-not (Test-Path -LiteralPath $exe)) {
 Write-Host ("OK: " + $exe)
 
 # 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
-$code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs')
+# 额外引用只加在这里：应用目标不需要 zip 写库（见 Invoke-CscTarget 上的说明）。
+$code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs') @('/reference:System.IO.Compression.dll')
 if ($code -ne 0) {
     Write-Host ("FAIL: 测试目标 csc 退出码 " + $code)
     if ($code -gt 0) { exit $code }
