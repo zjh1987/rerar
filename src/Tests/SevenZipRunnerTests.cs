@@ -6,7 +6,9 @@
 //   stdin 关闭后密码提示不会挂起、取消与 TerminateAll 真的杀得掉子进程。
 //
 // 关于线程：凡是「本来可能永久挂起」的用例都放在后台线程上有界等待（RunBounded / Join），
-// 这样 I5 或 Job Object 一旦回归，得到的是一个 FAIL，而不是一套永远跑不完的测试。
+// 这样 I5、Job Object 或管道读取一旦回归，得到的是一个 FAIL，而不是一套永远跑不完的测试。
+// 注意 Harness 没有 per-case 超时：直接在主线程上跑「可能永不返回」的 Run，
+// 任何一条时间断言（sw.Elapsed < N）都永远没有机会执行 —— 那种用例必须用 RunBounded。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -41,9 +43,10 @@ internal sealed class SevenZipRunnerTests : TestBase
             RunResult r = SevenZipRunner.Run(TestEnv.SevenZip, new string[] { "x", TestEnv.CorruptZip, "-o" + TestEnv.Tmp, "-y", "-p" }, null, CancellationToken.None);
             AssertEq(r.ExitCode, 2); });
         H.Run("Runner.EncryptedWithoutPasswordDoesNotHang", delegate {
-            Stopwatch sw = Stopwatch.StartNew();
-            RunResult r = SevenZipRunner.Run(TestEnv.SevenZip, new string[] { "t", TestEnv.AesZip, "-p", "-y" }, null, CancellationToken.None);
-            AssertTrue(sw.Elapsed.TotalSeconds < 20); AssertTrue(r.ExitCode != 0); });
+            long elapsedMs;
+            RunResult r = RunBounded(20000, new string[] { "t", TestEnv.AesZip, "-p", "-y" }, out elapsedMs);
+            AssertTrue(elapsedMs < 20000);                 // 有界：这里一旦挂起就是 FAIL，而不是跑不完的测试
+            AssertTrue(r != null && r.ExitCode != 0); });  // r == null 表示 20s 内没返回
 
         // ---- 退出码 1 =「完成但有警告」仍算成功（brief 的 IsSuccess 语义，端到端验证）----
         // 独占锁住输入文件，7z 读不到它就只会警告（实测退出码 1，不是 2）。
@@ -111,10 +114,43 @@ internal sealed class SevenZipRunnerTests : TestBase
             AssertFalse(SevenZipRunner.IsSuccess(r.ExitCode));
             AssertTrue(r.StdErr != null && r.StdErr.Length > 0); });
 
+        // ---- 非 ASCII 成员名：Runner 必须自己钉死 -sccUTF-8（规格 §4.3）----
+        // 7z 默认按 OEM 代码页输出控制台文本，中文成员名在 StdOut 里会变成替换字符 U+FFFD
+        //（实测：不带 -sccUTF-8 的 l -slt 拿到的路径全是 U+FFFD），进度回调里的成员名同样会烂。
+        // 这里端到端跑「造包 -> 列表 -> 解压」，只有 Runner 自己注入开关才能全部通过。
+        H.Run("Runner.NonAsciiMemberNameSurvivesUtf8Console", delegate {
+            string name = "\u4e2d\u6587\u540d.txt";                 // 中文名.txt
+            string seed = TestEnv.MakeFile(name, "unicode member name\r\n");
+            string archive = TestEnv.TmpFile("unicode.zip");
+
+            RunResult created = SevenZipRunner.Run(TestEnv.SevenZip,
+                new string[] { "a", "-tzip", archive, seed, "-pSECRET", "-y" }, null, CancellationToken.None);
+            AssertTrue(SevenZipRunner.IsSuccess(created.ExitCode));
+
+            RunResult listed = SevenZipRunner.Run(TestEnv.SevenZip,
+                new string[] { "l", "-slt", archive, "-pSECRET", "-y" }, null, CancellationToken.None);
+            AssertTrue(SevenZipRunner.IsSuccess(listed.ExitCode));
+            AssertEq(EncodingProblem("l -slt 输出", listed.StdOut, name), "");
+
+            string outDir = Path.Combine(TestEnv.Tmp, "unicode-out");
+            RunResult extracted = SevenZipRunner.Run(TestEnv.SevenZip,
+                new string[] { "x", archive, "-o" + outDir, "-pSECRET", "-y" }, null, CancellationToken.None);
+            AssertTrue(SevenZipRunner.IsSuccess(extracted.ExitCode));
+            AssertEq(EncodingProblem("x 输出", extracted.StdOut, null), "");
+            AssertTrue(File.Exists(Path.Combine(outDir, name)));
+
+            // 调用方自己传了 -scc* 就不再注入（唯一的命令行出口必须幂等），结果一样干净
+            RunResult listedByCaller = SevenZipRunner.Run(TestEnv.SevenZip,
+                new string[] { "l", "-slt", "-sccUTF-8", archive, "-pSECRET", "-y" }, null, CancellationToken.None);
+            AssertTrue(SevenZipRunner.IsSuccess(listedByCaller.ExitCode));
+            AssertEq(EncodingProblem("调用方自带 -sccUTF-8 的 l -slt 输出", listedByCaller.StdOut, name), ""); });
+
         // ---- 无管道死锁：7z i 的输出约 11KB，远超 4KB 管道缓冲 ----
         // 老写法（WaitForExit() 之后再 ReadToEnd()）在这里会死锁；异步事件读必须能读完。
         H.Run("Runner.LargeStdOutDoesNotDeadlock", delegate {
-            RunResult r = SevenZipRunner.Run(TestEnv.SevenZip, new string[] { "i", "-p" }, null, CancellationToken.None);
+            long elapsedMs;
+            RunResult r = RunBounded(20000, new string[] { "i", "-p" }, out elapsedMs);
+            AssertTrue(r != null);                         // 有界：死锁回归 = FAIL，而不是跑不完的测试
             AssertEq(r.ExitCode, 0);
             AssertTrue(r.StdOut != null && r.StdOut.Length > 4000); });
 
@@ -159,6 +195,31 @@ internal sealed class SevenZipRunnerTests : TestBase
             AssertTrue(SevenZipRunner.IsSuccess(r.ExitCode));
             AssertEq(problem, ""); });
 
+        // ---- onProgress 抛异常绝不能杀掉宿主进程（GUI 会在解压中途整个消失）----
+        // 回调跑在管道读取线程上：那里的未处理异常从 .NET 2.0 起就是进程级终止；
+        // 而且读取循环一死就再也没有「流结束」通知，无参 WaitForExit() 会无限期阻塞。
+        // 正确行为：异常在 Run 的调用方栈上原样浮出，进程与运行器都活下来。
+        H.Run("Runner.ThrowingProgressCallbackSurfacesAtRunCallSite", delegate {
+            string seed = MakeSeed("callback-throw.bin", 4);          // 与进度用例同素材：保证真的有命名进度行
+            string archive = TestEnv.TmpFile("callback-throw.zip");
+
+            bool threw = false;
+            string message = "";
+            try {
+                SevenZipRunner.Run(TestEnv.SevenZip, SlowAddArgs(seed, archive),
+                    delegate(int percent, string member) { throw new InvalidOperationException("onProgress boom"); },
+                    CancellationToken.None);
+            }
+            catch (InvalidOperationException ex) { threw = true; message = ex.Message; }
+
+            AssertTrue(threw);                                        // 异常必须浮到 Run 的调用方
+            AssertEq(message, "onProgress boom");                     // 而且就是回调抛出的那一个
+
+            // 进程与运行器都还活着：再跑一条正常命令必须成功。
+            // 若回调异常真的杀了进程（回归时），执行根本到不了这一行。
+            RunResult after = SevenZipRunner.Run(TestEnv.SevenZip, new string[] { "i", "-p" }, null, CancellationToken.None);
+            AssertEq(after.ExitCode, 0); });
+
         // ---- 取消：ct 触发 TerminateJobObject，7z 必须当场死掉 ----
         H.Run("Runner.CancellationTokenTerminatesRunningChild", delegate {
             string seed = MakeSeed("cancel-seed.bin", 16);           // 完整压缩约 7 秒
@@ -199,6 +260,19 @@ internal sealed class SevenZipRunnerTests : TestBase
     }
 
     // ---------------- 辅助 ----------------
+
+    // 检查一段 7z 控制台输出的编码是否干净（成员名没被控制台字符集弄坏）：
+    // 出现替换字符 U+FFFD 或找不到期望的成员名都算问题；返回空串表示没问题。
+    private static string EncodingProblem(string what, string text, string expectedName)
+    {
+        if (text == null) { return what + " 为空（没有输出）"; }
+        if (text.IndexOf('\uFFFD') >= 0) { return what + " 里出现替换字符 U+FFFD（7z 控制台字符集不是 UTF-8）"; }
+        if (expectedName != null && text.IndexOf(expectedName, StringComparison.Ordinal) < 0)
+        {
+            return what + " 里找不到成员名 [" + expectedName + "]";
+        }
+        return "";
+    }
 
     private static int Check(string line, out int percent)
     {

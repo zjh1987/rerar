@@ -14,9 +14,14 @@
 //      本进程（含 GUI 被强杀）结束时子进程一起死；AssignProcessToJobObject 失败绝不静默降级，
 //      当场杀掉子进程并抛异常 —— 唯一的例外是「赋值时子进程已经退出」（实测返回 ERROR_ACCESS_DENIED），
 //      那种情况没有孤儿可保护，如实放行。
+//   4) 编码由本类集中保证（规格 §4.3）—— 命令行里钉死 -sccUTF-8，否则 7z 按 OEM 代码页输出控制台
+//      文本，中文成员名在 StdOut 与进度回调里全变成替换字符 U+FFFD（实测）。调用方自己传了 -scc*
+//      就以调用方的为准（本类不覆盖）。
 //
 // 线程约定：Run 每次调用只用局部状态，顺序调用之间不共享任何可变数据；多线程顺序调用安全
-// （不支持两个 Run 并发）。onProgress 在读取管道的后台线程被调用，UI 线程的编组由调用方负责。
+// （不支持两个 Run 并发）。onProgress 在读取管道的后台线程被调用，UI 线程的编组由调用方负责；
+// 回调抛出的异常**不会**从管道线程逃出去（那会杀掉整个进程），而是被记下来、在 WaitForExit()
+// 之后从 Run 原样抛出，见 Run 里对应的注释。
 // TerminateAll 可从任意线程调用。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
@@ -81,6 +86,11 @@ namespace Rerar.Core
             StringBuilder stdErr = new StringBuilder();
             object outputGate = new object();
 
+            // onProgress 在管道读取线程上抛出的第一个异常（见下面 OutputDataReceived 里的说明）。
+            // 由 progressGate 保护；Run 在 WaitForExit() 之后把它原样抛给调用方。
+            object progressGate = new object();
+            Exception[] progressFailure = new Exception[1];
+
             IntPtr job = CreateJob();
             Process process = new Process();
             process.StartInfo = psi;
@@ -88,7 +98,22 @@ namespace Rerar.Core
             {
                 if (e.Data == null) { return; }        // null 是「流结束」标记，不是一行内容
                 lock (outputGate) { stdOut.Append(e.Data).Append('\n'); }
-                DispatchProgress(e.Data, onProgress);
+                try
+                {
+                    DispatchProgress(e.Data, onProgress);
+                }
+                catch (Exception ex)
+                {
+                    // 调用方回调抛出的异常绝不能从管道读取线程逃出去：
+                    //  (a) .NET 2.0 起，任何线程上的未处理异常都直接终止整个进程 —— GUI 会在解压
+                    //      中途带着 CLR 崩溃信息消失（实测：调用方抛异常后 stdout 立刻停止，进程退出码
+                    //      0xE0434352）；Task 14 的 UI 编组遇到 ObjectDisposedException 就会踩到；
+                    //  (b) 即使运行时不杀进程，读取循环一死就再也没有「流结束」通知，
+                    //      无参 WaitForExit()（下面）会无限期阻塞 —— 本项目唯一进程入口上的无界挂起。
+                    // 所以这里只记下第一个异常、让读取循环继续跑完；等 WaitForExit() 返回后由 Run
+                    // 抛给调用方，异常位置从「随机的管道线程」变成「调用方自己的 Run 调用点」。
+                    lock (progressGate) { if (progressFailure[0] == null) { progressFailure[0] = ex; } }
+                }
             };
             process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
             {
@@ -139,9 +164,17 @@ namespace Rerar.Core
                 }
 
                 // 无参 WaitForExit() 会一并等待异步读事件处理完（.NET Framework 保证），
-                // 所以这一行之后 stdout/stderr 必定已经积累完整。
+                // 所以这一行之后 stdout/stderr 必定已经积累完整，回调也已经全部跑完
+                //（因此下面读 progressFailure 没有竞态）。
                 process.WaitForExit();
                 exitCode = process.ExitCode;
+
+                // onProgress 抛出的异常在这里浮出水面（绝不在管道线程上抛，也绝不吞掉）：
+                // 抛的是回调抛出的那个异常对象本身，类型与消息原样保留，便于调用方按类型处理
+                //（例如 Task 14 的 ObjectDisposedException）。代价是堆栈被重置到这一行。
+                Exception callbackFailure;
+                lock (progressGate) { callbackFailure = progressFailure[0]; }
+                if (callbackFailure != null) { throw callbackFailure; }
             }
             finally
             {
@@ -264,16 +297,41 @@ namespace Rerar.Core
             return false;
         }
 
+        // 参数表里是否有 -scc 前缀项（7z 的控制台字符集开关，如 -sccUTF-8 / -sccWIN / -sccDOS）。
+        // 有的话说明调用方自己决定了控制台字符集，本类不再注入（调用方的选择优先）。
+        private static bool HasConsoleCharsetSwitch(string[] args)
+        {
+            foreach (string arg in args)
+            {
+                if (arg != null && arg.StartsWith("-scc", StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
+
         // 7z 装在有空格的路子里是常态（C:\Program Files\7-Zip\...），而 .NET Framework 的
         // ProcessStartInfo 只有字符串 Arguments（ArgumentList 是 .NET Core 才有的），
         // 所以这里必须自己做 Windows 的命令行引号转义，否则路径会被拆成两个参数。
+        //
+        // 规格 §4.3：控制台字符集必须钉死在 UTF-8（与 StandardOutputEncoding 对齐），
+        // 否则 7z 按 OEM 代码页输出成员名，StdOut 与进度回调里的非 ASCII 名字全变成 U+FFFD
+        //（实测：中文成员名 l -slt 不带开关 → 全是替换字符，带开关 → 完好）。
+        // 这是 Runner 的责任：任何调用方忘了传都会静默损坏名字，所以在唯一的命令行出口处注入。
         private static string BuildCommandLine(string[] args)
         {
             StringBuilder sb = new StringBuilder();
+            bool first = true;
+
+            if (!HasConsoleCharsetSwitch(args))
+            {
+                sb.Append("-sccUTF-8");
+                first = false;
+            }
+
             for (int i = 0; i < args.Length; i++)
             {
-                if (i > 0) { sb.Append(' '); }
+                if (!first) { sb.Append(' '); }
                 AppendQuotedArgument(sb, args[i] == null ? "" : args[i]);
+                first = false;
             }
             return sb.ToString();
         }
