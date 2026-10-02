@@ -260,6 +260,55 @@ internal static class TestEnv
         get { return GaterIndex("gater-epub.zip", BuildEpubZip); }
     }
 
+    // ---- 以下 6 个夹具属于「规格 §6.4 表被裁定为欠包含」之后补的规则（不变式 I4 是权威）----
+    // 全部都是**一个标记就够**的形状：表里原来只写了常见形状（`+`）或干脆没写（其余 ⇒ 放行），
+    // 于是这些真容器会一路走到 Allow —— 开了「解压成功后删除原包」就是用户文档被销毁且全程 exit 0。
+
+    // Apple iWork（Pages/Numbers/Keynote）：主条目 Index/Document.iwa，且**不带**任何别的标记
+    //（没有 [Content_Types].xml、没有 mimetype），所以它只能靠 iWork 这条规则被认出来。
+    public static ArchiveIndex IndexIWork
+    {
+        get { return GaterIndex("gater-iwork.zip", BuildIWorkZip); }
+    }
+
+    // 同一族容器的另一个标记 Metadata/DocumentIdentifier（Keynote/Numbers 包里也有它）。
+    // 单列一个夹具，好让两条规则各自被真包钉住，而不是靠一个包「顺便」带过。
+    public static ArchiveIndex IndexIWorkIdentifier
+    {
+        get { return GaterIndex("gater-iwork-identifier.zip", BuildIWorkIdentifierZip); }
+    }
+
+    // Ant `<zip>` / 裸 `zip` 打出来的 jar：只有 .class，**没有** META-INF/MANIFEST.MF。
+    public static ArchiveIndex IndexJarClassesOnly
+    {
+        get { return GaterIndex("gater-jar-classes-only.zip", BuildJarClassesOnlyZip); }
+    }
+
+    // 只有 META-INF/MANIFEST.MF、一个 .class 都没有的资源 jar（classpath jar / OSGi 等）。
+    public static ArchiveIndex IndexJarManifestOnly
+    {
+        get { return GaterIndex("gater-jar-manifest-only.zip", BuildJarManifestOnlyZip); }
+    }
+
+    // 只有 AndroidManifest.xml、没有 classes.dex 的 APK 形状（无 dex 的 split APK / 资源包）。
+    public static ArchiveIndex IndexApkManifestOnly
+    {
+        get { return GaterIndex("gater-apk-manifest-only.zip", BuildApkManifestOnlyZip); }
+    }
+
+    // Python wheel：`<name>-<ver>.dist-info/` 是 wheel 规范要求的路径段（dist-info 目录本身
+    // 与它下面的 METADATA/RECORD 都带这个段，所以任一条目都能触发）。
+    public static ArchiveIndex IndexWheel
+    {
+        get { return GaterIndex("gater-wheel.zip", BuildWheelZip); }
+    }
+
+    // VSIX（VS 扩展包）：根级 extension.vsixmanifest。
+    public static ArchiveIndex IndexVsix
+    {
+        get { return GaterIndex("gater-vsix.zip", BuildVsixZip); }
+    }
+
     // 惰性「真 zip → ArchiveIndex」通用入口。
     //
     // 自检是必须的，不是装饰：夹具要是没被列出来（ListingFailed，或 0 个文件条目），Judge 会按
@@ -356,6 +405,64 @@ internal static class TestEnv
         SeedText(src, "mimetype", "application/epub+zip");
         SeedText(src, "META-INF/container.xml", "<?xml version=\"1.0\"?><container/>");
         SeedText(src, "OEBPS/content.opf", "<?xml version=\"1.0\"?><package/>");
+        ZipSeedDir(targetPath, src);
+    }
+
+    // Apple iWork 包：主条目 Index/Document.iwa（外加一个同样以 .iwa 结尾但**不叫** Document.iwa
+    // 的成员，确保匹配的是完整路径段而不是「后缀是 .iwa」这种过宽的判据）。
+    private static void BuildIWorkZip(string targetPath)
+    {
+        string src = SeedDir("gater-iwork-src");
+        SeedText(src, "Index/Document.iwa", "iwa fixture payload");
+        SeedText(src, "Index/Document.iwa.bak", "not the primary entry");
+        SeedText(src, "Metadata/Properties.plist", "<?xml version=\"1.0\"?><plist/>");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildIWorkIdentifierZip(string targetPath)
+    {
+        string src = SeedDir("gater-iwork-identifier-src");
+        SeedText(src, "Metadata/DocumentIdentifier", "iwork document identifier");
+        SeedText(src, "Index/Document.iwa.bak", "not the primary entry");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildJarClassesOnlyZip(string targetPath)
+    {
+        string src = SeedDir("gater-jar-classes-only-src");
+        SeedText(src, "com/example/App.class", "fixture class payload");
+        SeedText(src, "com/example/Helper.class", "fixture class payload");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildJarManifestOnlyZip(string targetPath)
+    {
+        string src = SeedDir("gater-jar-manifest-only-src");
+        SeedText(src, "META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n\r\n");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildApkManifestOnlyZip(string targetPath)
+    {
+        string src = SeedDir("gater-apk-manifest-only-src");
+        SeedText(src, "AndroidManifest.xml", "<?xml version=\"1.0\"?><manifest/>");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildWheelZip(string targetPath)
+    {
+        string src = SeedDir("gater-wheel-src");
+        SeedText(src, "mypkg/__init__.py", "# fixture package\r\n");
+        SeedText(src, "mypkg-1.0.dist-info/METADATA", "Name: mypkg\r\nVersion: 1.0\r\n");
+        SeedText(src, "mypkg-1.0.dist-info/RECORD", "mypkg/__init__.py,,\r\n");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildVsixZip(string targetPath)
+    {
+        string src = SeedDir("gater-vsix-src");
+        SeedText(src, "extension.vsixmanifest", "<?xml version=\"1.0\"?><PackageManifest/>");
+        SeedText(src, "extension/readme.txt", "fixture extension payload");
         ZipSeedDir(targetPath, src);
     }
 

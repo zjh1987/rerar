@@ -7,6 +7,11 @@
 //   * 标记名大小写不敏感；
 //   * «含嵌套 zip 的普通包»照样放行 —— 否则本工具的主用例（递归）整体失效。
 //
+// 尾部另有一组用例属于「规格 §6.4 特征表被裁定为欠包含」之后补上的规则（不变式 I4 是权威）：
+//   * Apple iWork（Index/Document.iwa、Metadata/DocumentIdentifier）；
+//   * JAR / APK 的两个标记**各自单独**就够（原表写成合取，会让真容器整包放行）；
+//   * Python wheel（*.dist-info/ 路径段）、VSIX（extension.vsixmanifest）。
+//
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
 using System;
@@ -45,6 +50,46 @@ internal sealed class ArchiveGaterTests : TestBase
         // ---- 规格 §6.4 第 4/5 行（EPUB / ODF 的 mimetype 标记条目）----
         H.Run("Gater.RefusesEpubMimetypeMarker", delegate {
             string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexEpub, out why), GateVerdict.ContainerDocument); });
+
+        // ---- 规格 §6.4 表被裁定为「欠包含」之后补的 6 条（不变式 I4 是约束权威，不是表里那一行）----
+        // 共同形状：单凭一个标记就足以拒绝。漏判的一侧是「用户的文档被拆散 + 原文件被删」，
+        // 多判的一侧只是「少递归一层，用户可在界面上强制按压缩包尝试」，两侧代价完全不对称。
+
+        // Apple iWork（Pages/Numbers/Keynote）：zip 包，主条目是 Index/Document.iwa。
+        // 它一个现有标记都不带，只靠「其余 ⇒ 放行」就会走进拆散用户文档的那条路。
+        H.Run("Gater.RefusesIWorkIndexDocument", delegate {
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexIWork, out why), GateVerdict.ContainerDocument);
+            AssertTrue(why.IndexOf("iwa", StringComparison.Ordinal) >= 0); });      // 拒绝的理由必须指名是哪种身份
+
+        H.Run("Gater.RefusesIWorkMetadataIdentifier", delegate {
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexIWorkIdentifier, out why), GateVerdict.ContainerDocument);
+            AssertTrue(why.IndexOf("DocumentIdentifier", StringComparison.Ordinal) >= 0); });
+
+        // JAR 的两个半边**各自单独**都够（Ant <zip> 打的 jar 没有 MANIFEST.MF；资源 jar 没有 .class）。
+        // 规格的 `+` 描述的是常见形状，不是「必须两半齐全」的许可：一旦要求配对，
+        // classes-only / manifest-only 的真容器就整包放行、被递归拆散。
+        H.Run("Gater.RefusesJarWithClassesOnly", delegate {
+            AssertEq(TestEnv.IndexJarClassesOnly.FileCount, 2);
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexJarClassesOnly, out why), GateVerdict.ContainerDocument); });
+
+        H.Run("Gater.RefusesJarWithManifestOnly", delegate {
+            AssertEq(TestEnv.IndexJarManifestOnly.FileCount, 1);
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexJarManifestOnly, out why), GateVerdict.ContainerDocument); });
+
+        // APK：只有 AndroidManifest.xml、没有 classes.dex（无 dex 的 split APK / 资源包）。
+        H.Run("Gater.RefusesApkWithoutDex", delegate {
+            AssertEq(TestEnv.IndexApkManifestOnly.FileCount, 1);
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexApkManifestOnly, out why), GateVerdict.ContainerDocument); });
+
+        // Python wheel：任一 *.dist-info/ 路径段。
+        H.Run("Gater.RefusesPythonWheel", delegate {
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexWheel, out why), GateVerdict.ContainerDocument);
+            AssertTrue(why.IndexOf("dist-info", StringComparison.Ordinal) >= 0); });
+
+        // VSIX：extension.vsixmanifest。
+        H.Run("Gater.RefusesVsix", delegate {
+            string why; AssertEq(ArchiveGater.Judge(TestEnv.IndexVsix, out why), GateVerdict.ContainerDocument);
+            AssertTrue(why.IndexOf("vsixmanifest", StringComparison.Ordinal) >= 0); });
 
         // ---- 清单读不出来（损坏包，真 7-Zip 退出码 2）：不知道身份就绝不递归 ----
         H.Run("Gater.RefusesFailedListing", delegate {
