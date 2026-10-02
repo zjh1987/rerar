@@ -20,6 +20,15 @@
 //   3. 空 / 纯空白 / 只剩零宽字符的候选**丢弃**，绝不产出空密码：空密码在某些格式下是一次"合法"
 //      的尝试，让它混进阶梯毫无意义，还可能把「没设密码」误判成「密码是空字符串」。
 //
+// 线索（CluesFromFileNames / CluesFromTextFile）另有三条规则，都是「加法而不是替换」：
+//   * 标签值给**两个粒度**：第一个空白之前的 token（`abc123 请勿传播` 里有用的是 token）与**整段**
+//     （只以括号/引号/句读这类硬终止符收尾，于是 `密码：my pass` 拿得到 `my pass` —— 空格是密码里
+//     合法的字符，只认 token 会先试一个错的，比不支持空格更糟）。
+//   * 标签与值之间**可以没有分隔符**：网盘名常见 `xxx密码123456.rar` / `解压密码123456`。紧贴形式的值
+//     原本是文件名的一部分，故再补一条剥掉扩展名的候选（`123456.rar` 也照留）。
+//   * 名字**主干**（末段去扩展名）算最后优先级的线索 —— 密码就是包名的包总得有机会；它排在所有标签值
+//     与 URL 主机名之后（CluesFromFileNames 因此分两遍：先采标签/URL，再补主干）。
+//
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
 using System;
@@ -94,18 +103,50 @@ namespace Rerar.Core
 
         // 文件名 / 文件夹名里的线索（含 `【解压密码：xxx】` 形式，也含名字里出现的 URL 主机名）。
         // 调用方可以把目录名与文件名一起传进来：本方法只看字符串，路径里的父目录同样会被扫到。
+        //
+        // 分两遍：先把**所有**名字里的标签值与 URL 主机名采完，最后才补每个名字的**主干**（末段去扩展名）。
+        // 规格 §6.5 把「文件名与文件夹名」本身也算线索来源 —— 密码就是包名的包总得有机会；但裸名字远不如
+        // 带标签的值可信，所以它是**最后优先级**：`movie.rar` 的 `movie` 排在任何 `解压密码：…` 之后。
+        // 顺序不是装饰，用户会看着清单往前走。
         public static IEnumerable<string> CluesFromFileNames(IEnumerable<string> names)
         {
             List<string> clues = new List<string>();
             if (names == null) { return clues; }
 
             HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            List<string> stems = new List<string>();
+
             foreach (string name in names)
             {
                 if (name == null) { continue; }
                 HarvestLine(name, clues, seen);
+                stems.Add(NameStem(name));      // 主干先攒着：它要等所有标签/URL 采完
             }
+
+            foreach (string stem in stems)
+            {
+                // 空主干（`C:\dir\` 这种以分隔符收尾的名字）不要；已经在清单里的值（标签/URL 采到的）不重复补。
+                if (stem.Length == 0 || seen.Contains(stem)) { continue; }
+                AddVariants(clues, seen, stem);
+            }
+
             return clues;
+        }
+
+        // 名字的**主干**：末段（最后一个 `\` 或 `/` 之后）+ 去扩展名。纯字符串操作，不碰文件系统。
+        // `xxx密码123456.rar` ⇒ `xxx密码123456`；文件夹名（没有扩展名）原样。
+        private static string NameStem(string name)
+        {
+            int slash = -1;
+            for (int i = name.Length - 1; i >= 0; i--)
+            {
+                if (name[i] == '\\' || name[i] == '/') { slash = i; break; }
+            }
+
+            string last = name.Substring(slash + 1).Trim();
+            int dot = last.LastIndexOf('.');
+            if (dot > 0) { last = last.Substring(0, dot); }     // dot == 0 是 `.gitignore` 这种名字，不剥
+            return last;
         }
 
         // 小文本文件的**内容**（不是路径）→ 线索。逐行扫描，行内按出现先后采集，故线索也保序。
@@ -308,7 +349,14 @@ namespace Rerar.Core
                 || c == '-' || c == '.' || c == '_';
         }
 
-        // 命中「标签 + 分隔符」后读出值：读到空白 / 括号 / 引号 / 中英文句读为止。
+        // 命中标签后读出值。两种形态都认：
+        //   * **分隔形式** `密码：x` / `password=x` / `密码是x` / `密码 x` —— 标签与值之间有分隔符；
+        //   * **紧贴形式** `xxx密码123456.rar` / `解压密码123456` —— 网盘名里的常见写法，标签后直接跟值。
+        // 值给**两个粒度**，都是加法、不互相替换：
+        //   * token：读到第一个空白为止。文本里的值常紧跟说明文字（`abc123 请勿外传`），那时有用的是 token，
+        //     而且它保持本方法原有的行为与位置（先于整段进清单）；
+        //   * 整段：只以**硬终止符**（括号 / 引号 / 句读）收尾，空白不再截断 —— 密码里可以合法地含空格
+        //     （`密码：my pass`）。少了这一条，含空格的密码永远试不到正确的那个，却会先试一个错的 token。
         // 返回消费掉的字符数（0 = 此处没有线索）。
         private static int TryHarvestLabelledValue(string line, int index, List<string> clues, HashSet<string> seen)
         {
@@ -316,27 +364,82 @@ namespace Rerar.Core
             if (labelLength == 0) { return 0; }
 
             int at = index + labelLength;
-            if (at >= line.Length || !IsLabelValueSeparator(line[at])) { return 0; }
-            while (at < line.Length && IsLabelValueSeparator(line[at])) { at++; }
-
-            int start = at;
-            while (at < line.Length && !IsValueTerminator(line[at])) { at++; }
-
-            int consumed = at - index;
-            if (consumed <= 0) { consumed = 1; }
-
-            string value = line.Substring(start, at - start).Trim();
-            if (value.Length > 0)
+            bool glued = false;
+            if (at >= line.Length)
             {
-                AddVariants(clues, seen, value);
-
-                // 句读收尾（`解压密码：abc.`）时补一条剥掉尾句读的候选。原文也留着，
-                // 所以这是一次**加法**：两种写法都在清单里，猜错一次也只是多花一次 `7z t`。
-                string tailTrimmed = value.TrimEnd(TrailingJunk);
-                if (tailTrimmed.Length > 0 && tailTrimmed != value) { AddVariants(clues, seen, tailTrimmed); }
+                return 0;                                   // 行尾只有一个光秃秃的标签
+            }
+            if (IsLabelValueSeparator(line[at]))
+            {
+                while (at < line.Length && IsLabelValueSeparator(line[at])) { at++; }
+            }
+            else
+            {
+                glued = true;                               // 标签后面直接跟值，没有分隔符
             }
 
+            int start = at;
+
+            int tokenEnd = start;                           // token：空白也算终止符
+            while (tokenEnd < line.Length && !IsValueTerminator(line[tokenEnd])) { tokenEnd++; }
+
+            int restEnd = start;                            // 整段：只认硬终止符
+            while (restEnd < line.Length && !IsHardValueTerminator(line[restEnd])) { restEnd++; }
+
+            // 消费到 token 末尾为止（**不是**整段末尾）：后面可能还跟着另一个标签（`密码：a 解压密码：b`），
+            // 整段读完会把第二个标签连同它的值一起吞掉。整段只作为**额外出的一条候选**。
+            int consumed = tokenEnd - index;
+            if (consumed <= 0) { consumed = 1; }
+
+            string token = line.Substring(start, tokenEnd - start).Trim();
+            AddValue(clues, seen, token);
+
+            if (glued)
+            {
+                // 紧贴形式的值原本就是**文件名的一部分**（`xxx密码123456.rar` 的值是 `123456.rar`），
+                // 扩展名是名字的尾巴而不是密码的一部分，所以补一条剥掉扩展名的候选。加法：`123456.rar` 照留。
+                string withoutExtension = StripFileExtension(token);
+                if (withoutExtension.Length > 0 && withoutExtension != token) { AddVariants(clues, seen, withoutExtension); }
+            }
+
+            string rest = line.Substring(start, restEnd - start).Trim();
+            if (rest != token) { AddValue(clues, seen, rest); }      // 整段与 token 相同时不重复加
+
             return consumed;
+        }
+
+        // 采一条标签值：原文 + 句读收尾时补一条剥掉尾句读的候选（`解压密码：abc.` ⇒ `abc.` 与 `abc` 都在）。
+        private static void AddValue(List<string> clues, HashSet<string> seen, string value)
+        {
+            if (value.Length == 0) { return; }
+
+            AddVariants(clues, seen, value);
+
+            string tailTrimmed = value.TrimEnd(TrailingJunk);
+            if (tailTrimmed.Length > 0 && tailTrimmed != value) { AddVariants(clues, seen, tailTrimmed); }
+        }
+
+        // 值的**硬**终止符：空白不算。整段读取用它，于是 `密码：my pass` 才拿得到 `my pass`。
+        private static bool IsHardValueTerminator(char c)
+        {
+            if (char.IsWhiteSpace(c)) { return false; }
+            return IsValueTerminator(c);
+        }
+
+        // 剥掉末尾的文件扩展名（`123456.rar` ⇒ `123456`）；后缀不像扩展名就原样返回。
+        // 只给**紧贴**形式用：那里的值本来就是文件名的一部分，扩展名不属于密码。
+        private static string StripFileExtension(string value)
+        {
+            int dot = value.LastIndexOf('.');
+            if (dot <= 0 || dot + 1 >= value.Length) { return value; }
+
+            string suffix = value.Substring(dot + 1);
+            if (suffix.Length > 6) { return value; }
+            foreach (char c in suffix)
+            {
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) { return value; }
+            }
+            return value.Substring(0, dot);
         }
 
         // 值的终止符：空白、括号、引号、中英文句读。刻意**不**包含半角 `!`、`?`、`*`、`#`、`@`、

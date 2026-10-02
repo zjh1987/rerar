@@ -6,6 +6,9 @@
 //
 // 末尾 7 条用例覆盖 brief Step 3 与规格 §6.5 写明、但 brief 未给用例的行为：保序去重、
 // 空/纯空白候选被丢弃、原文变体、各前缀形式（含全角冒号）、URL 只取主机名、字典先于线索。
+//
+// 最后 3 条是控制方裁定后补齐的两个缺口（各一条用例 + 名字主干次序）：含空格的值必须整段成候选、
+// 紧贴形式（`解压密码123456`）必须与分隔形式一样被认出、名字主干必须排在标签值/URL 之后。
 
 using System.Collections.Generic;
 using Rerar.Core;
@@ -64,5 +67,30 @@ internal sealed class PasswordCandidatesTests : TestBase
             List<string> l = new List<string>(PasswordCandidates.Build("M", TestEnv.F("S1"), TestEnv.F("D1"), TestEnv.F("C1")));
             AssertTrue(l.IndexOf("D1") > l.IndexOf("S1"));
             AssertTrue(l.IndexOf("C1") > l.IndexOf("D1")); });
+
+        // 缺口 1：含空格的密码。`密码：my pass` 必须产出整段 `my pass`（空格是密码的一部分），
+        // 同时保留旧的 token 行为 —— `解压密码：abc123 请勿传播` 里有用的是 `abc123`。
+        H.Run("Pwd.ClueKeepsSpacedValueAlongsideToken", delegate {
+            List<string> spaced = new List<string>(PasswordCandidates.CluesFromTextFile("密码：my pass"));
+            AssertTrue(spaced.Contains("my pass"));
+            AssertTrue(spaced.Contains("my"));
+            List<string> prose = new List<string>(PasswordCandidates.CluesFromTextFile("解压密码：abc123 请勿传播"));
+            AssertTrue(prose.Contains("abc123")); });
+
+        // 缺口 2：无分隔符的标签（网盘名 `xxx密码123456.rar` / 文件夹 `解压密码123456`）。
+        // 紧贴形式取的是「标签之后的值」；文件名里的扩展名是名字的尾巴，不属于密码，故一并剥掉。
+        // 第三条是**回归**：分隔形式（含 `【解压密码：…】`）必须照旧。
+        H.Run("Pwd.ClueAcceptsLabelWithoutSeparator", delegate {
+            AssertTrue(new List<string>(PasswordCandidates.CluesFromFileNames(TestEnv.F("解压密码123456"))).Contains("123456"));
+            AssertTrue(new List<string>(PasswordCandidates.CluesFromFileNames(TestEnv.F("xxx密码123456.rar"))).Contains("123456"));
+            AssertTrue(new List<string>(PasswordCandidates.CluesFromFileNames(TestEnv.F("【解压密码：hello123】movie.rar"))).Contains("hello123")); });
+
+        // 规格 §6.5 把「文件名与文件夹名」也算线索来源：名字主干（末段去扩展名）在最末，
+        // 排在所有标签值之后 —— 于是 `movie.rar` 的 `movie` 不会插到 `hello123` 前面。
+        H.Run("Pwd.NameStemIsLastPriorityClue", delegate {
+            List<string> c = new List<string>(PasswordCandidates.CluesFromFileNames(TestEnv.F("movie.rar", "【解压密码：hello123】show.rar")));
+            AssertTrue(c.Contains("hello123"));
+            AssertTrue(c.Contains("movie"));
+            AssertTrue(c.IndexOf("movie") > c.IndexOf("hello123")); });
     }
 }
