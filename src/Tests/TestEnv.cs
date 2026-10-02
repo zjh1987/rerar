@@ -201,6 +201,225 @@ internal static class TestEnv
         get { return Fixture("single-stream.bz2", BuildSingleStreamBz2); }
     }
 
+    // ------------------------------------------------------------------
+    // 容器文档 fixture（Task 5 起）：ArchiveGater.Judge 的输入。
+    //
+    // 每个都是一份**真 zip**（7-Zip 打出来的）经 SevenZipIndex.Read 得到的 ArchiveIndex ——
+    // 内容身份（条目名）就是判定依据本身，所以夹具必须由真打包器产生，不能手搓索引。
+    // H.Run 每用例清空整个临时根，故与其它 fixture 一样：惰性 + 不存在则重建。
+    // ------------------------------------------------------------------
+
+    // 规格 §6.4 最典型的 OOXML：根级 [Content_Types].xml + 根级 _rels/.rels + word/document.xml。
+    public static ArchiveIndex IndexDocx
+    {
+        get { return GaterIndex("gater-docx.zip", BuildDocxZip); }
+    }
+
+    // 同样的 OOXML 身份，外加一个**真**嵌套 zip（word/embeddings/embedding1.zip）：
+    // 钉住「包里有包」绝不能成为放行理由 —— 那是把 Word 文档交给递归拆散的最短路径。
+    public static ArchiveIndex IndexDocxWithNestedZip
+    {
+        get { return GaterIndex("gater-docx-nested.zip", BuildDocxWithNestedZip); }
+    }
+
+    // 身份标记全大写（[CONTENT_TYPES].XML / _RELS/.RELS）：zip 条目名是大小写敏感的字节串，
+    // 各家打包工具的大小写五花八门，而标记名的大小写不携带语义。
+    public static ArchiveIndex IndexDocxUpperCase
+    {
+        get { return GaterIndex("gater-docx-upper.zip", BuildDocxUpperCaseZip); }
+    }
+
+    // APK：AndroidManifest.xml + classes.dex（规格 §6.4 第 2 行）。
+    public static ArchiveIndex IndexApk
+    {
+        get { return GaterIndex("gater-apk.zip", BuildApkZip); }
+    }
+
+    // JAR：META-INF/MANIFEST.MF + 任一 .class（规格 §6.4 第 3 行）。
+    public static ArchiveIndex IndexJar
+    {
+        get { return GaterIndex("gater-jar.zip", BuildJarZip); }
+    }
+
+    // 普通 zip（几个普通文件）：判定必须放行，否则递归功能整体失效。
+    public static ArchiveIndex IndexPlain
+    {
+        get { return GaterIndex("gater-plain.zip", BuildPlainZip); }
+    }
+
+    // 普通 zip + 真嵌套 zip：本工具的主用例就是「包里的包」，
+    //「含 .zip 条目」本身绝不能成为拒绝理由。
+    public static ArchiveIndex IndexPlainWithNestedZip
+    {
+        get { return GaterIndex("gater-plain-nested.zip", BuildPlainWithNestedZip); }
+    }
+
+    // EPUB/ODF：根级 mimetype 标记条目（OCF 容器规范要求它是本包根级的成员）。
+    public static ArchiveIndex IndexEpub
+    {
+        get { return GaterIndex("gater-epub.zip", BuildEpubZip); }
+    }
+
+    // 惰性「真 zip → ArchiveIndex」通用入口。
+    //
+    // 自检是必须的，不是装饰：夹具要是没被列出来（ListingFailed，或 0 个文件条目），Judge 会按
+    //「清单不可用 ⇒ 拒绝递归」直接返回 ContainerDocument —— 于是**所有拒绝类用例都会在一个坏
+    // 夹具上假通过**。这里当场把这种静默假通过变成一条明确的 FAIL。
+    private static ArchiveIndex GaterIndex(string fileName, Action<string> build)
+    {
+        string path = Fixture(fileName, build);
+        ArchiveIndex index = SevenZipIndex.Read(SevenZip, path, null);
+        if (index.ListingFailed || index.FileCount == 0)
+        {
+            throw new InvalidOperationException(
+                "容器文档夹具 " + fileName + " 的清单不可用：ListingFailed=" + index.ListingFailed +
+                "，FileCount=" + index.FileCount + "，ExitCode=" + index.ExitCode +
+                "（那种形状会让拒绝类用例假通过）");
+        }
+        return index;
+    }
+
+    private static void BuildDocxZip(string targetPath)
+    {
+        string src = SeedDir("gater-docx-src");
+        SeedDocxMarkers(src, false);
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildDocxWithNestedZip(string targetPath)
+    {
+        string src = SeedDir("gater-docx-nested-src");
+        SeedDocxMarkers(src, false);
+
+        // 真嵌套 zip（不是改个名的空壳）：先真造一个 zip 放进 seed 目录，再连同外层一起打包。
+        string innerSrc = SeedDir("gater-inner-docx-src");
+        SeedText(innerSrc, "payload.txt", "Rerar gater fixture: nested payload\r\n");
+        ZipSeedDir(Path.Combine(src, @"word\embeddings\embedding1.zip"), innerSrc);
+
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildDocxUpperCaseZip(string targetPath)
+    {
+        string src = SeedDir("gater-docx-upper-src");
+        SeedDocxMarkers(src, true);
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildApkZip(string targetPath)
+    {
+        string src = SeedDir("gater-apk-src");
+        SeedText(src, "AndroidManifest.xml", "<?xml version=\"1.0\"?><manifest/>");
+        SeedText(src, "classes.dex", "dex 035 fixture payload");
+        SeedText(src, "META-INF/CERT.RSA", "not-a-real-certificate");
+        SeedText(src, "res/layout/main.xml", "<?xml version=\"1.0\"?><layout/>");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildJarZip(string targetPath)
+    {
+        string src = SeedDir("gater-jar-src");
+        SeedText(src, "META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n\r\n");
+        SeedText(src, "com/example/App.class", "fixture class payload");
+        SeedText(src, "com/example/App.java", "class App {}");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildPlainZip(string targetPath)
+    {
+        string src = SeedDir("gater-plain-src");
+        SeedText(src, "a.txt", "alpha");
+        SeedText(src, "b.txt", "bravo");
+        SeedText(src, "docs/readme.md", "# readme");
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildPlainWithNestedZip(string targetPath)
+    {
+        // 与 IndexPlain 同样的三个普通文件，只多一个真嵌套 zip：于是用例可以断言
+        //「同一份输入 + 一个嵌套包」依然放行，差别确实只在那一个成员上。
+        string src = SeedDir("gater-plain-nested-src");
+        SeedText(src, "a.txt", "alpha");
+        SeedText(src, "b.txt", "bravo");
+        SeedText(src, "docs/readme.md", "# readme");
+
+        string innerSrc = SeedDir("gater-inner-plain-src");
+        SeedText(innerSrc, "inner.txt", "inner");
+        ZipSeedDir(Path.Combine(src, "inner.zip"), innerSrc);
+
+        ZipSeedDir(targetPath, src);
+    }
+
+    private static void BuildEpubZip(string targetPath)
+    {
+        string src = SeedDir("gater-epub-src");
+        SeedText(src, "mimetype", "application/epub+zip");
+        SeedText(src, "META-INF/container.xml", "<?xml version=\"1.0\"?><container/>");
+        SeedText(src, "OEBPS/content.opf", "<?xml version=\"1.0\"?><package/>");
+        ZipSeedDir(targetPath, src);
+    }
+
+    // OOXML 的身份标记。upper = true 时全部大写（大小写不敏感用例）。
+    private static void SeedDocxMarkers(string srcDir, bool upper)
+    {
+        string contentTypes = "[Content_Types].xml";
+        string rels = "_rels/.rels";
+        string document = "word/document.xml";
+        if (upper)
+        {
+            contentTypes = "[CONTENT_TYPES].XML";
+            rels = "_RELS/.RELS";
+            document = "WORD/DOCUMENT.XML";
+        }
+
+        SeedText(srcDir, contentTypes, "<?xml version=\"1.0\"?><Types/>");
+        SeedText(srcDir, rels, "<?xml version=\"1.0\"?><Relationships/>");
+        SeedText(srcDir, document, "<?xml version=\"1.0\"?><document/>");
+    }
+
+    // 造夹具用的 seed 目录：每次构造前清空重建，半成品不会被下一轮当成有效输入。
+    private static string SeedDir(string name)
+    {
+        string dir = Path.Combine(_root, "fixture-seed", name);
+        if (Directory.Exists(dir)) { Directory.Delete(dir, true); }
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    // 在 seed 目录里写一个成员（自动补中间目录）。
+    private static void SeedText(string srcDir, string relativePath, string content)
+    {
+        string path = Path.Combine(srcDir, relativePath);
+        string parent = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        File.WriteAllText(path, content, new UTF8Encoding(false));
+    }
+
+    // 把一个 seed 目录打成 zip：条目名 = 相对 seed 目录的路径（正是身份判定要的形状）。
+    //
+    // 为什么用 `"<seed>\*"` 而不是把每个文件当参数（本机 7-Zip 26.01 实测）：
+    //   * 逐个传绝对路径会丢掉目录部分 —— `_rels\.rels` 被存成 `.rels`、`word\document.xml`
+    //     被存成 `document.xml`，OOXML/JAR 的路径特征就没了；
+    //   * `[Content_Types].xml` 直接当参数会被 7z 当成通配符（方括号是它的通配语法），
+    //     报「系统找不到指定的文件」。
+    // 通配符让 7z 自己枚举目录，条目名恰好是相对路径，方括号原样保留。
+    //
+    // -pSECRET 是被不变式 I5 逼出来的：Runner 硬拒不带 -p 的参数表，而 7-Zip 的 a 命令拿到
+    // 空 -p 会弹密码提示（实测）。zip 的成员名在中央目录里是明文（TwoFileZip 已自检过这一点），
+    // 所以加密不影响 SevenZipIndex.Read 用空 -p 读清单。
+    private static void ZipSeedDir(string targetPath, string seedDir)
+    {
+        string parent = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        if (File.Exists(targetPath)) { File.Delete(targetPath); }
+
+        string[] args = new string[] { "a", "-tzip", targetPath, seedDir + @"\*", "-pSECRET", "-y" };
+        RunResult r = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(r.ExitCode)) { FixtureFailed("构造 zip 夹具", args, r); }
+
+        if (!File.Exists(targetPath)) { throw new InvalidOperationException("zip 夹具构造失败，未生成 " + targetPath); }
+    }
+
     // 惰性 fixture 统一入口：先造到 <名字>.building，成功后再改名到位，
     // 这样半成品绝不会被后续用例当成可复用的 fixture。
     private static string Fixture(string fileName, Action<string> build)
