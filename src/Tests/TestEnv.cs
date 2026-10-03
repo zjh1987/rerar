@@ -1850,4 +1850,389 @@ internal static class TestEnv
         }
         return false;
     }
+
+    // ==================================================================
+    // Task 10 修复轮 #3（Finding 1–4）的夹具与驱动
+    // ==================================================================
+
+    // ---------------- Finding 1：致命/触顶之后「没轮到」的那些候选 ----------------
+
+    // 固定可用空间（第 1 个目标就因空间不足成为致命档）+ 多个目标：用来钉住
+    // 「致命中止之后，本轮**还没轮到处理**的候选全部进 NotAttempted（且没有 Results 条目）」。
+    public static RunSummary RunExtractManyWithFakeDisk(long freeBytes, params string[] archives)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        return new Extractor(options, new SequenceDisk(new long[] { freeBytes }), null).Run(archives);
+    }
+
+    // ---------------- Finding 2：一次**跑得久**的密码验证 ----------------
+
+    // 形状：512 MiB 全零（NTFS 稀疏文件，实占近 0）+ 8 MiB 随机填充，用 7-Zip 压成**加密 zip**
+    //（ZipCrypto，密码 SECRET，头部明文 ⇒ 清单读得出来 ⇒ 流程会走到密码阶梯）。
+    //
+    // 为什么必须这么大：这条用例要证明的命题是「取消能打断**正在跑的那一次** `t`」。小夹具上
+    // 一次 `t` 只有几十毫秒，与「下一个候选之前才发现取消」在时间上完全无法区分 —— 那个区分只能
+    // 建立在「一次调用本身足够长」上。本机实测（7-Zip 26.01）：
+    //     t -pSECRET  ≈ 0.85 s（要解压 512 MiB）
+    //     t -pWRONG   ≈ 0.02 s（ZipCrypto 的头校验立刻失败）
+    //     l -slt -p   ≈ 0.05 s（只读中央目录，不解压）
+    // 8 MiB 随机填充的作用是把**包体**抬到解压后总量的 1% 以上：否则解压比会超过
+    // Preflight.MaxExpansionRatio(100)，这个包会在**密码阶梯之前**就被安全上限拒掉，用例白测
+    //（自检 2 钉住这一点）。
+    private const long SlowVerifyZeroBytes = 512L * 1024 * 1024;
+    private const int SlowVerifyPadBytes = 8 * 1024 * 1024;
+
+    public static string SlowEncryptedZip
+    {
+        get { return Fixture("slow-verify.zip", BuildSlowEncryptedZip); }
+    }
+
+    private static void BuildSlowEncryptedZip(string targetPath)
+    {
+        string sourceDir = Path.Combine(_root, "slow-verify-src");
+        if (!Directory.Exists(sourceDir)) { Directory.CreateDirectory(sourceDir); }
+
+        // 稀疏零文件：逻辑大小 512 MiB、实占接近 0（与 OversizedFile 同一套 FSCTL_SET_SPARSE 做法）。
+        string zeros = Path.Combine(sourceDir, "zeros.bin");
+        if (!File.Exists(zeros) || new FileInfo(zeros).Length != SlowVerifyZeroBytes)
+        {
+            using (FileStream fs = new FileStream(zeros, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            {
+                uint returned;
+                bool ok = DeviceIoControl(fs.SafeFileHandle.DangerousGetHandle(), FsctlSetSparse,
+                    IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
+                if (!ok)
+                {
+                    throw new InvalidOperationException("FSCTL_SET_SPARSE 失败（Win32 错误 " + Marshal.GetLastWin32Error() + "）");
+                }
+                fs.SetLength(SlowVerifyZeroBytes);
+            }
+        }
+
+        string pad = SeedBinary("slow-verify-pad.bin", SlowVerifyPadBytes);
+
+        string[] args = new string[] { "a", "-tzip", "-mx1", targetPath, zeros, pad, "-pSECRET", "-y" };
+        RunResult built = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(built.ExitCode)) { FixtureFailed("构造 SlowEncryptedZip fixture", args, built); }
+
+        // 自检 1：清单必须读得出来、且带 `Encrypted = +`（否则永远走不到密码阶梯）。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (listed.StdOut == null || listed.StdOut.IndexOf("Encrypted = +", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException(
+                "SlowEncryptedZip fixture 构造失败：清单里没有 `Encrypted = +`；stdout=[" + Head(listed.StdOut) + "]");
+        }
+
+        // 自检 2：解压比必须**明显低于**安全上限（否则会被 caps 拦在密码阶梯之前）。
+        long pack = new FileInfo(targetPath).Length;
+        double ratio = (double)(SlowVerifyZeroBytes + SlowVerifyPadBytes) / (double)pack;
+        if (ratio > Preflight.MaxExpansionRatio * 0.8)
+        {
+            throw new InvalidOperationException("SlowEncryptedZip fixture 构造失败：解压比约 " + (long)ratio +
+                " 倍，太接近安全上限 " + Preflight.MaxExpansionRatio + " 倍（会被拦在密码阶梯之前）");
+        }
+
+        // 自检 3：密码确实是 SECRET（否则「第一次 `t` 就是慢的那一次」不成立）。
+        string[] verifyArgs = new string[] { "t", targetPath, "-pSECRET", "-y" };
+        RunResult verified = RunSevenZip(verifyArgs);
+        if (!SevenZipRunner.IsSuccess(verified.ExitCode)) { FixtureFailed("校验 SlowEncryptedZip fixture（SECRET 打不开）", verifyArgs, verified); }
+    }
+
+    // 有没有 7z 子进程已经烧掉 >= milliseconds 的 CPU 时间。用例用它把「取消」精确地落进一次
+    // **完整校验**（`t`）里：`l -slt` 只读中央目录、CPU 时间几乎为 0，而 `t` 要解压整个包。
+    // 判据用 CPU 时间而不是墙钟：机器慢只会让同一次调用更慢，不会把一次清单读取变成一次校验。
+    public static bool AnySevenZipBurningCpu(long milliseconds)
+    {
+        Process[] running = Process.GetProcessesByName("7z");
+        try
+        {
+            foreach (Process p in running)
+            {
+                try
+                {
+                    if (!p.HasExited && p.TotalProcessorTime.TotalMilliseconds >= milliseconds) { return true; }
+                }
+                catch (Exception)
+                {
+                    // 拿不到某个进程的 CPU 时间（权限等）就跳过它，不因为「看不见」而误判。
+                }
+            }
+        }
+        finally
+        {
+            foreach (Process p in running) { p.Dispose(); }
+        }
+        return false;
+    }
+
+    // 带真实取消令牌跑一遍（Finding 2 的驱动）。
+    public static RunSummary RunExtractWithToken(string archive, string password, CancellationToken token)
+    {
+        RunOptions options = NewOptions(password, 10, false, 2);
+        options.Cancellation = token;
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
+
+    // 一次候选验证（`t`）要多久。用例拿它当基线：取消之后必须**远早于**一整次调用就跑完。
+    public static long TimeSingleVerification(string archive, string password)
+    {
+        Stopwatch watch = Stopwatch.StartNew();
+        RunSevenZip(new string[] { "t", archive, "-p" + password, "-y" });
+        watch.Stop();
+        return watch.ElapsedMilliseconds;
+    }
+
+    // 预检放行、之后每次查询都抛的 provider（Finding 2 的第二半：解压后那次 FreeBytes 必须被包住，
+    // 让「查不出来」落进「按空间不足处理」的不提交路径，而不是降级成「内部错误」）。
+    public static RunSummary RunExtractWithThrowingDisk(string archive)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        return new Extractor(options, new ThrowingDisk(), null).Run(new string[] { archive });
+    }
+
+    private sealed class ThrowingDisk : IDiskSpaceProvider
+    {
+        private int _calls;
+
+        public long FreeBytes(string path)
+        {
+            _calls++;
+            if (_calls <= 1) { return long.MaxValue; }     // 第 1 次 = 预检：放行
+            throw new InvalidOperationException("注入的磁盘查询失败（用例构造）");
+        }
+    }
+
+    // ---------------- Finding 3：长路径 / 未完成标记 ----------------
+
+    // 目标目录名最长的归档副本：120 个 'q' + ".zip" ⇒ 消毒后的目标目录名正好 120 字符
+    //（PathSanitizer 的长度上限）。于是「裸目标名 + 条目」正好可以顶到 MaxPathLength。
+    public static string LongNamedArchiveCopy()
+    {
+        string path = TmpFile(new string('q', 120) + ".zip");
+        File.Copy(LongEntryZip, path, true);
+        return path;
+    }
+
+    // 让**旧度量**（裸目标名 + 条目名）正好等于 Preflight.MaxPathLength 的条目名长度。
+    // 旧度量放行、**新度量**（目标名 + " (未完成) (2)" + 条目名 = 旧度量 + 17）必然拒绝 ——
+    // 这条用例钉的就是这 17 个字符的差。长度随 OutRoot 现算，机器不同也成立。
+    public static int LongEntryNameLength
+    {
+        get { return 258 - (OutRoot.Length + 1 + 120); }
+    }
+
+    public static string LongEntryName
+    {
+        get { return new string('e', LongEntryNameLength - 4) + ".txt"; }
+    }
+
+    public static string LongEntryZip
+    {
+        get { return Fixture("long-entry.zip", BuildLongEntryZip); }
+    }
+
+    private static void BuildLongEntryZip(string targetPath)
+    {
+        int length = LongEntryNameLength;
+        if (length < 8 || length > 200)
+        {
+            throw new InvalidOperationException("长路径夹具的前提不成立：条目名长度 " + length +
+                "（临时目录太深或太浅，见 LongEntryNameLength）");
+        }
+        string entryName = LongEntryName;
+        WriteZipFile(targetPath, delegate(ZipArchive z) { AddZipText(z, entryName, "Rerar long-path fixture\r\n"); });
+    }
+
+    // 「清单读得出来、解压一定失败（CRC 错）」的 zip：唯一成员是 stored 的短名字 `payload`，
+    // 数据里的标记字节被翻掉一位 ⇒ `l -slt` 成功（基线可用）、`x` 退出码 2 ⇒ 走 MarkIncomplete。
+    // 失败路径的长度用例需要一个「写到盘上、然后失败」的输入，这是最便宜、最确定的一种。
+    private const string CorruptPayloadMarker = "RERAR-CORRUPT-ME-0123456789-ABCDEFGHIJ";
+
+    public static string CorruptPayloadZip
+    {
+        get { return Fixture("corrupt-payload.zip", BuildCorruptPayloadZip); }
+    }
+
+    // 该夹具唯一的成员名（长度就是它 —— 用例拿它算路径长度）。
+    public const string CorruptPayloadEntryName = "payload";
+
+    private static void BuildCorruptPayloadZip(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            ZipArchiveEntry entry = z.CreateEntry(CorruptPayloadEntryName, CompressionLevel.NoCompression);
+            using (Stream stream = entry.Open())
+            {
+                byte[] bytes = new UTF8Encoding(false).GetBytes(CorruptPayloadMarker);
+                stream.Write(bytes, 0, bytes.Length);
+            }
+        });
+
+        byte[] file = File.ReadAllBytes(targetPath);
+        byte[] marker = new UTF8Encoding(false).GetBytes(CorruptPayloadMarker);
+        int at = IndexOfBytes(file, marker);
+        if (at < 0)
+        {
+            throw new InvalidOperationException("CorruptPayloadZip fixture 构造失败：找不到数据标记（stored 成员应当原样落在文件里）");
+        }
+        file[at + 5] = (byte)(file[at + 5] ^ 0xFF);
+        File.WriteAllBytes(targetPath, file);
+
+        // 自检 1：清单仍读得出来（⇒ 有可用基线 ⇒ 流程会真的写盘，然后才在 CRC 上失败）。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode))
+        {
+            FixtureFailed("校验 CorruptPayloadZip fixture（清单必须可读）", listArgs, listed);
+        }
+        // 自检 2：解压必须失败（否则这条用例根本没走到 MarkIncomplete）。
+        string[] testArgs = new string[] { "t", targetPath, "-p", "-y" };
+        RunResult tested = RunSevenZip(testArgs);
+        if (SevenZipRunner.IsSuccess(tested.ExitCode))
+        {
+            FixtureFailed("校验 CorruptPayloadZip fixture（必须解压失败）", testArgs, tested);
+        }
+    }
+
+    private static int IndexOfBytes(byte[] haystack, byte[] needle)
+    {
+        if (haystack == null || needle == null || needle.Length == 0) { return -1; }
+        for (int i = 0; i + needle.Length <= haystack.Length; i++)
+        {
+            bool ok = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != needle[j]) { ok = false; break; }
+            }
+            if (ok) { return i; }
+        }
+        return -1;
+    }
+
+    // 「哨兵的名字已经被占住」的 zip：除了一份 CRC 坏掉的成员（必然走失败路径），还有一个
+    // **同名目录条目** `_RERAR_INCOMPLETE.txt/`。于是 MarkIncomplete 无论先写还是后写都不可能把
+    // 哨兵文件放进去 —— 这正是「标记真的放不下」这一档：必须**如实写进判词**，绝不像旧实现那样
+    // 静默留下一个没有标记的目录。恶意/畸形归档里出现这个形状是现实的（成员名由归档作者决定）。
+    public static string SentinelNameClashZip
+    {
+        get { return Fixture("sentinel-clash.zip", BuildSentinelNameClashZip); }
+    }
+
+    private static void BuildSentinelNameClashZip(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            z.CreateEntry("_RERAR_INCOMPLETE.txt/");     // 与哨兵同名的**目录**条目
+            ZipArchiveEntry entry = z.CreateEntry(CorruptPayloadEntryName, CompressionLevel.NoCompression);
+            using (Stream stream = entry.Open())
+            {
+                byte[] bytes = new UTF8Encoding(false).GetBytes(CorruptPayloadMarker);
+                stream.Write(bytes, 0, bytes.Length);
+            }
+        });
+
+        byte[] file = File.ReadAllBytes(targetPath);
+        byte[] marker = new UTF8Encoding(false).GetBytes(CorruptPayloadMarker);
+        int at = IndexOfBytes(file, marker);
+        if (at < 0) { throw new InvalidOperationException("SentinelNameClashZip fixture 构造失败：找不到数据标记"); }
+        file[at + 5] = (byte)(file[at + 5] ^ 0xFF);
+        File.WriteAllBytes(targetPath, file);
+
+        // 自检 1：清单读得出来（目录条目不计入文件数，基线仍在）。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 SentinelNameClashZip fixture（清单必须可读）", listArgs, listed); }
+        // 自检 2：解压必须失败（CRC 错 ⇒ 走 MarkIncomplete 那条失败路径）。
+        string[] testArgs = new string[] { "t", targetPath, "-p", "-y" };
+        RunResult tested = RunSevenZip(testArgs);
+        if (SevenZipRunner.IsSuccess(tested.ExitCode)) { FixtureFailed("校验 SentinelNameClashZip fixture（必须解压失败）", testArgs, tested); }
+        // 自检 3：7-Zip 解压后必须真的在暂存树里造出那个**同名目录**（否则「标记放不下」这个前提是假的）。
+        string probe = Path.Combine(_root, "sentinel-clash-probe");
+        if (Directory.Exists(probe)) { Directory.Delete(probe, true); }
+        Directory.CreateDirectory(probe);
+        RunSevenZip(new string[] { "x", targetPath, "-o" + probe, "-p", "-y" });
+        bool clash = Directory.Exists(Path.Combine(probe, "_RERAR_INCOMPLETE.txt"));
+        try { Directory.Delete(probe, true); }
+        catch (Exception) { }
+        if (!clash)
+        {
+            throw new InvalidOperationException("SentinelNameClashZip fixture 构造失败：7-Zip 没有把同名条目解成目录");
+        }
+    }
+
+    // 长度 >= atLeastLength 的嵌套输出根（每次加一个目录段，最多只超 1 个字符）。
+    // Finding 3 的用例要控制「目标目录名 + (未完成) + 哨兵名」的长度，于是输出根必须够深；
+    // 具体长度由调用方用返回值的 Length 现算（机器不同 Tmp 长度不同，绝不写死）。
+    public static string LongOutputRoot(int atLeastLength)
+    {
+        string path = Tmp;
+        while (path.Length < atLeastLength)
+        {
+            int need = atLeastLength - path.Length;
+            if (need < 2) { need = 2; }
+            if (need > 100) { need = 100; }
+            path = Path.Combine(path, new string('d', need - 1));
+        }
+        if (!Directory.Exists(path)) { Directory.CreateDirectory(path); }
+        return path;
+    }
+
+    // 指定输出根跑一遍（Finding 3 的长度用例要自己控制目标目录的长度）。
+    public static RunSummary RunExtractWithOutputRoot(string archive, string outputRoot)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        options.OutputRoot = outputRoot;
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
+
+    // ---------------- Finding 4：密码来源类别 ----------------
+
+    // 用给定口令造的加密 zip（ZipCrypto；头部明文 ⇒ 清单读得出来 ⇒ 流程会走到密码阶梯）。
+    // 两个口令分别服务「字典层命中」的两条标签：内置字典（123456 在内置表里）与导入字典。
+    public static string BuiltInDictZip
+    {
+        get { return Fixture("dict-builtin.zip", delegate(string p) { BuildDictZip(p, "123456"); }); }
+    }
+
+    public static string ImportedDictZip
+    {
+        get { return Fixture("dict-imported.zip", delegate(string p) { BuildDictZip(p, "ImportedSecret"); }); }
+    }
+
+    private static void BuildDictZip(string targetPath, string password)
+    {
+        string sourceDir = Path.Combine(_root, "dict-src");
+        if (!Directory.Exists(sourceDir)) { Directory.CreateDirectory(sourceDir); }
+        string source = Path.Combine(sourceDir, "dict-payload.txt");
+        File.WriteAllText(source, "Rerar dictionary-label fixture\r\n", new UTF8Encoding(false));
+
+        string[] args = new string[] { "a", "-tzip", "-mx1", targetPath, source, "-p" + password, "-y" };
+        RunResult built = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(built.ExitCode)) { FixtureFailed("构造字典口令夹具", args, built); }
+
+        // 自检 1：清单必须读得出来、且带 `Encrypted = +`（否则走不到密码阶梯）。
+        RunResult listed = RunSevenZip(new string[] { "l", "-slt", targetPath, "-p", "-y" });
+        if (listed.StdOut == null || listed.StdOut.IndexOf("Encrypted = +", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException("字典口令夹具构造失败：清单里没有 `Encrypted = +`");
+        }
+        // 自检 2：口令确实有效、空口令确实无效（否则用例断言的「命中了字典层」是假的）。
+        if (!SevenZipRunner.IsSuccess(RunSevenZip(new string[] { "t", targetPath, "-p" + password, "-y" }).ExitCode))
+        {
+            throw new InvalidOperationException("字典口令夹具构造失败：`t -p<口令>` 没成功");
+        }
+        if (SevenZipRunner.IsSuccess(RunSevenZip(new string[] { "t", targetPath, "-p", "-y" }).ExitCode))
+        {
+            throw new InvalidOperationException("字典口令夹具构造失败：空口令竟然解开了");
+        }
+    }
+
+    // 带导入字典跑一遍（Finding 4 的「导入字典」那一半）。
+    public static RunSummary RunExtractWithDictionary(string archive, string[] dictLines)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        options.DictLines = new List<string>(dictLines);
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
 }

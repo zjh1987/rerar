@@ -67,8 +67,19 @@ namespace Rerar.Core
         // 「取消」与「真的失败」在运行级别上区分开。
         public bool Cancelled;
 
-        // 因致命原因中止而**没有处理**的候选（原样路径）。与规格 §10.1 对深度上限的要求同理：
-        // 绝不静默停止 —— 未处理的项必须能被列出来。它们不是 Failed（没试过，谈不上失败）。
+        // **未处理项的权威清单**（原样路径；规格 §10.1「触顶必须显式列出未处理项」）。
+        //
+        // 契约（Task 10 修复轮 #3 的 Finding 1 裁定）：
+        //   * 本清单是**唯一权威**的「这一项没有被处理」的集合，**与原因无关** —— 递归深度触顶、
+        //     致命中止（盘满 / 取消）之后还没来得及处理的候选，全部都在这里；
+        //   * 因**深度触顶**而未处理的项在 Results 里**同时**有一条 Status = NotAttemptedDepthLimit
+        //     的结果（每个归档的结局枚举必须如实反映，报告/界面靠它分类），于是同一个归档会**同时**
+        //     出现在 Results 与 NotAttempted 两个集合里；
+        //   * 消费方**不得把两个集合相加**去数「未处理项」：未处理项的总数就是 NotAttempted.Count，
+        //     Results 里那条 NotAttemptedDepthLimit 是同一件事的另一种表述（按状态分类用）；
+        //   * 除深度触顶外的其它未处理原因**没有**对应的 Results 条目（它们没被处理过，谈不上结局）。
+        //
+        // 它们都不是 Failed（没试过，谈不上失败），也绝不静默丢掉。
         public List<string> NotAttempted = new List<string>();
     }
 
@@ -125,6 +136,11 @@ namespace Rerar.Core
         private volatile bool _extractionRunning;
         private volatile bool _lowWaterDuringExtraction;
         private bool _lowWaterAfterRun;
+
+        // 低水位判定来自「查询可用空间失败」时（注入的 provider 抛异常）的**如实判词**：
+        // 那时说「可用空间低于低水位 N 字节」是不实陈述，所以单独记下真正的原因。
+        // 与上面几个标志一样是「运行级 + 每归档重置」的。
+        private string _lowWaterProbeReason;
         private int _lastLadderTries;
         private string _lastMatchedCandidate = "";
 
@@ -164,6 +180,9 @@ namespace Rerar.Core
                     {
                         ArchiveResult notAttempted = DepthLimitResult(task);
                         summary.Results.Add(notAttempted);
+                        // 同一项也进 NotAttempted（**权威的未处理清单**，与原因无关）：
+                        // 只把它放进 Results 会让「打印 NotAttempted」的消费方**少报**未处理项。
+                        summary.NotAttempted.Add(task.Path);
                         NotifyFinished(notAttempted);      // 界面/CLI 也要看到这些「未处理项」
                     }
                     break;
@@ -179,7 +198,7 @@ namespace Rerar.Core
                     {
                         // 用户取消要在**运行级**如实标注：取消既不是成功，也不是「这个归档失败了」。
                         if (_options.Cancellation.IsCancellationRequested) { summary.Cancelled = true; }
-                        summary.NotAttempted.Add(task.Path);
+                        summary.NotAttempted.Add(task.Path);       // 权威的未处理清单（与原因无关）
                         continue;
                     }
 
@@ -204,6 +223,8 @@ namespace Rerar.Core
                 if (Stopped())
                 {
                     if (_options.Cancellation.IsCancellationRequested) { summary.Cancelled = true; }
+                    // 本轮已解出、但**还没轮到处理**的候选：进权威的未处理清单（没有 Results 条目 ——
+                    // 它们没被处理过，谈不上结局）。
                     foreach (ArchiveTask task in next) { summary.NotAttempted.Add(task.Path); }
                     break;
                 }
@@ -326,13 +347,21 @@ namespace Rerar.Core
             }
 
             // --- 3) 索引：**一次** Read 同时服务门控与完整性基线 ---
+            // 【为什么这一次 Read 仍然用 CancellationToken.None（修复轮 #3 的 Finding 2，明确保留）】
+            //   1. 它是**取消之前**的那次读：此刻我们还不知道这个包需不需要密码，而「需不需要密码」
+            //      只能由它的结论（ListingFailed + HasEncryptedHeaders）决定 —— 半途打断会让后续
+            //      每一步都建立在「读不出来」之上，把「被取消」误判成「需要密码」；
+            //   2. 它的实现是 Task 4 已定稿的 SevenZipIndex.Read(path, archive, password)，签名里
+            //      没有 token。为了这一处给它加参数会改动本修复轮之外的模块（及它的其它调用方），
+            //      而 Task 12/14 已在消费这个签名 —— 不在本轮范围内动它。
+            // 密码阶梯与清单探针的每一次调用都拿到真实 token（见下），那才是会跑很久的那一批。
             ArchiveIndex index = SevenZipIndex.Read(_options.SevenZipPath, archiveArg, null);
             string password = null;
             if (Preflight.NeedsPassword(index))
             {
                 // 头部加密：连清单都读不出来。候选用 `l` 验证（对头部加密的 7z，只有正确密码的
                 // `l -p…` 才成功；比 `t` 便宜得多），验证到了再用它把清单读出来。
-                password = FindPassword(archiveArg, true, null);
+                password = FindPassword(archiveArg, true, null, _options.Cancellation);
                 if (password == null) { return PasswordUnavailable(result); }
                 index = SevenZipIndex.Read(_options.SevenZipPath, archiveArg, password);
             }
@@ -359,15 +388,20 @@ namespace Rerar.Core
                 return Reject(result, ArchiveStatus.SkippedUnreadable, namingProblem);
             }
 
-            // 长路径按**实际写入的那个目录名**判定：暂存目录名是随机的 .rerar-stage-xxx，
-            // 而最终目标名可能很长（被消毒后的归档名最长 120 字符）—— 两者都可能成为最长的那一个。
-            string writeRoot = stagingBase.Length >= target.Length ? stagingBase : target;
+            // 长路径按**流程实际能产生的最长目录名**判定（修复轮 #3 的 Finding 3）：解压写盘发生在
+            // 暂存目录下（随机 .rerar-stage-xxx），但任何失败路径都会把暂存目录改名成
+            // "<目标名> (未完成)"（同名已存在时再加 " (2)"）—— 那个名字比目标名本身长 10 个字符。
+            // 只按「暂存名 / 裸目标名」判定会漏掉这一档：条目路径离上限只差几个字符时，改名本身
+            // 会失败（改名失败会留下一个**已带哨兵**的目录，见 MarkIncomplete，但用户看到的名字
+            // 不是他要的 "<名字> (未完成)"）。所以这里取三者中最长的那个做度量。
+            string writeRoot = LongestWriteRoot(stagingBase, target);
             string overlong = Preflight.FindOverlongEntry(writeRoot, index);
             if (overlong != null)
             {
                 return Reject(result, ArchiveStatus.SkippedUnreadable,
-                    "路径过长（预检拒绝，规格 §10.2）：条目「" + overlong + "」加上目标目录会超过 " +
-                    Preflight.MaxPathLength + " 字符；原包保留");
+                    "路径过长（预检拒绝，规格 §10.2）：条目「" + overlong + "」加上输出目录名会超过 " +
+                    Preflight.MaxPathLength + " 字符（度量的是流程实际会用到的最长目录名，含失败路径要改成的" +
+                    "「 (未完成)」名）；原包保留");
             }
             string conflict = Preflight.FindConflictingEntries(index);
             if (conflict != null)
@@ -400,13 +434,17 @@ namespace Rerar.Core
             }
 
             // --- 6) 密码（§6.5）：线索必须在任何改名/移动/删除**之前**采集 ---
+            // 这一段里的每一次 7-Zip 调用都带真实 token（修复轮 #3 的 Finding 2）：此刻 linked 还没
+            // 建起来（低水位轮询是从「预检通过」之后的第 7 步才启动的，见下），所以能发生的取消只有
+            // 用户那一个 —— 正是 `_options.Cancellation`。取消落在这一段时，FindPassword 返回 null，
+            // PasswordUnavailable 会把「已取消」如实报出来（绝不误报成「需要密码」）。
             if (password == null)
             {
-                string listing = RunListingProbe(archiveArg);
+                string listing = RunListingProbe(archiveArg, _options.Cancellation);
                 if (Preflight.MentionsEncryption(listing))
                 {
                     List<string> clues = HarvestClues(sourcePath, listing);
-                    password = FindPassword(archiveArg, false, clues);
+                    password = FindPassword(archiveArg, false, clues, _options.Cancellation);
                     if (password == null) { return PasswordUnavailable(result); }
                     // 只记「哪个候选 + 来源类别」，绝不把密码值写进结果/报告（凭据卫生，§6.5）。
                     result.Message = AppendMessage(result.Message,
@@ -415,13 +453,17 @@ namespace Rerar.Core
             }
 
             // --- 7) 低水位轮询 + 暂存 → 解压 → 校验 → 提交 → 删除 ---
-            // 轮询从「预检通过」就启动，一直活到本归档处理结束：它覆盖密码阶梯、暂存与解压全过程，
-            // 于是「预检时够、真正写的时候不够」这个窗口也被盯住了。轮询线程与解压线程并发，
+            // 轮询从这里（预检通过、密码已验证）启动，一直活到本归档处理结束：它覆盖暂存与解压
+            // 全过程，于是「预检时够、真正写的时候不够」这个窗口也被盯住了。轮询线程与解压线程并发，
             // 低水位时的动作是 `linked.Cancel()` —— Runner 走 Job Object 把子进程打断（退出码 1223）。
+            // 【范围如实说明】密码阶梯（上一段）发生时轮询还没启动，那一段里能发生的取消只有用户
+            // 取消（已按 Finding 2 穿进每一次 `t`/`l`）；低水位轮询不覆盖密码阶梯 —— 这是本轮
+            // 刻意不动的一处（只修被点名的发现，不重排安全路径）。
             CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(_options.Cancellation);
             _lowWaterHit = false;
             _lowWaterAfterRun = false;
             _lowWaterDuringExtraction = false;
+            _lowWaterProbeReason = null;
             Timer poller = StartDiskPoller(destRoot, linked);
             RunResult extraction = null;
             try
@@ -429,7 +471,8 @@ namespace Rerar.Core
                 PollDisk(destRoot, linked);     // 同步复检一次：不让「刚够」变成「边写边满」
                 if (_lowWaterHit)
                 {
-                    return LowWaterAbort(result, stagingBase, target, sourcePath, "已中止本归档（尚未开始解压）");
+                    return LowWaterAbort(result, stagingBase, target, sourcePath,
+                        LowWaterReason("已中止本归档（尚未开始解压）"));
                 }
                 if (_options.Cancellation.IsCancellationRequested)
                 {
@@ -466,10 +509,29 @@ namespace Rerar.Core
                 // --- 8) 先分类「被打断」：1223 是被 Job Object 打断，不是解压失败，更不是成功 ---
                 // 兜底复核：即便轮询线程错过了窗口（解压太快 / 定时器还没到点），也绝不把产物提交到
                 // 已经低于低水位的卷上。它与轮询走**同一条**「不提交」路径，只是触发时机不同。
-                if (!_lowWaterHit && _disk.FreeBytes(destRoot) < _options.MinFreeBytes)
+                //
+                // 【为什么这里也要 try/catch（修复轮 #3 的 Finding 2）】注入进来的 provider 可能抛
+                //（默认实现内部已吞掉异常并返回 0）。**绝不能让它逃出 Process** —— 那会把结果降级成
+                //「内部错误」，用户看到的是「程序出错了」而不是「空间不明、未提交、原包保留」。
+                // 处置方向与预检一致：查不出来 ⇒ 按**不足**处理（绝不因为查不出来就当够用），
+                // 走与低水位**同一条**不提交路径，判词如实说是查询失败（不谎称可用空间低于低水位）。
+                if (!_lowWaterHit)
                 {
-                    _lowWaterHit = true;
-                    _lowWaterAfterRun = true;
+                    try
+                    {
+                        if (_disk.FreeBytes(destRoot) < _options.MinFreeBytes)
+                        {
+                            _lowWaterHit = true;
+                            _lowWaterAfterRun = true;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _lowWaterHit = true;
+                        _lowWaterAfterRun = true;
+                        _lowWaterProbeReason = "无法查询目标卷可用空间（" + ex.GetType().Name + "：" + ex.Message +
+                            "）：按空间不足处理，解压结果未提交；原包保留";
+                    }
                 }
 
                 if (_lowWaterHit || linked.IsCancellationRequested || extraction.ExitCode == CancelledExitCode)
@@ -479,15 +541,17 @@ namespace Rerar.Core
                         // Review Focus #1：低水位 —— 干净中止，绝不提交半成品、绝不删原包。
                         // 判词区分「解压中途中止」与「解压完成后复核发现」：两者是同一条安全路径，
                         // 但读者（用户与复核者）需要知道是哪一种。
-                        return LowWaterAbort(result, stagingBase, target, sourcePath, _lowWaterAfterRun
-                            ? "解压完成后的复核发现空间不足，未提交"
-                            : (_lowWaterDuringExtraction ? "已在解压中途中止" : "已在解压开始前中止（未提交）"));
+                        return LowWaterAbort(result, stagingBase, target, sourcePath, _lowWaterProbeReason != null
+                            ? _lowWaterProbeReason
+                            : LowWaterReason(_lowWaterAfterRun
+                                ? "解压完成后的复核发现空间不足，未提交"
+                                : (_lowWaterDuringExtraction ? "已在解压中途中止" : "已在解压开始前中止（未提交）")));
                     }
 
                     _summary.Cancelled = true;
-                    MarkIncomplete(stagingBase, target, sourcePath, "用户取消");
+                    string cancelMark = MarkIncomplete(stagingBase, target, sourcePath, "用户取消");
                     result.Status = ArchiveStatus.Failed;
-                    result.Message = "已取消：本归档未完成（暂存目录已标记为未完成）；原包保留";
+                    result.Message = AppendMessage("已取消：本归档未完成；原包保留", cancelMark);
                     return result;
                 }
 
@@ -525,10 +589,10 @@ namespace Rerar.Core
             {
                 // 枚举/属性读不动 ⇒ 校验做不完（长路径、被占用、权限）：绝不据此判成功，
                 // 但也**不删**暂存内容 —— 它是用户可能想要的半成品，按规格 §6.7 改名"未完成"。
-                MarkIncomplete(stagingBase, target, sourcePath, "校验期间有 " + scan.Unreadable.Count + " 个条目读不动");
+                string unreadableMark = MarkIncomplete(stagingBase, target, sourcePath, "校验期间有 " + scan.Unreadable.Count + " 个条目读不动");
                 result.Status = ArchiveStatus.Failed;
-                result.Message = "无法完成完整性校验：暂存树里有 " + scan.Unreadable.Count +
-                    " 个条目读不动（例如路径过长或被占用）：未提交，原包保留";
+                result.Message = AppendMessage("无法完成完整性校验：暂存树里有 " + scan.Unreadable.Count +
+                    " 个条目读不动（例如路径过长或被占用）：未提交，原包保留", unreadableMark);
                 return result;
             }
 
@@ -537,9 +601,9 @@ namespace Rerar.Core
                 string diagnostics = Head(Best(extraction));
                 string fatal = DiskFullReason(extraction);
                 if (fatal != null) { FailRun(fatal); }
-                MarkIncomplete(stagingBase, target, sourcePath, "7-Zip 退出码 " + extraction.ExitCode);
+                string failedMark = MarkIncomplete(stagingBase, target, sourcePath, "7-Zip 退出码 " + extraction.ExitCode);
                 result.Status = ArchiveStatus.Failed;
-                result.Message = "解压失败（7-Zip 退出码 " + extraction.ExitCode + "）：" + diagnostics + "；原包保留";
+                result.Message = AppendMessage("解压失败（7-Zip 退出码 " + extraction.ExitCode + "）：" + diagnostics + "；原包保留", failedMark);
                 return result;
             }
 
@@ -549,9 +613,9 @@ namespace Rerar.Core
             if (!Preflight.TryGetBaseline(index, extraction.StdOut, out expectedFiles, out expectedBytes, out countsFiles))
             {
                 // 绝不用退出码顶上来当成功证据（I1）。没有基线 ⇒ 不提交、原包保留。
-                MarkIncomplete(stagingBase, target, sourcePath, "没有可用的完整性基线");
+                string baselineMark = MarkIncomplete(stagingBase, target, sourcePath, "没有可用的完整性基线");
                 result.Status = ArchiveStatus.Failed;
-                result.Message = "无法校验完整性：没有可用的索引基线（绝不以退出码判定成功）；未提交，原包保留";
+                result.Message = AppendMessage("无法校验完整性：没有可用的索引基线（绝不以退出码判定成功）；未提交，原包保留", baselineMark);
                 return result;
             }
 
@@ -581,9 +645,11 @@ namespace Rerar.Core
             }
             catch (Exception ex)
             {
-                MarkIncomplete(stagingBase, target, sourcePath, "提交失败：" + ex.Message);
+                string commitMark = MarkIncomplete(stagingBase, target, sourcePath, "提交失败：" + ex.Message);
                 result.Status = ArchiveStatus.Failed;
-                result.Message = AppendMessage(result.Message, "提交失败（同卷改名 " + ex.GetType().Name + "：" + ex.Message + "）：原包保留");
+                result.Message = AppendMessage(
+                    AppendMessage(result.Message, "提交失败（同卷改名 " + ex.GetType().Name + "：" + ex.Message + "）：原包保留"),
+                    commitMark);
                 return result;
             }
             if (!Directory.Exists(target))
@@ -702,16 +768,24 @@ namespace Rerar.Core
         //   1. 判「成员是否加密」（`Encrypted = +`）——ArchiveIndex 不带这个信息；
         //   2. 采集归档注释作为密码线索（§6.5）。
         // 它不承担基线职责：基线只由那次 SevenZipIndex.Read 提供（I1 的「一次 Read」）。
-        private string RunListingProbe(string archiveArg)
+        //
+        // ct 必须传进来（修复轮 #3 的 Finding 2）：这一步发生在密码阶梯之前，对「成员加密、
+        // 头部明文」的包，它是整条流水线上第一个可能跑很久的 7-Zip 调用；用户按下取消时，
+        // 它同样必须能被 Job Object 立刻打断，而不是等它自己跑完。
+        private string RunListingProbe(string archiveArg, CancellationToken ct)
         {
             string[] args = new string[] { "l", "-slt", archiveArg, "-p", "-y" };
-            RunResult listing = SevenZipRunner.Run(_options.SevenZipPath, args, null, CancellationToken.None);
+            RunResult listing = SevenZipRunner.Run(_options.SevenZipPath, args, null, ct);
             return (listing.StdOut == null ? "" : listing.StdOut) + "\n" + (listing.StdErr == null ? "" : listing.StdErr);
         }
 
         // 密码阶梯（§6.5）：手动 → 本次已验证成功 → 导入字典 → 内置字典 → 同目录线索。
         // 逐个用 `t`（或头部加密时的 `l`）验证 —— **绝不用 x**：错密码的 x 会写出大量垃圾。
-        private string FindPassword(string archiveArg, bool useListing, IEnumerable<string> clues)
+        //
+        // ct（修复轮 #3 的 Finding 2）：每一次候选验证都是一次**完整校验**，在几十 GB 的包上
+        // 可能一跑就是几分钟 —— 那正是最需要能被打断的地方。取消必须能立刻打断**正在跑的那一次**
+        // 调用，而不是等它自己结束之后才由循环顶部的 Stopped() 发现。
+        private string FindPassword(string archiveArg, bool useListing, IEnumerable<string> clues, CancellationToken ct)
         {
             List<string> dict = new List<string>();
             if (_options.DictLines != null) { dict.AddRange(_options.DictLines); }
@@ -730,11 +804,17 @@ namespace Rerar.Core
                 ordinal++;
                 _lastLadderTries = ordinal;
 
-                if (!VerifyPassword(archiveArg, candidate, useListing)) { continue; }
+                if (!VerifyPassword(archiveArg, candidate, useListing, ct)) { continue; }
+
+                // 先**分类**，再把它加进 _verifiedPasswords。顺序反了的话，字典层命中的候选会在分类
+                // 之前就被塞进「本次运行已验证过的密码」，于是所有字典命中一律被报成那一类 ——
+                // 内置字典 / 导入字典这两个标签永远不可达（修复轮 #3 的 Finding 4）。
+                // 分类保持阶梯的层次顺序（手动 → 本次已验证 → 字典 → 线索）：标签要说的是
+                // 「这一个候选是**从阶梯哪一层**来的」，而不是「它属于哪些集合」。
+                string source = DescribeCandidateSource(candidate, dict);
 
                 // 只在**验证通过之后**才缓存（I5：ZipCrypto 有 1/256 的头校验假阳性，
                 // 凭「有文件出现」缓存会把一个错密码推成下一个归档的首选）。
-                string source = DescribeCandidateSource(candidate, dict);
                 if (!_verifiedPasswords.Contains(candidate)) { _verifiedPasswords.Add(candidate); }
                 _lastMatchedCandidate = "#" + ordinal + "（" + source + "）";
                 return candidate;
@@ -743,16 +823,22 @@ namespace Rerar.Core
         }
 
         // 只用 `t`（测试）或 `l`（清单）验证候选，绝不用 `x`。两者都必须带 -p（I5）。
-        private bool VerifyPassword(string archiveArg, string candidate, bool useListing)
+        // ct 直通 SevenZipRunner：token 一响，Runner 走 Job Object 把这次 `t`/`l` 子进程打断
+        //（退出码 1223，IsSuccess == false），于是「取消」不必等这次完整校验自己跑完。
+        private bool VerifyPassword(string archiveArg, string candidate, bool useListing, CancellationToken ct)
         {
             string[] args = useListing
                 ? new string[] { "l", "-slt", archiveArg, "-p" + candidate, "-y" }
                 : new string[] { "t", archiveArg, "-p" + candidate, "-y" };
 
-            return SevenZipRunner.IsSuccess(SevenZipRunner.Run(_options.SevenZipPath, args, null, CancellationToken.None).ExitCode);
+            return SevenZipRunner.IsSuccess(SevenZipRunner.Run(_options.SevenZipPath, args, null, ct).ExitCode);
         }
 
         // 命中候选来自阶梯的哪一层（只报**类别**，不报值 —— 密码绝不进结果/报告）。
+        //
+        // 调用点必须排在 `_verifiedPasswords.Add` **之前**（见 FindPassword）：否则刚加进去的
+        // 字典候选会被这里第二档吃掉，内置字典 / 导入字典两个标签永远不可达（Finding 4）。
+        // 三档的顺序刻意与阶梯一致（手动 → 本次已验证 → 字典）：标签说的是「来自阶梯哪一层」。
         private string DescribeCandidateSource(string candidate, List<string> dict)
         {
             if (!string.IsNullOrEmpty(_options.Password))
@@ -1115,32 +1201,76 @@ namespace Rerar.Core
             }
         }
 
-        // 规格 §6.7 的失败路径：暂存目录改名 "<目标名> (未完成)" + 写哨兵。
-        // 幂等、尽力而为、**绝不删除**：改名或写哨兵失败（磁盘满时很常见）也绝不抛给调用方。
-        private static void MarkIncomplete(string staging, string target, string sourcePath, string reason)
+        // 规格 §6.7 的失败路径：写哨兵 + 暂存目录改名 "<目标名> (未完成)"。
+        // 幂等、尽力而为、**绝不删除**、绝不抛给调用方。
+        //
+        // 【顺序是安全属性，不是风格（修复轮 #3 的 Finding 3）】哨兵**先写、且写在暂存目录名之下**，
+        // 然后才改名。原因：改名后的目录名比目标名还长 6 个字符（再消歧一次就是 10 个），而哨兵
+        // 文件名本身还有 21 个字符；在离 MAX_PATH(259) 上限很近的输入上，「改名成功、往新名字里写
+        // 哨兵失败」会让用户拿到一个**没有哨兵**的目录（旧实现正是这样，而且异常被吞掉，用户完全
+        // 不知情）—— 而在半成品/盘满那一档，哨兵是唯一能告诉他「这不是完整结果」的东西。
+        // 先写在短名字下 ⇒ 改名只是 Directory.Move，哨兵随目录一起搬过去 ⇒ 改名失败也绝不可能
+        // 变成「没有哨兵」。
+        //
+        // 返回值：null = 一切照旧；否则 = 一句**必须如实写进该归档判词**的话
+        //（改名失败 / 哨兵写不进去）。静默留下一个没有标记的目录是本轮修掉的缺陷之一，
+        // 所以这里绝不再吞掉「标记没写成」这件事。
+        private static string MarkIncomplete(string staging, string target, string sourcePath, string reason)
         {
+            string warning = null;
             try
             {
-                if (!Directory.Exists(staging)) { return; }
+                if (!Directory.Exists(staging)) { return null; }
 
+                // 1) 哨兵先落在**暂存名下**（同一次运行创建的目录，名字最短）。
+                string text = "Rerar 未完成的解压\r\n" +
+                    "源归档：" + sourcePath + "\r\n" +
+                    "原因：" + reason + "\r\n" +
+                    "本目录是解压中途留下的产物，**不是**完整结果；源归档未被删除。\r\n";
+                try
+                {
+                    File.WriteAllText(Path.Combine(staging, SentinelName), text, new UTF8Encoding(true));
+                }
+                catch (Exception ex)
+                {
+                    warning = "未完成标记写入失败（" + ex.GetType().Name + "：" + ex.Message + "）：目录 " +
+                        staging + " 里没有 " + SentinelName + "，请勿把它当作完整结果";
+                }
+
+                // 2) 再改名；失败就留在暂存名下（哨兵已经在里面了，绝不删）。
                 string destination = target + IncompleteSuffix;
                 for (int n = 2; n < MaxNameAttempts && (File.Exists(destination) || Directory.Exists(destination)); n++)
                 {
                     destination = target + IncompleteSuffix + " (" + n + ")";
                 }
 
-                try { Directory.Move(staging, destination); }
-                catch (Exception) { destination = staging; }     // 改名失败就留在原暂存名下，绝不删
-
-                string text = "Rerar 未完成的解压\r\n" +
-                    "源归档：" + sourcePath + "\r\n" +
-                    "原因：" + reason + "\r\n" +
-                    "本目录是解压中途留下的产物，**不是**完整结果；源归档未被删除。\r\n";
-                File.WriteAllText(Path.Combine(destination, SentinelName), text, new UTF8Encoding(true));
+                try
+                {
+                    Directory.Move(staging, destination);
+                }
+                catch (Exception ex)
+                {
+                    warning = AppendMessage(warning, "未完成目录改名失败（" + ex.GetType().Name + "：" + ex.Message +
+                        "）：仍是 " + staging + "（" + SentinelName + " 已在该目录里）");
+                }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                // 连 Directory.Exists / 拼路径都炸了：绝不假装标记写好了。
+                warning = AppendMessage(warning, "未完成目录处理失败（" + ex.GetType().Name + "：" + ex.Message +
+                    "）：暂存目录 " + staging);
             }
+            return warning;
+        }
+
+        // 失败路径实际会用到的最长目录名：暂存名 vs 目标名 vs 目标名 + " (未完成)" + " (2)"。
+        // " (2)" 是 MarkIncomplete 在同名目录已存在时的消歧后缀（与规格 §6.11 的 " (2)" 同形）。
+        // 预检拿它做度量根，于是「改名后仍然放得下」是被**事前**保证的，而不是事后吞掉异常。
+        private static string LongestWriteRoot(string stagingBase, string target)
+        {
+            string longest = stagingBase.Length >= target.Length ? stagingBase : target;
+            string incomplete = target + IncompleteSuffix + " (2)";
+            return incomplete.Length > longest.Length ? incomplete : longest;
         }
 
         // ------------------------------------------------------------------
@@ -1430,10 +1560,14 @@ namespace Rerar.Core
         {
             if (_lowWaterHit)
             {
-                return LowWaterAbort(result, null, null, null, "已中止本归档（尚未开始解压）");
+                return LowWaterAbort(result, null, null, null, LowWaterReason("已中止本归档（尚未开始解压）"));
             }
             if (_summary.Cancelled || _options.Cancellation.IsCancellationRequested)
             {
+                // 运行级也要如实标注「取消」（修复轮 #3 的 Finding 2）：只把判词写成「已取消」而
+                // RunSummary.Cancelled 仍是 false，消费方（CLI 退出码 / 界面）会把一次被取消的运行
+                // 当成正常跑完 —— 这正是「取消必须被**观察到**」的另一半。
+                _summary.Cancelled = true;
                 result.Status = ArchiveStatus.Failed;
                 result.Message = "已取消：密码尚未验证完成；原包保留";
                 return result;
@@ -1488,13 +1622,15 @@ namespace Rerar.Core
 
         // 低水位中止：三个触发点（开始前同步复检 / 密码阶段 / 解压中途或解压后复核）走的是
         // **同一条**「不提交、不删除、如实报原因」的路径，只有判词按阶段不同。
-        private ArchiveResult LowWaterAbort(ArchiveResult result, string stagingBase, string target, string sourcePath, string phase)
+        // reason 是**完整的**判词（不再在这里拼「低于低水位」那句前缀）：可用空间**查不出来**
+        // 时也走这条路，那时的判词是「无法查询…按空间不足处理」—— 绝不说一句自己证明不了的话。
+        private ArchiveResult LowWaterAbort(ArchiveResult result, string stagingBase, string target, string sourcePath, string reason)
         {
-            string reason = LowWaterReason(phase);
             FailRun(reason);
-            if (!string.IsNullOrEmpty(stagingBase)) { MarkIncomplete(stagingBase, target, sourcePath, reason); }
+            string markWarning = null;
+            if (!string.IsNullOrEmpty(stagingBase)) { markWarning = MarkIncomplete(stagingBase, target, sourcePath, reason); }
             result.Status = ArchiveStatus.Failed;
-            result.Message = reason;
+            result.Message = AppendMessage(reason, markWarning);
             return result;
         }
 

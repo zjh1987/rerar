@@ -20,6 +20,14 @@ namespace Rerar.Core
     //   Skipped* 三种是「按设计不处理 / 处理不了但不计为失败」（需要密码、容器文档、无法读取）；
     //   NotAttemptedDepthLimit 是「递归深度触顶」——规格 §6.1 要求触顶必须**显式列出未处理项**，
     //   绝不静默停止，所以它是一个独立状态，而不是 Failure。
+    //
+    // 【与 RunSummary.NotAttempted 的关系（Task 10 修复轮 #3 的 Finding 1 裁定；那个类型在
+    // Extractor.cs 里，不在这里 —— 这里放一条指路，免得消费方只看本文件时漏掉那条契约）】
+    //   * RunSummary.NotAttempted 是「未处理项」的**权威清单**，与原因无关：深度触顶、致命中止
+    //     （盘满/取消）之后没轮到的候选都在里面；
+    //   * 深度触顶的那一项**同时**有一条 Results 条目（Status = NotAttemptedDepthLimit）——
+    //     即同一个归档会同时出现在两个集合里；
+    //   * 消费方**不得把两个集合相加**：未处理项总数 = NotAttempted.Count。
     public enum ArchiveStatus
     {
         Completed,

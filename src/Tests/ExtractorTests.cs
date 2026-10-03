@@ -22,8 +22,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using Rerar.Core;
 
 internal sealed class ExtractorTests : TestBase
@@ -98,6 +100,10 @@ internal sealed class ExtractorTests : TestBase
             RunSummary s = TestEnv.RunExtractWithDepth(1, TestEnv.DeepNestedZip);
             AssertTrue(s.Results.Exists(delegate(ArchiveResult r) { return r.Status == ArchiveStatus.NotAttemptedDepthLimit; }));
             AssertTrue(File.Exists(TestEnv.DeepNestedZip));
+            // 修复轮 #3 的 Finding 1：触顶那一项**同时**是权威未处理清单的一员
+            //（只放进 Results 会让打印 NotAttempted 的消费方少报未处理项）。
+            AssertEq(s.NotAttempted.Count, 1);
+            AssertEq(s.NotAttempted[0], Path.Combine(TestEnv.OutOf(TestEnv.DeepNestedZip), "mid.zip"));
         });
 
         // ==================================================================
@@ -478,6 +484,250 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(forced.Results[0].Message.Contains("安全上限"));
             AssertFalse(Directory.Exists(TestEnv.OutOf(part)));
             AssertTrue(File.Exists(part));
+        });
+
+        // ==================================================================
+        // 修复轮 #3（Finding 1–4）
+        // ==================================================================
+
+        // Finding 1：NotAttempted 是**权威**的未处理清单，与原因无关。深度触顶那一项既在
+        // Results 里（Status = NotAttemptedDepthLimit，供报告按状态分类），也在 NotAttempted 里
+        //（供「打印未处理项」的消费方）—— 两个集合**不能相加**，未处理项总数 = NotAttempted.Count。
+        H.Run("Extract.NotAttemptedIsCanonicalUnprocessedList", delegate {
+            RunSummary s = TestEnv.RunExtractWithDepth(1, TestEnv.DeepNestedZip);
+
+            ArchiveResult limited = null;
+            foreach (ArchiveResult r in s.Results)
+            {
+                if (r.Status == ArchiveStatus.NotAttemptedDepthLimit) { limited = r; }
+            }
+            AssertTrue(limited != null);
+            AssertTrue(s.NotAttempted.Contains(limited.Path));           // 同一个归档同时在两处
+            AssertEq(s.NotAttempted.Count, 1);                           // 权威数量（不是两处之和）
+            AssertEq(s.Results.Count, 2);                                // outer 完成 + mid 触顶
+        });
+
+        // Finding 1 的另一半：**致命中止**（盘满）之后本轮还没轮到的候选也进 NotAttempted，
+        // 且**没有** Results 条目（没被处理过，谈不上结局）。
+        H.Run("Extract.FatalAbortListsUnprocessedRemainder", delegate {
+            RunSummary s = TestEnv.RunExtractManyWithFakeDisk(1024, TestEnv.BigSevenZip, TestEnv.PlainZip);
+
+            AssertTrue(s.FatalReason != null && s.FatalReason.Contains("空间"));
+            AssertEq(s.Results.Count, 1);                                // 只有第 1 个目标有结局
+            AssertEq(s.Results[0].Status, ArchiveStatus.Failed);
+            AssertEq(s.NotAttempted.Count, 1);
+            AssertEq(s.NotAttempted[0], TestEnv.PlainZip);               // 第 2 个：未处理
+            AssertTrue(File.Exists(TestEnv.PlainZip));                   // 未处理 = 原样没动
+            AssertTrue(File.Exists(TestEnv.BigSevenZip));
+        });
+
+        // Finding 2：取消必须能打断**正在跑的那一次**密码验证 `t`，而不是等它自己跑完。
+        //
+        // 判据是**判词落在哪一段**，不是计时：修好前那次 `t` 拿的是 CancellationToken.None，
+        // 于是一次完整校验会跑完、手工候选被判定成功 ⇒ 流程走到解压前那一步才发现取消 ⇒
+        // 判词是「已取消：尚未开始解压」；修好后 token 打响、子进程被 Job Object 打断 ⇒
+        // 候选**没有**验证成功 ⇒ 判词是「已取消：密码尚未验证完成」。
+        // 取消的时机由一个看门狗给：等一个已经烧掉 150 ms CPU 的 7z 子进程出现（`l -slt` 只读中央
+        // 目录、CPU 时间几乎为 0，只有 `t` 会这样），这样「取消落在这次调用之内」与机器快慢无关。
+        H.Run("Extract.CancelInterruptsPasswordVerification", delegate {
+            string archive = TestEnv.SlowEncryptedZip;
+
+            // 基线：一次 `t -pSECRET` 要多久。太短就区分不了「打断这一次」与「下一个候选之前才发现」。
+            long oneCall = TestEnv.TimeSingleVerification(archive, "SECRET");
+            if (oneCall < 200)
+            {
+                H.Skip("Extract.CancelInterruptsPasswordVerification",
+                    "本机一次完整校验只要 " + oneCall + " ms，无法把「打断正在跑的那一次 `t`」与「下一个候选之前才发现取消」区分开");
+                return;
+            }
+
+            CancellationTokenSource source = new CancellationTokenSource();
+            long[] cancelledAt = new long[1];
+            Stopwatch watch = Stopwatch.StartNew();
+            Thread watchdog = new Thread(delegate() {
+                try
+                {
+                    while (!source.IsCancellationRequested && watch.ElapsedMilliseconds < 20000)
+                    {
+                        if (TestEnv.AnySevenZipBurningCpu(150)) { break; }
+                        Thread.Sleep(5);
+                    }
+                    cancelledAt[0] = watch.ElapsedMilliseconds;
+                    source.Cancel();
+                }
+                catch (Exception)
+                {
+                }
+            });
+            watchdog.IsBackground = true;
+            watchdog.Start();
+
+            RunSummary s = TestEnv.RunExtractWithToken(archive, "SECRET", source.Token);
+            long afterCancelMs = watch.ElapsedMilliseconds - cancelledAt[0];
+            watchdog.Join(2000);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Failed);
+            AssertTrue(s.Cancelled);                                     // 运行级也如实标注「取消」
+            AssertTrue(s.Results[0].Message.Contains("密码尚未验证完成"));
+            AssertFalse(s.Results[0].Message.Contains("尚未开始解压"));   // 手工候选从未被验证通过
+            AssertTrue(afterCancelMs < oneCall / 2);                     // 是**被打断**，不是等它跑完
+            AssertFalse(Directory.Exists(TestEnv.OutOf(archive)));        // 什么都没提交
+            AssertTrue(File.Exists(archive));                            // 原包保留
+        });
+
+        // Finding 2 的第二半：解压后那次 FreeBytes 也必须被包住。注入的 provider 在第 1 次
+        //（预检）之后每次查询都抛 —— 正确处置是「按空间不足处理、不提交、原包保留」，
+        // 而不是让异常逃出 Process 把结果降级成一条「内部错误」。
+        H.Run("Extract.DiskProbeFailureTakesLowWaterPath", delegate {
+            RunSummary s = TestEnv.RunExtractWithThrowingDisk(TestEnv.PlainZip);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Failed);
+            AssertFalse(s.Results[0].Message.Contains("内部错误"));
+            AssertTrue(s.Results[0].Message.Contains("空间"));
+            AssertTrue(s.FatalReason != null && s.FatalReason.Contains("空间"));
+            AssertFalse(Directory.Exists(TestEnv.OutOf(TestEnv.PlainZip)));      // 半成品绝不提交
+            AssertTrue(File.Exists(TestEnv.PlainZip));                           // 原包保留
+
+            // 失败路径仍然留下了「未完成」标记（哨兵先写、再改名 ⇒ 哨兵随目录一起搬过去）。
+            string incomplete = TestEnv.OutOf(TestEnv.PlainZip) + " (未完成)";
+            AssertTrue(Directory.Exists(incomplete));
+            AssertEq(Directory.GetFiles(incomplete, "_RERAR_INCOMPLETE.txt").Length, 1);
+        });
+
+        // Finding 3 的第一半：长路径预检必须按**流程实际会用到的最长目录名**度量
+        //（目标名 + " (未完成)" + 可能的 " (2)"，比裸目标名长 10 个字符），而不是裸目标名。
+        // 夹具的条目名长度让**旧度量**正好等于 MaxPathLength（放行）、新度量 +10 字符（拒绝）。
+        H.Run("Extract.PreflightUsesLongestIncompleteName", delegate {
+            string archive = TestEnv.LongNamedArchiveCopy();          // 目标目录名 = 120 字符（消毒上限）
+            string bareTarget = Path.Combine(TestEnv.OutRoot, PathSanitizer.Sanitize(Path.GetFileName(archive)));
+
+            // 算术前提用纯函数直接钉住：旧度量放行、新度量拒绝。
+            ArchiveIndex index = new ArchiveIndex();
+            index.FileCount = 1;
+            index.TotalBytes = 22;
+            index.Entries.Add(Entry(TestEnv.LongEntryName, 22));
+            AssertTrue(Preflight.FindOverlongEntry(bareTarget, index) == null);
+            AssertTrue(Preflight.FindOverlongEntry(bareTarget + " (未完成) (2)", index) != null);
+
+            RunSummary s = TestEnv.RunExtract(archive);
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.Contains("路径过长"));
+            AssertFalse(Directory.Exists(bareTarget));                // 一个字节都没写盘
+            AssertTrue(File.Exists(archive));                         // 原包保留
+        });
+
+        // Finding 3 的第二半：失败路径的哨兵**先写、后改名**，所以「改名成功、往长名字里写哨兵
+        // 失败」这条曾经静默丢标记的路不再存在。这里的构造正是那个窗口：目标目录名 235 字符 ⇒
+        // 改名后的哨兵路径 263 > MaxPathLength（而**旧**度量仍放行，所以流程真的会走到失败路径）。
+        //
+        // 【本机如实说明】本机 LongPathsEnabled=1，CLR 也支持超长路径 ⇒ 实测**旧**实现同样能把这个
+        // 哨兵写成功，这条用例在本机**区分不了新旧**（它钉的是契约：失败路径的目录必须有哨兵，
+        // 且判词不得谎报标记失败）。在 LongPathsEnabled=0（Windows 默认）的机器上，263 字符的写入
+        // 会抛 PathTooLongException 并被旧实现吞掉 ⇒ 这条用例在那里会以「没有哨兵」失败。
+        // Finding 3 的**预检**那一半（旧度量放行、新度量拒绝）由 Extract.PreflightUsesLongestIncompleteName
+        // 钉住，那条在本机也真的会因为修复前的代码而失败（修复轮 #3 的 RED 实测）。
+        H.Run("Extract.IncompleteMarkerSurvivesLongTargetName", delegate {
+            string outRoot = TestEnv.LongOutputRoot(116);
+            int entryLength = TestEnv.CorruptPayloadEntryName.Length;
+
+            // 目标目录名取「新度量刚好放行（T + 10 + 1 + E <= 259）」而「改名后的哨兵路径越界
+            //（T + 6 + 1 + 21 > 259）」的长度：E = 7、" (未完成)" 6 字符、哨兵名 21 字符
+            // ⇒ 目标目录名 = 235 - 1 - outRoot.Length。
+            int targetDirLength = 235 - 1 - outRoot.Length;
+            if (targetDirLength < 1)
+            {
+                H.Skip("Extract.IncompleteMarkerSurvivesLongTargetName",
+                    "临时目录已经太深（" + outRoot.Length + " 字符），造不出这条用例要的长度关系");
+                return;
+            }
+
+            string archiveName = new string('p', targetDirLength) + ".zip";
+            string archive = Path.Combine(TestEnv.Tmp, archiveName);
+            File.Copy(TestEnv.CorruptPayloadZip, archive, true);
+
+            string target = Path.Combine(outRoot, PathSanitizer.Sanitize(archiveName));
+            int newMeasure = target.Length + " (未完成) (2)".Length + 1 + entryLength;
+            int markerAfterRename = (target + " (未完成)").Length + 1 + "_RERAR_INCOMPLETE.txt".Length;
+            if (newMeasure > Preflight.MaxPathLength || markerAfterRename <= Preflight.MaxPathLength)
+            {
+                H.Skip("Extract.IncompleteMarkerSurvivesLongTargetName",
+                    "本机构造不出这条长度关系：新度量 " + newMeasure + "，改名后哨兵路径 " + markerAfterRename);
+                return;
+            }
+            // 前提：**旧**度量必须放行（否则这个输入在修复前就被预检拦掉，压根走不到失败路径）。
+            AssertTrue(target.Length + 1 + entryLength <= Preflight.MaxPathLength);
+
+            RunSummary s = TestEnv.RunExtractWithOutputRoot(archive, outRoot);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Failed);
+            AssertTrue(s.Results[0].Message.Contains("7-Zip 退出码 2"));
+            AssertFalse(s.Results[0].Message.Contains("未完成标记写入失败"));
+
+            string incomplete = target + " (未完成)";
+            AssertTrue(Directory.Exists(incomplete));                              // 改名成功
+            // 哨兵在不在：**按名字**数（不能给 GetFiles 传 pattern —— 它会拼成
+            // "<241 字符目录>\<pattern>" 的 263 字符搜索路径而抛 PathTooLong；不带 pattern 的枚举
+            // 只用目录本身（243 字符），返回的是字符串，不需要再对长路径调 API）。
+            bool marked = false;
+            foreach (string entry in Directory.GetFileSystemEntries(incomplete))
+            {
+                if (Path.GetFileName(entry) == "_RERAR_INCOMPLETE.txt") { marked = true; }
+            }
+            AssertTrue(marked);
+            AssertFalse(Directory.Exists(target));                                 // 没有提交成正式输出
+            AssertTrue(File.Exists(archive));                                      // 原包保留
+        });
+
+        // Finding 3 的第三半（**与机器无关**的那一半）：标记**真的**放不下时，判词必须如实说出来。
+        // 夹具里有一个与哨兵同名的目录条目 ⇒ 无论先写还是后写，`File.WriteAllText` 都必然失败。
+        //   * 修好后：MarkIncomplete 把失败如实返回，判词里出现「未完成标记写入失败」；
+        //   * 修好前：异常被吞掉，判词只有「解压失败…；原包保留」—— 用户拿到一个没有标记的目录
+        //     却完全不知道（这条断言在修复前的代码上会失败，修复轮 #3 的 RED 实测）。
+        H.Run("Extract.MarkerFailureIsReportedNotSilent", delegate {
+            RunSummary s = TestEnv.RunExtract(TestEnv.SentinelNameClashZip);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Failed);
+            AssertTrue(s.Results[0].Message.Contains("7-Zip 退出码 2"));
+            AssertTrue(s.Results[0].Message.Contains("未完成标记写入失败"));
+            AssertFalse(s.Results[0].Message.Contains("内部错误"));
+            AssertTrue(File.Exists(TestEnv.SentinelNameClashZip));                 // 原包保留
+
+            // 标记确实没写进去（判词说的就是这件事，不是谎报）；目录仍带「(未完成)」名字。
+            string incomplete = TestEnv.OutOf(TestEnv.SentinelNameClashZip) + " (未完成)";
+            AssertTrue(Directory.Exists(incomplete));
+            bool marked = false;
+            foreach (string entry in Directory.GetFileSystemEntries(incomplete))
+            {
+                if (Path.GetFileName(entry) == "_RERAR_INCOMPLETE.txt" && !Directory.Exists(entry)) { marked = true; }
+            }
+            AssertFalse(marked);
+        });
+
+        // Finding 4：字典层命中的候选必须被报成**字典**（内置/导入），而不是「本次运行已验证过的
+        // 密码」。旧实现先把命中的候选塞进 _verifiedPasswords、再分类，于是字典标签永远不可达。
+        // 这里两条都钉住：同一批里的第 2 个归档，候选确实来自「本次已验证」层（阶梯顺序如此），
+        // 那时标签就**应该**是那一类 —— 标签说的是「来自阶梯哪一层」，与阶梯层次一致。
+        H.Run("Extract.BuiltInDictionaryHitIsLabelled", delegate {
+            string one = CopyToTmp(TestEnv.BuiltInDictZip, "dict-one.zip");
+            string two = CopyToTmp(TestEnv.BuiltInDictZip, "dict-two.zip");
+
+            RunSummary s = TestEnv.RunExtractMany(one, two);
+
+            AssertEq(s.Results.Count, 2);
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(s.Results[0].Message.Contains("内置字典"));
+            AssertFalse(s.Results[0].Message.Contains("本次运行已验证过的密码"));
+
+            AssertEq(s.Results[1].Status, ArchiveStatus.Completed);
+            AssertTrue(s.Results[1].Message.Contains("本次运行已验证过的密码"));
+        });
+
+        H.Run("Extract.ImportedDictionaryHitIsLabelled", delegate {
+            RunSummary s = TestEnv.RunExtractWithDictionary(TestEnv.ImportedDictZip, new string[] { "ImportedSecret" });
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(s.Results[0].Message.Contains("导入字典"));
+            AssertFalse(s.Results[0].Message.Contains("本次运行已验证过的密码"));
         });
     }
 
