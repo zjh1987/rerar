@@ -36,7 +36,23 @@ namespace Rerar.Core
         SkippedContainer,
         SkippedUnreadable,
         Failed,
-        NotAttemptedDepthLimit
+        NotAttemptedDepthLimit,
+
+        // 【Task 12 修复轮 Finding 1 的控制方裁定】「整批因致命原因中止（盘满 / 取消）之后，
+        // 这一项还没轮到处理」。
+        //
+        // 为什么必须是**新**成员，而不是复用 NotAttemptedDepthLimit：复用会把原因**谎报**成
+        //「深度触顶」，而原因恰恰是机器读方要区分的东西；在枚举**外**拼一个状态串则破坏跨任务
+        // 契约（Task 8 的 CSV 与 Task 12 的 JSON 都写枚举名）。
+        //
+        // 加成员是**加法**：既有取值的名字与含义一字未改，按名字匹配的消费方不受影响；不认识它的
+        // 消费方退化为枚举名（Reporter.StatusText 就是这么写的）而不会失败。
+        //
+        // 谁发它：CLI 在 RunSummary.NotAttempted 里**没有**对应 Results 条目的路径上**合成**一条
+        //（每个归档恰好一个对象）。为什么不让 Extractor 自己发：Task 10 的裁定是「除深度触顶外的
+        // 未处理原因**没有** Results 条目（它们没被处理过，谈不上结局）」—— 那是引擎的事实；
+        //「机器可读报告里必须逐项可见」是**呈现**责任，交给 CLI / Task 14 更合适，引擎语义一字不动。
+        NotAttemptedFatal
     }
 
     // 一个源归档的处理结果：汇总表 / 导出报告 / CLI JSON 的唯一数据源。
@@ -140,6 +156,58 @@ namespace Rerar.Core
                 if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) { return true; }
             }
             return false;
+        }
+    }
+
+    // 一次运行的**进程退出码**契约（Task 12 定义；Task 15 的验收脚本按它判定）。
+    //
+    // 【为什么它在这里，而不是在 CLI 里】Task 12 修复轮 Finding 2 的控制方裁定改了其中一档
+    //（取消 ⇒ 1，不再是 2），而 CLI 是**独立进程**：tests.exe 只编译 src\Core\*.cs + src\Tests\*.cs，
+    // 进程内够不着 src\App\Program.cs 里的私有映射函数。映射放在 Core（应用目标与测试目标都编
+    // src\Core\*.cs）之后，**同一份实现**同时服务 CLI 与用例 —— 用例断言的就是 CLI 真正执行的那段代码。
+    //
+    // 语义（逐字是契约）：
+    //   0 = 全部成功：每条 Results 都是 Completed，且 NotAttempted 为空；
+    //   1 = 有失败 / 跳过 / 未处理，**或用户取消**（取消不是致命错误：这次运行**跑过**，Results 里
+    //       可能已经有一批 Completed；「取消」这件事由 RunSummary.Cancelled 承载，调用方要区分
+    //       取消与部分失败时去读它 —— 信息不丢）；
+    //   2 = **致命错误：什么都没跑成**（用法/环境错误、RunSummary.FatalReason 非空）。
+    public static class RunExitCodes
+    {
+        public const int Success = 0;
+        public const int FailedOrSkipped = 1;
+        public const int Fatal = 2;
+
+        public static int For(RunSummary summary)
+        {
+            // 没有摘要 = 谈不上「跑成了」：保守取致命档（绝不把「不知道」读成成功）。
+            if (summary == null) { return Fatal; }
+
+            // 致命档只留给「整批中止」：盘满 / 环境问题，什么都没有正常收尾。
+            // 它与「取消」**不同档**，见下。
+            if (!string.IsNullOrEmpty(summary.FatalReason)) { return Fatal; }
+
+            // 【控制方裁定（Task 12 修复轮 Finding 2）】取消 ⇒ 1，**不是** 2。
+            // 2 的定义是「什么都没跑成」，而一次被取消的运行已经跑过（可能还解出了一批）——
+            // 把它说成致命错误是对事实的夸大。取消与部分失败在退出码上同档（都表示「这批没有全部
+            // 成功」），需要区分的调用方读 RunSummary.Cancelled。
+            if (summary.Cancelled) { return FailedOrSkipped; }
+
+            if (summary.Results != null)
+            {
+                foreach (ArchiveResult result in summary.Results)
+                {
+                    // 只有一个状态算「这项成功了」：Completed。部分失败、三种跳过、失败、
+                    // 两种「未处理」都算 1。
+                    if (result == null || result.Status != ArchiveStatus.Completed) { return FailedOrSkipped; }
+                }
+            }
+
+            // 未处理项（权威清单）：没试过的项也绝不是「全部成功」——
+            // 致命中止之后还没轮到处理的候选就是这种形状（它们**没有** Results 条目）。
+            if (summary.NotAttempted != null && summary.NotAttempted.Count > 0) { return FailedOrSkipped; }
+
+            return Success;
         }
     }
 }

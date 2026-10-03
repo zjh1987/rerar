@@ -2332,11 +2332,177 @@ internal static class TestEnv
     }
 
     // ------------------------------------------------------------------
+    // 「声明的解压后总字节远超本机可用空间」的稀疏 tar（修复轮 Finding 1 的夹具）
+    //
+    // 用途：CLI 里唯一能从外部**真实**构造出来的致命中止是空间预检失败
+    //（Preflight.CheckFreeSpace：要求可用空间 ≥ 索引里的总字节 + 低水位 64 MB）。所以要让某个
+    // 归档**声明**出比本机可用空间还大的总量，别的办法都构造不出「致命中止 ⇒ 有未处理项」。
+    //
+    // 为什么是 tar 而不是 zip：tar 的条目长度写在 512 字节的块头里（11 位八进制 ⇒ 单条上限
+    // 8 GiB 以内），7-Zip 按声明长度**跳过**数据段 —— 于是可以用多个 7 GiB 条目把总量堆到任意值，
+    // 而每个块头的长度字段都在 32 位以内。zip 要声明 > 4 GiB 的条目就得手写 ZIP64 扩展。
+    //
+    // 为什么可以不真占盘：整份文件标记成 NTFS 稀疏文件（FSCTL_SET_SPARSE，与 OversizedFile 同一套
+    // 做法），只在每个块头与结尾标记处真写几百字节，中间全是洞。FileInfo.Length（逻辑长度）同时是
+    // 解压比的分母（Extractor.ArchivePhysicalBytes）⇒ 解压比 ≈ 1，不会被「压缩炸弹」那条**单包**
+    // 上限（Preflight.CheckExpansion）先拦掉 —— 那条只会跳过这一个包，构不成致命中止。
+    //
+    // 【安全闸门（返回前必须全部通过，否则抛异常）】
+    //   1. Sniffer 必须认它是 tar（否则会被格式门控跳过，那是单包跳过档）；
+    //   2. 7-Zip 必须列得出声明的总量，且总量 ≤ 单包上限（超限只会被安全上限跳过）；
+    //   3. **可用空间 + 低水位 < 声明总量** —— 空间预检必然失败。这一条是硬性的：任一台机器的
+    //      可用空间比声明量还大时直接抛异常（用例 H.Skip），绝不让 7-Zip 真去写几十 GB 的洞。
+    // ------------------------------------------------------------------
+    public static string SparseHugeTar
+    {
+        get
+        {
+            string path = TmpFile("huge-declared.tar");
+            if (File.Exists(path)) { return path; }      // 惰性：同一用例内重复访问不重建
+
+            long perEntry = 7L * 1024 * 1024 * 1024;     // 单条声明量（11 位八进制能表达的范围内）
+            long free = AvailableFreeBytes(path);
+            long need = free + (4L * 1024 * 1024 * 1024); // 比可用空间再多 4 GiB：留出余量
+            long count = (need + perEntry - 1) / perEntry;
+            long declared = count * perEntry;
+
+            if (declared > Preflight.MaxTotalUncompressedBytes - (64L * 1024 * 1024))
+            {
+                throw new InvalidOperationException(
+                    "本机可用空间 " + free + " 字节太大：要把声明量抬到它之上就会超过单包上限 " +
+                    Preflight.MaxTotalUncompressedBytes + " 字节（超限只会被安全上限跳过，构不成致命中止）");
+            }
+
+            long offset = 0;
+            using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            {
+                uint returned;
+                if (!DeviceIoControl(fs.SafeFileHandle.DangerousGetHandle(), FsctlSetSparse,
+                        IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero))
+                {
+                    throw new InvalidOperationException(
+                        "FSCTL_SET_SPARSE 失败（Win32 错误 " + Marshal.GetLastWin32Error() + "）");
+                }
+
+                for (long i = 0; i < count; i++)
+                {
+                    byte[] header = TarHeader("big" + i + ".bin", perEntry);
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    fs.Write(header, 0, header.Length);
+                    offset += 512 + perEntry;            // 数据段是洞：只推进偏移，绝不写它
+                }
+
+                // 归档结束标记：两个 512 字节零块（tar 的 EOF 约定）。
+                byte[] end = new byte[1024];
+                fs.Seek(offset, SeekOrigin.Begin);
+                fs.Write(end, 0, end.Length);
+                fs.SetLength(offset + end.Length);       // 逻辑长度 = 声明总量 + 块头与标记
+            }
+
+            // 自检 1：Sniffer 必须判成 tar。
+            byte[] head = new byte[512];
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                int read = stream.Read(head, 0, head.Length);
+                if (read != head.Length) { Array.Resize(ref head, read); }
+            }
+            if (Sniffer.Classify(head, new FileInfo(path).Length, Path.GetFileName(path), null) != SniffKind.Tar)
+            {
+                throw new InvalidOperationException("SparseHugeTar 夹具构造失败：Sniffer 没把它判成 tar");
+            }
+
+            // 自检 2 + 3：7-Zip 读得出声明的总量，且空间预检必然失败。
+            ArchiveIndex index = SevenZipIndex.Read(SevenZip, path, null);
+            if (index.ListingFailed || index.TotalBytes < declared)
+            {
+                throw new InvalidOperationException(
+                    "SparseHugeTar 夹具构造失败：7-Zip 没读出声明的总量（ListingFailed=" + index.ListingFailed +
+                    "，TotalBytes=" + index.TotalBytes + "，期望 ≥ " + declared + "，ExitCode=" + index.ExitCode + "）");
+            }
+            long freeNow = AvailableFreeBytes(path);
+            if (freeNow + (64L * 1024 * 1024) >= index.TotalBytes)
+            {
+                throw new InvalidOperationException(
+                    "SparseHugeTar 夹具构造失败：可用空间 " + freeNow + " 字节 + 低水位 64 MB ≥ 声明总量 " +
+                    index.TotalBytes + " 字节 —— 空间预检会放行，夹具不可用（绝不能真去写几十 GB 的洞）");
+            }
+
+            return path;
+        }
+    }
+
+    // 卷可用空间（与产品的 DriveSpaceProvider 取同一个量：DriveInfo.AvailableFreeSpace）。
+    private static long AvailableFreeBytes(string anyPathOnVolume)
+    {
+        string root = Path.GetPathRoot(Path.GetFullPath(anyPathOnVolume));
+        DriveInfo drive = new DriveInfo(root);
+        if (!drive.IsReady) { throw new InvalidOperationException("卷 " + root + " 未就绪"); }
+
+        long available = drive.AvailableFreeSpace;
+        return available > 0 ? available : 0;
+    }
+
+    // 一个 POSIX ustar 块头：magic 在偏移 257（Sniffer 与 7-Zip 都看这里），长度字段是
+    // 11 位八进制 + NUL，校验和是「校验和字段当 8 个空格算」的字节和（6 位八进制 + NUL + 空格）。
+    private static byte[] TarHeader(string name, long size)
+    {
+        byte[] header = new byte[512];
+        WriteAscii(header, 0, name, 100);
+        WriteOctal(header, 100, 8, 420);         // mode 0644
+        WriteOctal(header, 108, 8, 0);           // uid
+        WriteOctal(header, 116, 8, 0);           // gid
+        WriteOctal(header, 124, 12, size);       // size（本夹具唯一有意义的字段）
+        WriteOctal(header, 136, 12, 0);          // mtime
+        for (int i = 148; i < 156; i++) { header[i] = 0x20; }    // 校验和字段先当 8 个空格
+        header[156] = (byte)'0';                 // typeflag：普通文件
+        WriteAscii(header, 257, "ustar", 6);     // magic："ustar\0"
+        WriteAscii(header, 263, "00", 2);        // version
+        WriteAscii(header, 265, "root", 32);     // uname
+        WriteAscii(header, 297, "root", 32);     // gname
+
+        int sum = 0;
+        for (int i = 0; i < header.Length; i++) { sum += header[i]; }
+        WriteAscii(header, 148, Convert.ToString(sum, 8).PadLeft(6, '0'), 6);
+        header[154] = 0;
+        header[155] = 0x20;
+        return header;
+    }
+
+    // 八进制数值字段：fieldLength-1 位八进制（左侧补 0）+ NUL 结束符。
+    private static void WriteOctal(byte[] buffer, int offset, int fieldLength, long value)
+    {
+        string text = Convert.ToString(value, 8).PadLeft(fieldLength - 1, '0');
+        WriteAscii(buffer, offset, text, fieldLength - 1);
+    }
+
+    // 定长 ASCII 字段：写满 text，其余字节保持 0（tar 的字符串字段以 NUL 结束）。
+    private static void WriteAscii(byte[] buffer, int offset, string text, int fieldLength)
+    {
+        for (int i = 0; i < text.Length && i < fieldLength; i++) { buffer[offset + i] = (byte)text[i]; }
+    }
+
+    // ------------------------------------------------------------------
     // CLI 驱动
     // ------------------------------------------------------------------
 
     // 单次 CLI 调用的上限。会挂起的 CLI 必须让**用例**失败，绝不能把整套测试挂住。
     public const int CliTimeoutMs = 120000;
+
+    // CLI 子进程的崩溃恢复日志根所认的环境变量名（与 src\App\Program.cs 里的常量逐字一致）。
+    public const string JournalRootVariable = "RERAR_JOURNAL_ROOT";
+
+    // CLI 子进程的崩溃恢复日志根（= 上面那个变量的值）：Tmp 之下，与进程内的 JournalRoot 分开，
+    // 用例据此断言「CLI 真的把日志写在这里」。
+    //
+    // 【为什么必须有这个变量（修复轮 Finding 3 的控制方裁定）】CLI 是**真进程**，本类的
+    // Journal.Root 接缝只能改本进程的静态字段，够不着子进程 —— 在这条裁定之前，本类只能在运行
+    // 前后对**真实的** %LOCALAPPDATA%\Rerar\journal 做快照并删掉本次运行写下的文件（对用户应用
+    // 数据目录的越界操作）。有了它，测试一次都不碰真实根。（.NET Framework 的
+    // Environment.GetFolderPath 不认 LOCALAPPDATA 环境变量，所以子进程里没有别的重定向办法。）
+    public static string CliJournalRoot
+    {
+        get { return Path.Combine(Tmp, "cli-journal"); }
+    }
 
     // 起 dist\Rerar.exe：参数最前面补 `--cli`（无头模式的显式开关），两个输出流都捕获。
     // 超时即杀（7-Zip 子进程由 Task 10 的 Job Object 兜底）并抛异常 ⇒ 该用例 FAIL。
@@ -2346,6 +2512,32 @@ internal static class TestEnv
     }
 
     public static CliResult RunCliWithTimeout(int timeoutMs, params string[] args)
+    {
+        // 默认：把子进程的日志根指到 Tmp 之下的 CliJournalRoot（见上面的说明）。
+        return RunCliCore(timeoutMs, CliJournalRoot, args);
+    }
+
+    // **不设置** RERAR_JOURNAL_ROOT 地跑一次 CLI（用于钉住「没设变量时仍然用生产默认根」）。
+    //
+    // 【为什么必须传入期望的退出码】没有变量时，**任何走到 Extractor 的调用**都会在真实的
+    // %LOCALAPPDATA%\Rerar\journal 里留下记录 —— 这正是修复轮 Finding 3 要杜绝的事。所以这里
+    // 只允许**不会构造 Extractor 的用法级致命调用**（例如 `--depth 0`、没有 `--target`）：调用方
+    // 必须给出它期望的退出码，对不上就当场抛异常（用例 FAIL），而不是悄悄把测试写进用户的应用数据。
+    public static CliResult RunCliWithoutJournalRootOverride(int expectedExitCode, params string[] args)
+    {
+        CliResult result = RunCliCore(CliTimeoutMs, null, args);
+        if (result.ExitCode != expectedExitCode)
+        {
+            throw new InvalidOperationException(
+                "期望一次用法级致命调用（退出码 " + expectedExitCode + "），实际 " + result.ExitCode +
+                "：这次调用可能已经走到了 Extractor，于是会在**真实的** %LOCALAPPDATA%\\Rerar 里留下恢复记录；" +
+                "命令行：" + result.Arguments);
+        }
+        return result;
+    }
+
+    // journalRoot == null ⇒ **移除**该变量（真正走生产默认根）。非 null ⇒ 设为该值。
+    private static CliResult RunCliCore(int timeoutMs, string journalRoot, string[] args)
     {
         string exe = ExePath;
         if (!File.Exists(exe))
@@ -2358,22 +2550,6 @@ internal static class TestEnv
         List<string> argv = new List<string>();
         argv.Add("--cli");
         if (args != null) { argv.AddRange(args); }
-
-        // 外部残留自愈（见文件末尾 SnapshotJournalLogs 的说明）：CLI 是**真进程**，它的崩溃恢复日志
-        // 写在生产根 %LOCALAPPDATA%\Rerar\journal —— Journal.Root 那个测试接缝只能在本进程内设置，
-        // 而 .NET Framework 的 GetFolderPath 不认 LOCALAPPDATA 环境变量（实测仍返回真实路径），
-        // 子进程没有别的办法重定向它。所以这里快照前后差异，只删本次运行**自己**新建的日志。
-        string journalRoot = null;
-        HashSet<string> before = null;
-        try
-        {
-            journalRoot = Journal.DefaultRoot;
-            before = SnapshotJournalLogs(journalRoot);
-        }
-        catch (Exception)
-        {
-            // 拿不到日志根（例如 %LOCALAPPDATA% 不可用）：CLI 自己会如实报「日志不可用」，测试照跑。
-        }
 
         CliResult result = new CliResult();
         result.Arguments = exe + " " + string.Join(" ", QuoteArguments(argv).ToArray());
@@ -2388,6 +2564,10 @@ internal static class TestEnv
         psi.RedirectStandardError = true;
         psi.StandardOutputEncoding = CliEncoding;
         psi.StandardErrorEncoding = CliEncoding;
+
+        // 子进程的崩溃恢复日志根：绝不落到真实的 %LOCALAPPDATA%（见 CliJournalRoot 的说明）。
+        if (journalRoot == null) { psi.EnvironmentVariables.Remove(JournalRootVariable); }
+        else { psi.EnvironmentVariables[JournalRootVariable] = journalRoot; }
 
         StringBuilder stdOut = new StringBuilder();
         StringBuilder stdErr = new StringBuilder();
@@ -2425,7 +2605,6 @@ internal static class TestEnv
         finally
         {
             process.Dispose();
-            CleanupNewJournalLogs(journalRoot, before);
         }
 
         return result;
@@ -2482,94 +2661,15 @@ internal static class TestEnv
     }
 
     // ------------------------------------------------------------------
-    // 生产日志根的外部残留自愈（只服务测试的洁净性，绝不参与产品逻辑）
+    // 生产日志根：测试**再也不碰**它了。
     //
-    // 生产 runId 形状：yyyyMMdd_HHmmss-<8 位十六进制>（Extractor.OpenJournal 拼出来的）。
-    // 删除的三重条件缺一不可：本次运行前**不存在**、名字是 runId 形状、文件里**有 done 记录**
-    //（正常收尾）。第三条是保险：正在被别人写、或崩在途中的日志一律不碰 —— 测试绝不伪造、
-    // 也绝不删掉别人可能还需要用于崩溃恢复的记录。
+    // 修复轮 Finding 3 之前，这里有一组「快照 + 有过滤地删除」的辅助方法：CLI 是独立进程，
+    // Journal.Root 那个进程内接缝够不着它，于是测试只能去真实的 %LOCALAPPDATA%\Rerar\journal 里
+    // 删掉本次运行自己写下的日志（三重过滤条件都缺一不可）。控制方的裁定是：**测试不该在自己的
+    // 临时目录之外删任何东西**。现在 CLI 认 RERAR_JOURNAL_ROOT（见 JournalRootVariable /
+    // CliJournalRoot），全组用例的日志一律落在 Tmp 之下，那句「删掉自己写的东西」的逻辑连同它
+    // 依赖的辅助方法一起删除了 —— 留下这段说明，好让后来者知道那批方法为何消失、别再加回来。
     // ------------------------------------------------------------------
-    private static HashSet<string> SnapshotJournalLogs(string root)
-    {
-        HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) { return names; }
-
-        string[] files;
-        try { files = Directory.GetFiles(root, "*" + Journal.FileExtension); }
-        catch (Exception) { return names; }
-
-        foreach (string file in files) { names.Add(Path.GetFileName(file)); }
-        return names;
-    }
-
-    private static void CleanupNewJournalLogs(string root, HashSet<string> before)
-    {
-        if (root == null || before == null || !Directory.Exists(root)) { return; }
-
-        string[] files;
-        try { files = Directory.GetFiles(root, "*" + Journal.FileExtension); }
-        catch (Exception) { return; }
-
-        bool removed = false;
-        foreach (string file in files)
-        {
-            string name = Path.GetFileName(file);
-            if (before.Contains(name)) { continue; }
-            if (!IsRunIdLogName(name)) { continue; }
-
-            try
-            {
-                string text = File.ReadAllText(file);
-                if (text.IndexOf("\t" + Journal.DoneStep + "\t", StringComparison.Ordinal) < 0) { continue; }
-                File.Delete(file);
-                removed = true;
-            }
-            catch (Exception)
-            {
-                // 删不掉（被占用等）就留着：测试的洁净性不该让用例失败。
-            }
-        }
-
-        // 连目录一起收掉（只在「确实删过自己的日志」且**目录已空**时）：
-        // 测试不该在 Tmp 之外留下任何东西。里面还有别人的日志 / Task 13 释放的内嵌 7-Zip 时，
-        // 目录非空 ⇒ 一律保留。
-        if (!removed) { return; }
-        TryRemoveEmptyDirectory(root);
-        TryRemoveEmptyDirectory(Path.GetDirectoryName(root));
-    }
-
-    private static void TryRemoveEmptyDirectory(string dir)
-    {
-        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) { return; }
-        try
-        {
-            if (Directory.GetFileSystemEntries(dir).Length == 0) { Directory.Delete(dir); }
-        }
-        catch (Exception)
-        {
-        }
-    }
-
-    private static bool IsRunIdLogName(string name)
-    {
-        if (string.IsNullOrEmpty(name)) { return false; }
-        if (!name.EndsWith(Journal.FileExtension, StringComparison.OrdinalIgnoreCase)) { return false; }
-
-        string stem = name.Substring(0, name.Length - Journal.FileExtension.Length);
-        if (stem.Length != 24) { return false; }              // yyyyMMdd_HHmmss-xxxxxxxx
-        if (stem[8] != '_' || stem[15] != '-') { return false; }
-
-        for (int i = 0; i < stem.Length; i++)
-        {
-            if (i == 8 || i == 15) { continue; }
-            char c = stem[i];
-            bool ok = i < 15
-                ? (c >= '0' && c <= '9')                       // 时间戳段
-                : ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));   // Guid("N") 前缀（小写十六进制）
-            if (!ok) { return false; }
-        }
-        return true;
-    }
 }
 
 // 一次 CLI 调用的结果：退出码 + 两个输出流 + 实际命令行（失败信息里带上它，排错不必猜参数）。

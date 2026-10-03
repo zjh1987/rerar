@@ -7,9 +7,11 @@
 // 【契约（Task 15 逐字依赖，不得改名）】
 //     Rerar.exe --cli --target <path> [--target <path>...] [--delete] [--password <pw>]
 //               [--dict <file>] [--depth <n>] [--json-out <file>]
-//     退出码：0 全部成功；1 有失败或跳过；2 致命错误（什么都没跑成 / 报告写不出来）。
+//     退出码：0 全部成功；1 有失败或跳过（含用户取消）；2 致命错误（什么都没跑成 / 报告写不出来）。
+//     映射只有一份实现：Rerar.Core.RunExitCodes（修复轮 Finding 2 的裁定见那里）。
 //     --json-out：机器可读的结果数组，对象的键逐字是
 //                 path,status,layers,files,failed,outputDir,message（= ArchiveResult 的字段名小写）。
+//                 数组**每个归档恰好一个对象**：致命中止后没轮到的候选也在里面（修复轮 Finding 1）。
 //
 // 【本文件必须自己负责的三件事】
 //   1) `--cli --selftest` 打印 version=<n> 并退出 0 —— tests\smoke.ps1 依赖的既有契约，绝不能改坏；
@@ -17,6 +19,10 @@
 //      相加：深度触顶那一项同时出现在两个集合里，相加就是同一件事数两遍（见 PrintSummary）；
 //   3) 报告的父目录由本文件创建 —— Task 8 的 Reporter 刻意不建（它只负责写），而一个不存在的父目录
 //      会让一次长时间的解压在最后一刻以 DirectoryNotFoundException 收场。
+//
+// 【进程级日志根覆盖】环境变量 RERAR_JOURNAL_ROOT 非空时，本次运行的崩溃恢复日志根改用它
+//（修复轮 Finding 3 的控制方裁定）：CLI 是真进程，测试够不着进程内的 Journal.Root 接缝，有了它
+// 就不必再去真实的 %LOCALAPPDATA%\Rerar 里删自己写下的文件。它同时也是可移植 / 调试运行的正规用法。
 //
 // 【凭据卫生】密码只经 RunOptions 交给 Extractor，绝不写进 stdout / stderr / JSON / 日志
 //（Task 10 只记「候选序号 + 来源类别」）。需要如实说明的一点：`--password` 在命令行上对同机其它
@@ -41,10 +47,14 @@ namespace Rerar
 {
     internal static class Program
     {
-        // 退出码是契约（Task 15 的验收脚本按它判定），逐字固定。
-        private const int ExitSuccess = 0;            // 全部成功
-        private const int ExitFailedOrSkipped = 1;    // 有失败或跳过（含未处理项）
-        private const int ExitFatal = 2;              // 致命错误：什么都没跑成 / 报告写不出来
+        // 退出码是契约（Task 15 的验收脚本按它判定），逐字固定，且**只有一份实现**：
+        // Rerar.Core.RunExitCodes（修复轮 Finding 2 之后 CLI 与用例共用同一段代码）。
+        private const int ExitSuccess = RunExitCodes.Success;            // 全部成功
+        private const int ExitFailedOrSkipped = RunExitCodes.FailedOrSkipped;  // 有失败或跳过（含取消、含未处理项）
+        private const int ExitFatal = RunExitCodes.Fatal;                // 致命错误：什么都没跑成 / 报告写不出来
+
+        // 崩溃恢复日志根的**进程级覆盖**（修复轮 Finding 3 的控制方裁定）。名字与 TestEnv 里的一致。
+        private const string JournalRootVariable = "RERAR_JOURNAL_ROOT";
 
         private const string Usage =
             "用法：Rerar.exe --cli --target <路径> [--target <路径>...] [--delete] [--password <密码>] " +
@@ -81,6 +91,10 @@ namespace Rerar
 
         private static int RunCli(string[] args)
         {
+            // 先把日志根定下来并**如实报出**（环境变量覆盖 + 默认根）。放在解析参数之前：连
+            // 用法级致命错误（什么都没跑）也应当说明「这次运行根本不写恢复记录到哪里」。
+            ApplyJournalRoot();
+
             List<string> targets = new List<string>();
             // 显式给了 `--target ""` 的项：Extractor.FreezeTargets 会把空串**静默跳过**（它没有路径
             // 可言）—— 那正是规格 §6.3 禁止的「静默丢弃」。所以 CLI 在入口就把它变成一条
@@ -207,6 +221,10 @@ namespace Rerar
             // 于是 --json-out 与汇总里都能看到它们（规格 §6.3 的「永不静默丢弃」）。
             if (emptyTargets.Count > 0) { summary.Results.InsertRange(0, emptyTargets); }
 
+            // 致命中止之后**没轮到处理**的候选也补进结果集（修复轮 Finding 1 的控制方裁定）：
+            // 机器读方只读 --json-out 时，否则会完全看不到这部分。
+            AddFatalUnprocessedRemainder(summary);
+
             PrintSummary(summary);
 
             if (reportPath != null)
@@ -229,7 +247,37 @@ namespace Rerar
                 }
             }
 
-            return ExitCodeFor(summary);
+            return RunExitCodes.For(summary);
+        }
+
+        // ------------------------------------------------------------------
+        // 崩溃恢复日志根（进程级覆盖；修复轮 Finding 3）
+        // ------------------------------------------------------------------
+
+        // 应用日志根覆盖并**如实报出有效根**。
+        //
+        // 为什么把有效的根印出来（而不是只写进日志）：用例要证明「没设变量时仍然用生产默认根」，
+        // 而**那个分支不能真的去写真实日志根**（真实根在用户的 %LOCALAPPDATA% 下）—— 于是那条
+        // 断言只能读运行头报出来的根。它之所以可信，由「设了变量的那一半」证明：日志文件确实
+        // 落在报出来的那个目录里（用例 Cli.JournalRootOverrideKeepsRealAppDataUntouched 两侧都钉）。
+        private static void ApplyJournalRoot()
+        {
+            try
+            {
+                string overridden = Environment.GetEnvironmentVariable(JournalRootVariable);
+                // 空串按「没有设置」处理：绝不让一个空值把日志根变成当前目录。
+                if (!string.IsNullOrEmpty(overridden)) { Journal.Root = overridden; }
+
+                Console.WriteLine("崩溃恢复日志根：" + Journal.Root +
+                    "（可用环境变量 " + JournalRootVariable + " 覆盖）");
+            }
+            catch (Exception ex)
+            {
+                // 日志根算不出来（例如 %LOCALAPPDATA% 不可用）：绝不致命 —— Extractor 会把
+                //「日志不可用」如实汇报成 JournalWriteFailures，解压本身照常跑。
+                Console.WriteLine("崩溃恢复日志根不可用（" + ex.GetType().Name + "：" + ex.Message +
+                    "）：本次运行没有恢复记录，解压照常进行");
+            }
         }
 
         // `--target ""` 的逐项结局：空参数无法定位任何文件，所以它和「不存在的路径」同类 ——
@@ -362,29 +410,58 @@ namespace Rerar
         }
 
         // ------------------------------------------------------------------
-        // 退出码（契约：0 / 1 / 2）
+        // 未处理剩余项 → 结果集（修复轮 Finding 1）
         // ------------------------------------------------------------------
 
-        private static int ExitCodeFor(RunSummary summary)
+        // 致命中止之后**没轮到处理**的候选（RunSummary.NotAttempted 里没有 Results 条目的那一部分）
+        // 合成为结果对象，于是 --json-out 里**每个归档恰好一条**，只读 JSON 的机器读方也看得见
+        // 「这一批还有哪些归档根本没被处理过」。
+        //
+        // 为什么不谎报原因：合成的状态是 ArchiveStatus.NotAttemptedFatal（Task 12 修复轮新增的成员，
+        // 加法、不破坏任何按名字匹配的消费方），判词里写明真正的致命原因。绝不复用
+        // NotAttemptedDepthLimit —— 那会把「盘满/取消」谎报成「深度触顶」。
+        //
+        // 绝不重复发：深度触顶的那一项在 Results 里**已经**有 NotAttemptedDepthLimit 条目，
+        // 这里按路径匹配跳过它（两个集合各自都含它，但对象只有一个）。
+        private static void AddFatalUnprocessedRemainder(RunSummary summary)
         {
-            // 致命档：整批因盘满 / 取消而中止 ⇒ 什么都没跑完。
-            if (!string.IsNullOrEmpty(summary.FatalReason)) { return ExitFatal; }
-            if (summary.Cancelled) { return ExitFatal; }
+            if (summary == null || summary.NotAttempted == null) { return; }
 
-            if (summary.Results != null)
+            string reason = !string.IsNullOrEmpty(summary.FatalReason)
+                ? "整批因致命错误中止：" + summary.FatalReason
+                : (summary.Cancelled ? "本次运行已被取消" : "整批已中止（原因未记录）");
+
+            foreach (string path in summary.NotAttempted)
             {
-                foreach (ArchiveResult result in summary.Results)
-                {
-                    // 只有一个状态算「这项成功了」：Completed。部分失败、跳过、失败、深度触顶都算 1。
-                    if (result == null || result.Status != ArchiveStatus.Completed) { return ExitFailedOrSkipped; }
-                }
+                if (string.IsNullOrEmpty(path)) { continue; }
+                if (HasResultFor(summary.Results, path)) { continue; }
+
+                ArchiveResult synthesized = new ArchiveResult();
+                synthesized.Path = path;
+                synthesized.Status = ArchiveStatus.NotAttemptedFatal;
+                synthesized.Layers = 0;          // 没开始过：计数器一律 0，绝不编造层数 / 文件数
+                synthesized.Files = 0;
+                synthesized.Failed = 0;
+                synthesized.OutputDir = "";      // 没有产物目录（一个字节都没写）
+                synthesized.Message = "未处理（" + reason + "）：此项尚未开始，原包保留";
+                summary.Results.Add(synthesized);
+                // 追加进 Results 之后，同一个路径若在 NotAttempted 里再次出现，上面那句匹配就会拦住它 ——
+                // 于是每个归档**恰好**一条对象，重复的未处理路径绝不会变成两条。
             }
+        }
 
-            // 未处理项（权威清单）：没试过的项也绝不是「全部成功」——
-            // 致命中止之后还没轮到处理的候选就是这种形状（它们**没有** Results 条目）。
-            if (summary.NotAttempted != null && summary.NotAttempted.Count > 0) { return ExitFailedOrSkipped; }
+        // 结果集里有没有就是这个路径的结局。两个集合里的路径都来自**同一个** ArchiveTask.Path，
+        // 所以逐字比较就够（大小写不敏感只是对 Windows 路径的稳妥处理）。
+        private static bool HasResultFor(List<ArchiveResult> results, string path)
+        {
+            if (results == null) { return false; }
 
-            return ExitSuccess;
+            foreach (ArchiveResult result in results)
+            {
+                if (result == null || result.Path == null) { continue; }
+                if (string.Equals(result.Path, path, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
         }
 
         // ------------------------------------------------------------------
@@ -396,7 +473,7 @@ namespace Rerar
             Console.WriteLine(Reporter.RenderTable(summary.Results));
             Console.WriteLine("----");
 
-            int total = 0, completed = 0, partial = 0, skipped = 0, failed = 0, depthLimit = 0;
+            int total = 0, completed = 0, partial = 0, skipped = 0, failed = 0, depthLimit = 0, fatalUnprocessed = 0;
             if (summary.Results != null)
             {
                 total = summary.Results.Count;
@@ -412,6 +489,7 @@ namespace Rerar
                         case ArchiveStatus.SkippedUnreadable: skipped++; break;
                         case ArchiveStatus.Failed: failed++; break;
                         case ArchiveStatus.NotAttemptedDepthLimit: depthLimit++; break;
+                        case ArchiveStatus.NotAttemptedFatal: fatalUnprocessed++; break;
                     }
                 }
             }
@@ -421,7 +499,8 @@ namespace Rerar
                 "，部分失败 " + Int(partial) +
                 "，跳过 " + Int(skipped) +
                 "，失败 " + Int(failed) +
-                "，未处理（深度上限）" + Int(depthLimit) + "）");
+                "，未处理（深度上限）" + Int(depthLimit) +
+                "，未处理（整批中止）" + Int(fatalUnprocessed) + "）");
 
             // 【控制方裁定 1】未处理数量 = RunSummary.NotAttempted.Count —— **唯一权威**的「没处理」清单，
             // 与原因无关（深度触顶、致命中止后没轮到的候选都在里面）。绝不与 Results 相加：

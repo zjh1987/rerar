@@ -20,12 +20,22 @@
 //   * 控制方裁定 2：报告父目录由 CLI 创建；建不出来必须在**任何解压之前**以退出码 2 收场；
 //   * 密码绝不进 stdout/stderr、也绝不进 JSON（Task 10 只记「候选序号 + 来源类别」）。
 //
+// 【修复轮（Task 12 第一轮 fix）新增/强化的三条】
+//   * Finding 1：致命中止后的未处理剩余项也必须出现在 --json-out 里（状态 NotAttemptedFatal），
+//     且**每个归档恰好一个对象**（深度触顶项绝不被再合成一条）；
+//   * Finding 2：取消 ⇒ 退出码 1（不是 2）。CLI 没有取消入口（RunOptions.Cancellation 从不设置），
+//     进程级构造不出取消的运行，所以这条断言打在 CLI **与用例共用**的映射实现上（RunExitCodes）；
+//   * Finding 3：CLI 认环境变量 RERAR_JOURNAL_ROOT —— 全组用例的恢复日志都落在 TestEnv.Tmp 之下，
+//     测试**再也不碰**真实的 %LOCALAPPDATA%\Rerar。
+//
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using Rerar.Core;
 
 internal sealed class CliTests : TestBase
 {
@@ -143,6 +153,126 @@ internal sealed class CliTests : TestBase
             AssertTrue(r.StdOut.IndexOf("NotAttempted", StringComparison.Ordinal) >= 0);
             AssertTrue(r.StdOut.IndexOf("mid.zip", StringComparison.Ordinal) >= 0);   // 未处理项逐个列出
             AssertTrue(File.Exists(TestEnv.DeepNestedZip));                           // 绝不删原包
+
+            // 【修复轮 Finding 1 的另一半】**每个归档恰好一个对象**：这一轮有两个归档
+            //（outer 完成 + mid 深度触顶），所以 JSON 里就是两条；深度触顶项**绝不**被再合成一条
+            // NotAttemptedFatal（它已经在 Results 里有自己的结局了）。
+            AssertEq(ObjectCount(json), 2);
+            AssertEq(StatusCount(json, "NotAttemptedDepthLimit"), 1);
+            AssertEq(StatusCount(json, "NotAttemptedFatal"), 0);
+        });
+
+        // 【修复轮 Finding 1 的控制方裁定】致命中止之后**没轮到处理**的候选必须在 --json-out 里
+        // 逐项可见：只读 JSON 的机器读方（Task 15 的验收脚本 / Task 14 的界面）否则完全看不到
+        // 这部分 —— 而「未处理数量」正是 Task 10 裁定要读 RunSummary.NotAttempted 的那个数字。
+        H.Run("Cli.FatalAbortReportsUnprocessedRemainderInJson", delegate {
+            // 前置条件：一个**声明**出比本机可用空间还大总量的稀疏 tar（唯一能从外部真实构造出
+            // 致命中止的东西 —— 空间预检失败）。造不出来（例如机器可用空间大到声明量会超过单包
+            // 上限）就如实跳过，绝不假通过。
+            string huge;
+            try { huge = TestEnv.SparseHugeTar; }
+            catch (Exception ex)
+            {
+                H.Skip("Cli.FatalAbortReportsUnprocessedRemainderInJson",
+                    "无法构造致命中止的前置条件（声明量超过本机可用空间的稀疏 tar）：" + ex.Message);
+                return;
+            }
+
+            CliResult r = TestEnv.RunCli("--target", huge, "--target", TestEnv.NestedZip,
+                "--json-out", TestEnv.JsonOut);
+
+            AssertEq(r.ExitCode, 2);                                   // 致命中止：什么都没跑成
+
+            string json = ReadJson(TestEnv.JsonOut);
+            AssertHasStatus(json, "Failed");                           // 触发致命中止的那一项有真实结局
+            AssertHasStatus(json, "NotAttemptedFatal");                // 没轮到的那一项**逐项可见**
+            AssertTrue(json.IndexOf(JsonEscaped(TestEnv.NestedZip), StringComparison.Ordinal) >= 0);
+            AssertEq(StatusCount(json, "NotAttemptedFatal"), 1);
+            AssertEq(ObjectCount(json), 2);                            // 每个归档恰好一个对象
+
+            // 那一项确实**没有被处理**：原包原样、产物目录不存在。
+            AssertTrue(File.Exists(TestEnv.NestedZip));
+            AssertFalse(Directory.Exists(TestEnv.InPlaceOutOf(TestEnv.NestedZip)));
+
+            // 人读面照旧（stdout 的清单没有被 JSON 取代）：权威计数 + 逐行列出未处理路径。
+            AssertTrue(r.StdOut.IndexOf("未处理数量：1", StringComparison.Ordinal) >= 0);
+            AssertTrue(r.StdOut.IndexOf("未处理：" + TestEnv.NestedZip, StringComparison.Ordinal) >= 0);
+        });
+
+        // 【修复轮 Finding 2 的控制方裁定】取消 ⇒ 退出码 1，不是 2：2 的定义是「什么都没跑成」，
+        // 而一次被取消的运行**跑过**（可能已经解出一批 Completed）。
+        //
+        // 【为什么这条断言不经过 CLI 子进程】CLI 没有取消入口（RunOptions.Cancellation 从不设置，
+        // 取消只可能来自界面），进程级根本构造不出 Cancelled 的运行。所以映射被放进
+        // Rerar.Core.RunExitCodes —— CLI 与用例**共用同一份实现**，这里断言的就是 CLI 真正执行的那段代码。
+        H.Run("Cli.CancelledExitCodeIsOneNotTwo", delegate {
+            RunSummary cancelled = new RunSummary();
+            cancelled.Cancelled = true;
+            cancelled.Results.Add(CompletedResult(TestEnv.NestedZip));   // 取消之前已经解出来的那一批
+            cancelled.NotAttempted.Add(@"C:\nope\remaining.zip");       // 没轮到的那一项
+            AssertEq(RunExitCodes.For(cancelled), 1);
+
+            // 取消绝不是成功：哪怕结果集为空也不能退化成 0。
+            RunSummary cancelledNothing = new RunSummary();
+            cancelledNothing.Cancelled = true;
+            AssertEq(RunExitCodes.For(cancelledNothing), 1);
+
+            // 反向：2 只留给「什么都没跑成」（致命原因），取消不再与它同档。
+            RunSummary fatal = new RunSummary();
+            fatal.FatalReason = "磁盘空间不足：目标卷可用空间不够（用例构造）";
+            AssertEq(RunExitCodes.For(fatal), 2);
+
+            // 顺带钉住这一档的其它两条：全完成 ⇒ 0；有未处理项 ⇒ 1。
+            RunSummary clean = new RunSummary();
+            clean.Results.Add(CompletedResult(TestEnv.NestedZip));
+            AssertEq(RunExitCodes.For(clean), 0);
+
+            RunSummary unprocessed = new RunSummary();
+            unprocessed.Results.Add(CompletedResult(TestEnv.NestedZip));
+            unprocessed.NotAttempted.Add(@"C:\nope\remaining.zip");
+            AssertEq(RunExitCodes.For(unprocessed), 1);
+        });
+
+        // 【修复轮 Finding 3 的控制方裁定】CLI 认环境变量 RERAR_JOURNAL_ROOT：全组用例的恢复日志
+        // 都落在 TestEnv.Tmp 之下，测试**再也不碰**真实的 %LOCALAPPDATA%\Rerar（那条「删掉自己
+        // 写进用户应用数据目录的文件」的逻辑已从 TestEnv.RunCli 里删除）。
+        H.Run("Cli.JournalRootOverrideKeepsRealAppDataUntouched", delegate {
+            string realRoot;
+            try { realRoot = Journal.DefaultRoot; }
+            catch (Exception ex)
+            {
+                H.Skip("Cli.JournalRootOverrideKeepsRealAppDataUntouched",
+                    "无法定位 %LOCALAPPDATA%（" + ex.GetType().Name + "）：无法证明真实日志根未被触碰");
+                return;
+            }
+
+            bool existedBefore = Directory.Exists(realRoot);
+            string[] before = LogNames(realRoot);
+
+            // (1) 设了变量 ⇒ 日志真的落在覆盖根里（于是「运行头报出来的根 = 真正用的根」是可证的）。
+            string overrideRoot = TestEnv.CliJournalRoot;
+            CliResult r = TestEnv.RunCli("--target", TestEnv.NestedZip, "--json-out", TestEnv.JsonOut);
+            AssertEq(r.ExitCode, 0);
+            AssertTrue(r.StdOut.IndexOf(overrideRoot, StringComparison.OrdinalIgnoreCase) >= 0);
+            AssertTrue(Directory.Exists(overrideRoot));
+            AssertTrue(Directory.GetFiles(overrideRoot, "*.log").Length > 0);
+
+            // (2) 真实的应用数据根一字未动（不新增文件、目录存在性也不变）。
+            AssertEq(Directory.Exists(realRoot), existedBefore);
+            AssertNoNewLogs(realRoot, before);
+
+            // (3) 没设变量 ⇒ 仍然用**生产默认根**。这一条只能读运行头报出来的根：那个分支不许
+            //     真的去写真实根，所以调用的必须是一次**用法级致命**（--depth 0 ⇒ 连 Extractor 都
+            //     不构造，因而一个日志文件都不会产生）；TestEnv 用期望退出码把这个前提钉住。
+            CliResult unset = TestEnv.RunCliWithoutJournalRootOverride(2, "--depth", "0",
+                "--target", TestEnv.NestedZip);
+            AssertEq(unset.ExitCode, 2);
+            AssertTrue(unset.StdOut.IndexOf(TestEnv.JournalRootVariable, StringComparison.Ordinal) >= 0);
+            AssertTrue(unset.StdOut.IndexOf(realRoot, StringComparison.OrdinalIgnoreCase) >= 0);
+
+            // 用法级致命绝不开日志 ⇒ 真实根仍然一字未动。
+            AssertEq(Directory.Exists(realRoot), existedBefore);
+            AssertNoNewLogs(realRoot, before);
         });
 
         H.Run("Cli.JsonKeysMatchTheCrossTaskContract", delegate {
@@ -272,6 +402,73 @@ internal sealed class CliTests : TestBase
     private static void AssertHasStatus(string json, string status)
     {
         AssertTrue(json.IndexOf("\"status\":\"" + status + "\"", StringComparison.Ordinal) >= 0);
+    }
+
+    // JSON 数组里有几个对象（= 几个归档）。「每个归档恰好一个对象」这类断言用它。
+    private static int ObjectCount(string json)
+    {
+        return CountOccurrences(json, "{\"path\":");
+    }
+
+    // 某个结局出现了几次。深度触顶项绝不被再合成一条（= 恰好 1），合成项也绝不重复发。
+    private static int StatusCount(string json, string status)
+    {
+        return CountOccurrences(json, "\"status\":\"" + status + "\"");
+    }
+
+    private static int CountOccurrences(string text, string needle)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(needle)) { return 0; }
+
+        int count = 0;
+        int at = text.IndexOf(needle, StringComparison.Ordinal);
+        while (at >= 0)
+        {
+            count++;
+            at = text.IndexOf(needle, at + needle.Length, StringComparison.Ordinal);
+        }
+        return count;
+    }
+
+    // 一个日志根下的日志文件名（目录不存在就是空集）。用于证明真实的应用数据根没被动过。
+    private static string[] LogNames(string root)
+    {
+        if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) { return new string[0]; }
+
+        string[] files;
+        try { files = Directory.GetFiles(root, "*" + Journal.FileExtension); }
+        catch (Exception) { return new string[0]; }
+
+        string[] names = new string[files.Length];
+        for (int i = 0; i < files.Length; i++) { names[i] = Path.GetFileName(files[i]); }
+        return names;
+    }
+
+    // 快照之后这个日志根里**不许**多出任何文件（也不许少 —— 测试绝不删别人的记录）。
+    private static void AssertNoNewLogs(string root, string[] before)
+    {
+        string[] after = LogNames(root);
+        AssertEq(after.Length, before.Length);
+
+        List<string> known = new List<string>(before);
+        for (int i = 0; i < after.Length; i++)
+        {
+            AssertTrue(known.Contains(after[i]));
+        }
+    }
+
+    // 一条「已完成」的结果（RunExitCodes 的用例只需要形状，不需要真跑一次解压）。
+    private static ArchiveResult CompletedResult(string archivePath)
+    {
+        ArchiveResult result = new ArchiveResult();
+        result.Path = archivePath;
+        result.Status = ArchiveStatus.Completed;
+        result.Layers = 1;
+        result.Files = 1;
+        result.Failed = 0;
+        result.OutputDir = "";
+        result.Message = "";
+        return result;
     }
 
     // 报告的编码与形状：UTF-8 **带 BOM**（规格 §2 第 6 条 / §3：报告一律 BOM，否则 PowerShell 5.1
