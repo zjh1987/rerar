@@ -258,6 +258,22 @@ if ($appBytes -le $payloadBytes) {
 }
 Write-Host ("OK: " + $exe + "（" + $appBytes + " 字节，其中内嵌载荷 " + $payloadBytes + " 字节）")
 
+# ======================================================================
+# Task 15：许可合规的「产物」半边 —— THIRD-PARTY-NOTICES.txt 必须与 exe 一起躺在 dist\ 下
+# ======================================================================
+# 内嵌 7z.exe + 7z.dll 使本程序成为 7-Zip 的**二进制再分发者**，而 7-Zip 的许可原文写着
+# 「Redistributions in binary form must reproduce related license information from this file」。
+# 所以这份文件缺席不是「少一个文档」，而是**许可违规**：那种 exe 不允许发出去，构建就在这里失败。
+# （另一半 —— 界面里的「关于/开源许可」入口 —— 属于 Task 14 的 MainForm；见 task-15-report.md。）
+$noticesSource = Join-Path $root 'THIRD-PARTY-NOTICES.txt'
+if (-not (Test-Path -LiteralPath $noticesSource)) {
+    Fail ("缺少 THIRD-PARTY-NOTICES.txt（" + $noticesSource + "）：本程序内嵌 7-Zip（LGPL + BSD 3-clause + " +
+          "BSD 2-clause + unRAR 限制），二进制再分发必须随附许可信息，缺了它的 exe 不允许发出去。")
+}
+$noticesTarget = Join-Path $dist 'THIRD-PARTY-NOTICES.txt'
+Copy-Item -LiteralPath $noticesSource -Destination $noticesTarget -Force
+Write-Host ("OK: " + $noticesTarget + "（" + (Get-Item -LiteralPath $noticesTarget).Length + " 字节，随 exe 分发）")
+
 # 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
 # 测试目标比应用目标多一条引用：System.IO.Compression（zip 写库，见 Invoke-CscTarget 上的说明）。
 # 第 5 个参数（额外开关）刻意**不传**：/resource: 与 /win32manifest: 都只属于应用目标。

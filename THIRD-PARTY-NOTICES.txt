@@ -1,0 +1,224 @@
+﻿Rerar 第三方组件与许可声明（THIRD-PARTY-NOTICES）
+==================================================
+
+本文件必须与 Rerar.exe 一起分发。它同时说明三件事：
+  1) 本程序内嵌了 7-Zip（因此本程序是 7-Zip 的**二进制再分发者**，有随附许可的义务）；
+  2) 7-Zip 的完整许可信息（GNU LGPL 正文要点 + BSD 3-clause + BSD 2-clause + unRAR 限制段落）；
+  3) 引擎相关的用户可见环境变量与本程序在你机器上留下的文件（含**刻意不回收**的旧目录）。
+
+许可原文来源：<https://www.7-zip.org/license.txt>（本文件中 7-Zip 相关的全部条款文字均照录该页）。
+7-Zip 源码与二进制下载：<https://www.7-zip.org>
+
+
+------------------------------------------------------------------
+1. 本程序使用了 7-Zip（LGPL）：事实与对应源码
+------------------------------------------------------------------
+
+Rerar 使用 7-Zip 作为唯一的解压引擎。内嵌的两份文件是：
+
+  * 7z.exe（命令行前端）
+  * 7z.dll（解压/压缩引擎，含 LGPL、BSD 3-clause、BSD 2-clause 与 unRAR 限制的代码）
+
+它们**未经任何修改**，逐字节来自官方发行版。构建时对这两份文件计算的 SHA-256 会被写死进程序
+（`dist\obj\EmbeddedEngine.g.cs`，由 `build\build.ps1` 生成），运行期每次使用/释放前都重新校验；
+被改写、被截断、被替换的副本一律拒绝使用并重新释放。
+
+正因为内嵌的是**未修改**的官方二进制，`https://www.7-zip.org` 发布的对应版本源码就是这份二进制的
+完整对应源码。7-Zip 的版本号与两份文件的 SHA-256 会打印在构建输出里，也可以直接查看生成的
+`EmbeddedEngine.g.cs`。
+
+想用**你自己编译或修改过的 7-Zip**（LGPL 允许、本程序也支持）：
+把它放在 `%ProgramFiles%\7-Zip\7z.exe`（或 Rerar.exe 同目录下），版本号不低于 25.00 即可 ——
+本程序**优先使用本机安装的那一份**，内嵌副本只是「本机一份都没有 / 太旧」时的兜底。
+注意：版本下限 25.00 是安全要求（更低版本存在已在野利用的符号链接目录穿越问题），不是许可限制。
+
+
+------------------------------------------------------------------
+2. 7-Zip 许可信息（照录 https://www.7-zip.org/license.txt）
+------------------------------------------------------------------
+
+7-Zip
+~~~~~
+License for use and distribution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+7-Zip Copyright (C) 1999-2025 Igor Pavlov.
+
+The licenses for files are:
+
+  - 7z.dll:
+       - The "GNU LGPL" as main license for most of the code
+       - The "GNU LGPL" with "unRAR license restriction" for some code
+       - The "BSD 3-clause License" for some code
+       - The "BSD 2-clause License" for some code
+  - All other files: the "GNU LGPL".
+
+Redistributions in binary form must reproduce related license information from this file.
+
+Note:
+  You can use 7-Zip on any computer, including a computer in a commercial
+  organization. You don't need to register or pay for 7-Zip.
+
+
+GNU LGPL information
+--------------------
+
+    This library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+
+    You can receive a copy of the GNU Lesser General Public License from
+    http://www.gnu.org/
+
+
+BSD 3-clause License in 7-Zip code
+----------------------------------
+
+  The "BSD 3-clause License" is used for the following code in 7z.dll
+    1) LZFSE data decompression.
+       That code was derived from the code in the "LZFSE compression library" developed by Apple Inc,
+       that also uses the "BSD 3-clause License".
+    2) ZSTD data decompression.
+       that code was developed using original zstd decoder code as reference code.
+       The original zstd decoder code was developed by Facebook Inc,
+       that also uses the "BSD 3-clause License".
+
+  Copyright (c) 2015-2016, Apple Inc. All rights reserved.
+  Copyright (c) Facebook, Inc. All rights reserved.
+  Copyright (c) 2023-2025 Igor Pavlov.
+
+Text of the "BSD 3-clause License"
+----------------------------------
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+BSD 2-clause License in 7-Zip code
+----------------------------------
+
+  The "BSD 2-clause License" is used for the XXH64 code in 7-Zip.
+
+  XXH64 code in 7-Zip was derived from the original XXH64 code developed by Yann Collet.
+
+  Copyright (c) 2012-2021 Yann Collet.
+  Copyright (c) 2023-2025 Igor Pavlov.
+
+Text of the "BSD 2-clause License"
+----------------------------------
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+unRAR license restriction
+-------------------------
+
+The decompression engine for RAR archives was developed using source
+code of unRAR program.
+All copyrights to original unRAR code are owned by Alexander Roshal.
+
+The license for original unRAR code has the following restriction:
+
+  The unRAR sources cannot be used to re-create the RAR compression algorithm,
+  which is proprietary. Distribution of modified unRAR sources in separate form
+  or as a part of other software is permitted, provided that it is clearly
+  stated in the documentation and source comments that the code may
+  not be used to develop a RAR (WinRAR) compatible archiver.
+
+【本条限制的中文说明，便于快速理解；以上英文段落为准】
+  * unRAR 的解压源码**不得**被用来重新实现 RAR **压缩**算法（那是专有的）；
+  * 以独立形式或作为其它软件的一部分分发**修改过的** unRAR 源码是允许的，但必须在文档与源码注释里
+    明确写出：「本代码不得用于开发与 RAR（WinRAR）兼容的压缩器」。
+
+Rerar 只使用 7-Zip 的**解压**能力：本程序不含任何压缩功能，也不派生、修改、再分发 unRAR 源码本身，
+而是原样内嵌官方 7z.dll。上述限制对本程序的使用方式是满足的，且本声明即为所需的「明确写出」。
+
+
+------------------------------------------------------------------
+3. 附：引擎与本地文件（用户可见的环境变量与落盘位置）
+------------------------------------------------------------------
+
+本程序不写注册表、不装服务、不建计划任务、不提权。它在你的用户目录下只会做一件事：
+把内嵌的 7-Zip 释放成两个普通文件。
+
+  默认释放位置：%LOCALAPPDATA%\Rerar\bin\<buildid>\{7z.exe, 7z.dll}
+  <buildid> = 内嵌 7z.exe 的 SHA-256 前 16 位（内容寻址：同一份载荷永远落同一个目录）
+  每次约 2.4 MB。
+
+两个环境变量（进程级，给可移植 / 排障 / 自动化用；不设置时行为完全不变）：
+
+  RERAR_ENGINE_ROOT
+      改写内嵌 7-Zip 的**释放根**（默认 %LOCALAPPDATA%\Rerar\bin）。
+      例：把 Rerar 放在只读介质上、或想让它完全不碰 %LOCALAPPDATA% 时，
+      设成某个可写目录即可。
+
+  RERAR_ENGINE_LOCAL
+      设为 off / 0 / false 时，**跳过全部本机 7-Zip 的探测**，强制使用内嵌便携版。
+      用途：验证「没有 7-Zip 的干净机器」这条路；或你怀疑本机那份 7-Zip 有问题时做对照。
+      其余任何取值（含未设置、空串、写错的值）都按「没设置」处理 —— 一个笔误不会悄悄改变引擎来源。
+
+另一个相关变量（崩溃恢复日志根）：
+
+  RERAR_JOURNAL_ROOT
+      改写崩溃恢复日志的根目录（默认 %LOCALAPPDATA%\Rerar\journal）。
+
+【刻意**不**回收的旧目录】7-Zip 升级后 <buildid> 会变，于是 %LOCALAPPDATA%\Rerar\bin\ 下会留下
+上一个版本的目录（每次约 2.4 MB）。本程序**故意不自动清理**它：那是「删除并非本次运行创建的文件」，
+风险大于收益（一个按模式删目录的逻辑，一旦模式写错就会删掉用户自己的东西）。
+想回收就直接手动删 `%LOCALAPPDATA%\Rerar\bin\` 下不需要的旧目录 —— 删除是安全的，下次运行会按需重新释放。
+
+
+------------------------------------------------------------------
+4. 本程序自身
+------------------------------------------------------------------
+
+Rerar 本身不使用任何其它第三方库（构建只用系统自带的 csc.exe，不引 NuGet）。
+本文件随 dist\Rerar.exe 一起分发；若你拿到的是一个没有本文件的 Rerar.exe，
+请到 7-zip.org 获取完整许可信息后再使用。
