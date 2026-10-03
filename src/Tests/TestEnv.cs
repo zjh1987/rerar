@@ -24,6 +24,9 @@ internal static class TestEnv
     // Task 14：界面设置落点的进程级覆盖（名字与 MainForm 里的常量一致）。
     private const string SettingsPathVariable = "RERAR_SETTINGS_PATH";
 
+    // Task 14 修复轮：界面运行日志根的进程级覆盖（同样与 MainForm 里的常量一致）。
+    private const string LogRootVariable = "RERAR_LOG_ROOT";
+
     private static readonly string _root = Path.Combine(Path.GetTempPath(), "rerar-tests");
     private static string _sevenZip;
 
@@ -173,6 +176,12 @@ internal static class TestEnv
         // 真实的用户数据 —— 界面用例会构造真的 MainForm，构造时它会读设置，关闭时会写设置。
         // 机制也一样（进程级环境变量），未设置时生产行为完全不变。
         Environment.SetEnvironmentVariable(SettingsPathVariable, Path.Combine(_root, "tmp", "settings.ini"));
+
+        // Task 14 修复轮：界面**运行日志**的根（%LOCALAPPDATA%\Rerar\logs）同样必须重定向。
+        // 之前只有设置与 journal 可重定向，于是任何一个真的把运行跑起来的界面用例（本轮新增的
+        //「空闲点重试真的起一轮」）都会往用户的应用数据里写一份日志。机制与前两条完全一致
+        //（进程级环境变量），未设置时生产落点一字不变。
+        Environment.SetEnvironmentVariable(LogRootVariable, Path.Combine(_root, "tmp", "logs"));
 
         // 进程外的残留也一并收拾：上一次运行若在 subst 夹具用例中途被杀，映射会留在机器上
         //（Cleanup 删得掉目录，删不掉映射）。放在这里而不是只放在夹具里，是因为它属于

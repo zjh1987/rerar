@@ -19,6 +19,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 
 internal static class GuiProbe
@@ -159,6 +160,95 @@ internal static class GuiProbe
         ((FieldInfo)member).SetValue(target, value);
     }
 
+    // 沿「成员路径」赋值（`Items[0].Selected` 这类）。取元素走 Item[int] 索引器**属性**
+    //（它不是 IList：ListViewItemCollection 明确对 IList.set_Item 抛 NotSupportedException），
+    // 所以这里用反射按属性名取，测试目标仍然不需要引 WinForms。
+    public static void SetPropPath(object target, string path, object value)
+    {
+        if (target == null) { throw new ArgumentNullException("target"); }
+        if (string.IsNullOrEmpty(path)) { throw new ArgumentException("path"); }
+
+        int lastDot = path.LastIndexOf('.');
+        object owner = lastDot < 0 ? target : PropPath(target, path.Substring(0, lastDot));
+        string leaf = lastDot < 0 ? path : path.Substring(lastDot + 1);
+
+        int bracket = leaf.IndexOf('[');
+        if (bracket < 0) { SetProp(owner, leaf, value); return; }
+
+        int close = leaf.IndexOf(']', bracket);
+        if (close < 0) { throw new InvalidOperationException("成员路径「" + path + "」里的下标没有闭合"); }
+
+        object collection = Prop(owner, leaf.Substring(0, bracket));
+        int index = int.Parse(leaf.Substring(bracket + 1, close - bracket - 1),
+            System.Globalization.CultureInfo.InvariantCulture);
+
+        PropertyInfo item = collection.GetType().GetProperty("Item", new Type[] { typeof(int) });
+        if (item == null)
+        {
+            throw new InvalidOperationException("类型「" + collection.GetType().FullName + "」没有 Item[int] 索引器");
+        }
+        item.SetValue(collection, value, new object[] { index });
+    }
+
+    // 沿「成员路径」取值：`Items[0].Selected`、`Items.Count`、`AcceptButton` 都能走。
+    // 为什么需要它：界面用例要读的是**集合里的元素**（右键菜单第 3 项是否可用、列表第 0 行是否选中），
+    // 而 Prop 只认单个成员名。取元素一律走 Item[int] 索引器**属性**（而不是 IList 接口）：
+    // WinForms 的 ListViewItemCollection / ToolStripItemCollection 都实现了 IList，却对
+    // IList.set_Item 抛 NotSupportedException —— 用接口那条路会在「读」的时候也踩到同一个坑。
+    public static object PropPath(object target, string path)
+    {
+        if (target == null) { throw new ArgumentNullException("target"); }
+        if (string.IsNullOrEmpty(path)) { throw new ArgumentException("path"); }
+
+        object current = target;
+        string[] steps = path.Split('.');
+        for (int s = 0; s < steps.Length; s++)
+        {
+            string step = steps[s];
+            int bracket = step.IndexOf('[');
+            string member = bracket < 0 ? step : step.Substring(0, bracket);
+            current = Prop(current, member);
+
+            while (bracket >= 0)
+            {
+                int close = step.IndexOf(']', bracket);
+                if (close < 0) { throw new InvalidOperationException("成员路径「" + path + "」里的下标没有闭合"); }
+
+                int index = int.Parse(step.Substring(bracket + 1, close - bracket - 1),
+                    System.Globalization.CultureInfo.InvariantCulture);
+                current = CollectionItem(current, index, path, member);
+
+                bracket = step.IndexOf('[', close);
+            }
+        }
+        return current;
+    }
+
+    // 从集合里按下标取一个元素（Item[int] 索引器属性）。
+    private static object CollectionItem(object collection, int index, string path, string member)
+    {
+        if (collection == null)
+        {
+            throw new InvalidOperationException("成员路径「" + path + "」的「" + member + "」是 null");
+        }
+
+        PropertyInfo item = collection.GetType().GetProperty("Item", new Type[] { typeof(int) });
+        if (item == null)
+        {
+            throw new InvalidOperationException("成员路径「" + path + "」的「" + member + "」不是可按下标取值的集合（实际类型 " +
+                collection.GetType().FullName + "）");
+        }
+        return item.GetValue(collection, new object[] { index });
+    }
+
+    // 成员是不是声明在 System.Windows.Forms.Control 自己身上（只用**名字**比较，不写那个类型，
+    // 否则会把 System.Windows.Forms 字符串编进 tests.exe —— 见 Member 里的说明）。
+    private static bool IsCanonicalControlMember(Type declaring)
+    {
+        if (declaring == null) { return false; }
+        return string.Equals(declaring.FullName, "System.Windows.Forms.Control", StringComparison.Ordinal);
+    }
+
     private static MemberInfo Member(Type t, string name)
     {
         // 缓存键必须带上**程序集**：Rerar.Core.ArchiveResult 在 tests.exe 与 Rerar.exe 里是两个
@@ -169,8 +259,39 @@ internal static class GuiProbe
         if (_members.TryGetValue(key, out cached)) { return cached; }
 
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-        MemberInfo found = t.GetProperty(name, flags);
-        if (found == null) { found = t.GetField(name, flags); }
+
+        // 【为什么不用 GetProperty(name, flags)】那样遇到**协变隐藏属性**会抛 AmbiguousMatchException：
+        // TableLayoutPanel / FlowLayoutPanel 用 `new TableLayoutControlCollection Controls` 把
+        // Control.Controls 隐藏成更具体的子类型，于是同名属性在两处都存在，GetProperty(name) 无法裁决
+        //（实测：界面用例遍历容器控件树时当场抛）。这里取**全部**同名属性，优先挑**声明在
+        // System.Windows.Forms.Control 上**的那一个 —— 也就是 Control.Controls 本来那个。
+        //
+        // 【为什么按名字比而不是 typeof(Control.ControlCollection)】测试目标**绝不能**引 WinForms
+        //（全局约束，用例 Gui.TestTargetStaysWinFormsFree 直接扫产物字节钉住）。写一个
+        // System.Windows.Forms 的类型引用会把那个字符串编进 tests.exe，当场把那条用例弄红。
+        MemberInfo found = null;
+        PropertyInfo[] properties = t.GetProperties(flags);
+        for (int i = 0; i < properties.Length; i++)
+        {
+            PropertyInfo candidate = properties[i];
+            if (!string.Equals(candidate.Name, name, StringComparison.Ordinal)) { continue; }
+            if (IsCanonicalControlMember(candidate.DeclaringType))
+            {
+                found = candidate;
+                break;
+            }
+            if (found == null) { found = candidate; }
+        }
+
+        if (found == null)
+        {
+            FieldInfo[] fields = t.GetFields(flags);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (string.Equals(fields[i].Name, name, StringComparison.Ordinal)) { found = fields[i]; break; }
+            }
+        }
+
         if (found == null)
         {
             throw new InvalidOperationException("类型「" + t.FullName + "」既没有属性也没有字段「" + name + "」");
@@ -272,6 +393,28 @@ internal static class GuiProbe
         return Convert.ToInt32(Prop(controls, "Count"));
     }
 
+    // 显式创建控件的 Win32 句柄（反射调 protected 的 Control.CreateHandle）。
+    //
+    // 【为什么需要它】有几个 WinForms 状态只在**句柄已创建**之后才被维护 —— 最典型的是
+    // ListView.SelectedIndices：没有句柄时 `ListViewItem.Selected = true` 只写项自己的状态，
+    // ListView 的选中索引集合恒为空（实测），于是靠 SelectedIndices 取行的产品代码在测试里
+    // 永远取不到选中项。窗口正常显示出来时句柄本来就有，所以这是夹具的**准备工作**，
+    // 不是绕过产品的另一条路径。
+    public static void CreateHandle(object control)
+    {
+        if (control == null) { throw new ArgumentNullException("control"); }
+        if (Convert.ToBoolean(Prop(control, "IsHandleCreated"))) { return; }
+
+        // 注意用 System.Type 全名：GuiProbe 自己有一个 Type(string) 方法，裸写 Type.EmptyTypes 会被它遮蔽。
+        MethodInfo create = control.GetType().GetMethod(
+            "CreateHandle", BindingFlags.NonPublic | BindingFlags.Instance, null, System.Type.EmptyTypes, null);
+        if (create == null)
+        {
+            throw new InvalidOperationException("类型「" + control.GetType().FullName + "」上没有 Control.CreateHandle()");
+        }
+        Unwrap(delegate { create.Invoke(control, null); return null; });
+    }
+
     // 按 Name 递归找控件（等价于 brief 里的 f.Controls.Find(name, true)）。找不到抛异常。
     public static object Find(object control, string name)
     {
@@ -330,6 +473,31 @@ internal static class GuiProbe
         return text == null ? "" : text.ToString();
     }
 
+    // 一棵控件树里所有控件的 Text 拼起来（含容器自己）。
+    // 为什么需要它：容器控件（Panel/TableLayoutPanel）自己的 Text 是**空串** —— WinForms 只对
+    // Form/GroupBox 之类做子控件文本的聚合 —— 所以「拖放区里有没有那句提示」必须靠递归收集，
+    // 只看容器自己的 Text 会得到一个空串（那正是本轮修掉的那条空洞断言的反面）。
+    public static string AllText(object control)
+    {
+        if (control == null) { return ""; }
+        StringBuilder builder = new StringBuilder();
+        CollectText(control, builder, 0);
+        return builder.ToString();
+    }
+
+    private static void CollectText(object control, StringBuilder into, int depth)
+    {
+        if (control == null || depth > 64) { return; }
+        into.Append(TextOf(control)).Append('\n');
+
+        object children = Prop(control, "Controls");
+        int count = Convert.ToInt32(Prop(children, "Count"));
+        for (int i = 0; i < count; i++)
+        {
+            CollectText(CollectionItem(children, i, "Controls", "Controls"), into, depth + 1);
+        }
+    }
+
     public static string TypeName(object instance)
     {
         return instance == null ? "" : instance.GetType().Name;
@@ -379,6 +547,7 @@ internal static class GuiProbe
     }
 
     // 应用产物里的 ArchiveResult（只填界面上用到的字段）。
+    // 参数里的 path 是**源路径**：逐项动作（重试 / 打开输出目录）都按选中行的结果取它。
     public static object NewResult(string path, string statusName, int files)
     {
         Type resultType = Type("Rerar.Core.ArchiveResult");
@@ -390,7 +559,21 @@ internal static class GuiProbe
         // 注意 ArchiveResult.Status 是**字段**不是属性 —— 用 GetProperty 拿会得到 null。
         SetProp(result, "Status", Enum.Parse(Type("Rerar.Core.ArchiveStatus"), statusName));
         SetProp(result, "Files", files);
+        SetProp(result, "Failed", 0);
+        SetProp(result, "OutputDir", "");
         return result;
+    }
+
+    // 界面用「应用产物里那份 List<ArchiveResult>」：把一批结果装进去（跨程序集类型身份问题同上）。
+    public static object NewResultListWith(params object[] results)
+    {
+        object list = NewResultList();
+        System.Collections.IList boxed = (System.Collections.IList)list;
+        if (results != null)
+        {
+            foreach (object one in results) { boxed.Add(one); }
+        }
+        return list;
     }
 
     // 造一个真实的 .lnk 快捷方式。造不出来时返回 false 并给出原因（用例据此 H.Skip —— 那是**夹具**

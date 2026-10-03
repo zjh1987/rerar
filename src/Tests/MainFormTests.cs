@@ -26,6 +26,67 @@ internal sealed class MainFormTests : TestBase
         public void Mark() { Ran = true; }
     }
 
+    // ==================================================================
+    // 界面用例的两个小助手。
+    //
+    // 【为什么不需要「把消息泵转一会儿」】本轮的判据全部落在**同步**发生的事情上：
+    //   * SessionRunCount 在 StartRun 里自增（点下去那一刻就 +1，与工作线程无关）；
+    //   * 逐项动作按钮/菜单项的可用性、计数标签的文案、会话日志清单都在调用点同步更新。
+    // 那些经 BeginInvoke 回到 UI 线程的收尾动作（FinishRun）在**没有消息循环**的测试线程上会一直
+    // 留在队列里 —— 那是无害的：它一次控件都没碰到，而且这几条用例要证明的正是「这一轮**起没起**」，
+    // 不是「这一轮跑得怎么样」（后者由 Core 的用例负责）。
+    // ==================================================================
+
+    private static bool IsRunning(object form)
+    {
+        return Convert.ToBoolean(GuiProbe.Prop(form, "_running"));
+    }
+
+    // 一条真实的、**不存在的**源路径：界面会把这一项交给 Core，Core 如实报「目标不存在或不可读」
+    // 并很快收尾 —— 于是用例不必依赖真的压缩包，也不会跑很久。
+    private static string MissingSourcePath(string name)
+    {
+        return Path.Combine(TestEnv.Tmp, name);
+    }
+
+    // 让界面以为当前这一轮已经收尾（走**产品自己的** FinishRun，绝不手改 _running）。
+    // 为什么需要它：测试线程上没有消息循环，工作线程经 BeginInvoke 投递的 FinishRun 永远不会被执行；
+    // 而「第二轮真的起得来」这件事要求 _running 已经回到 false（否则 EnqueueRetry 只会入队，
+    // 那正是被修的缺陷要区分的两种情形）。FinishRun 需要一个 RunSummary —— 按应用产物的类型现造。
+    private static void FinishRunningRound(object form)
+    {
+        if (!IsRunning(form)) { return; }
+        object summary = GuiProbe.New("Rerar.Core.RunSummary", null);
+        GuiProbe.Call(form, "FinishRun", new object[] { summary });
+        AssertFalse(IsRunning(form));       // 收尾之后必须真的空闲了（否则后面的断言没有意义）
+    }
+
+    // 把界面摆成「选中了一条可以重试的结果」的样子：_results 一条失败结局 + 逐项列表重建 +
+    // 选中第 0 行。这一切都经反射做在**产品里那个真实的 MainForm** 上。
+    //
+    // 【为什么要显式 CreateHandle】ListView.SelectedIndices 只在**句柄已创建**之后才被维护：
+    // 没有句柄时 `ListViewItem.Selected = true` 只把项自己的 StateSelected 置上，ListView 的
+    // 选中索引集合一直是空的（实测：SelectedIndices.Count 恒为 0），而产品的 SelectedResult()
+    // 正是按 SelectedIndices 取行的 —— 于是必须先把句柄建出来（这是测试夹具的准备工作，
+    // 不是产品的替代路径：产品里窗口本来就是显示出来的，句柄必然已创建）。
+    private static void PrepareRetryTarget(object form, string sourcePath)
+    {
+        object results = GuiProbe.NewResultListWith(
+            GuiProbe.NewResult(sourcePath, "Failed", 0));
+
+        GuiProbe.SetProp(form, "_results", results);
+        GuiProbe.SetProp(form, "_itemsBuilt", 0);
+        GuiProbe.Call(form, "RefreshItems", null);
+
+        object items = GuiProbe.Prop(form, "_lstItems");
+        GuiProbe.CreateHandle(items);
+        // ListView.SelectedItems 是只读集合 —— 所以不碰它，而是把**行元素**的 Selected 置 true
+        //（Item[int] 索引器属性 + ListViewItem.Selected 的 setter，两条都是反射可达的公开成员）。
+        GuiProbe.SetPropPath(items, "Items[0].Selected", true);
+        AssertEq(Convert.ToInt32(GuiProbe.PropPath(items, "SelectedIndices.Count")), 1);
+        GuiProbe.Call(form, "UpdateItemActions", null);
+    }
+
     public static void Run()
     {
         // ---- 工作线程回调：必须编组，且绝不能在窗体销毁后把异常抛回流水线 ----
@@ -67,7 +128,15 @@ internal sealed class MainFormTests : TestBase
         H.Run("Gui.DropZoneIsPresentAndNamed", delegate {
             GuiProbe.WithForm(delegate(object f) {
                 AssertEq(GuiProbe.FindCount(f, "dropZone"), 1);
-                AssertTrue(GuiProbe.TextOf(GuiProbe.Find(f, "dropZone")).Length >= 0);   // 取得到，不是 null
+
+                // 修复轮 Minor 11：原来这里断言「Length >= 0」—— 那对任何字符串都成立，
+                // 等于什么都没断言。改成对**文案本身**的真实断言：拖放区必须给出明确的下一步
+                //（J2/J11：拖放失效时的备用入口要在同一块里看得见）。
+                string dropZoneText = GuiProbe.AllText(GuiProbe.Find(f, "dropZone"));
+                AssertTrue(dropZoneText.IndexOf("拖到这里", StringComparison.Ordinal) >= 0);
+                AssertTrue(dropZoneText.IndexOf("选择文件夹", StringComparison.Ordinal) >= 0);
+                AssertTrue(dropZoneText.IndexOf("选择压缩包", StringComparison.Ordinal) >= 0);
+                AssertTrue(dropZoneText.IndexOf("原件默认保留", StringComparison.Ordinal) >= 0);
             }); });
 
         H.Run("Gui.DangerousDeleteIsUncheckedByDefault", delegate {                 // 不变式 I3 的界面层
@@ -216,15 +285,22 @@ internal sealed class MainFormTests : TestBase
             string running = (string)GuiProbe.Static("Rerar.MainForm", "FormatProgressText",
                 new object[] { 7, 23, TimeSpan.FromSeconds(751) });
             AssertTrue(running.IndexOf("第 7", StringComparison.Ordinal) >= 0);
-            AssertTrue(running.IndexOf("已发现 23 个包", StringComparison.Ordinal) >= 0);
+            AssertTrue(running.IndexOf("已发现 23", StringComparison.Ordinal) >= 0);
             AssertTrue(running.IndexOf("已用 12:31", StringComparison.Ordinal) >= 0);
             AssertFalse(running.IndexOf("剩余", StringComparison.Ordinal) >= 0);      // 还没满 3 个包
             AssertFalse(running.IndexOf("%", StringComparison.Ordinal) >= 0);        // 绝不报百分比
+            // 修复轮 Minor 2：单位是「项」（交给 Core 判定的候选文件），不是「个包」。
+            AssertTrue(running.IndexOf("项", StringComparison.Ordinal) >= 0);
+            AssertFalse(running.IndexOf("个包", StringComparison.Ordinal) >= 0);
 
             string scanning = (string)GuiProbe.Static("Rerar.MainForm", "FormatScanningText",
                 new object[] { 23 });
             AssertTrue(scanning.IndexOf("已发现 23", StringComparison.Ordinal) >= 0);
             AssertFalse(scanning.IndexOf("%", StringComparison.Ordinal) >= 0);       // 扫描期的百分比是谎话
+            // 修复轮 Minor 2：单位必须与名词相符 —— 这里数的是**候选文件**（枚举层不按后缀过滤，
+            // 「是不是压缩包」由 Core 逐个判），所以文案里不许出现「个压缩包」。
+            AssertTrue(scanning.IndexOf("候选文件", StringComparison.Ordinal) >= 0);
+            AssertFalse(scanning.IndexOf("个压缩包", StringComparison.Ordinal) >= 0);
         });
 
         H.Run("Gui.EtaAppearsOnlyAfterThreeArchivesAndIsLabelledRough", delegate {
@@ -389,5 +465,251 @@ internal sealed class MainFormTests : TestBase
             AssertFalse(GuiProbe.ContainsAscii(tests, "System.Windows.Forms")); // 测试目标**不引**
             AssertFalse(GuiProbe.ContainsAscii(tests, "System.Drawing"));
         });
+
+        // ==================================================================
+        // 修复轮（Task 14 第一轮 fix）：三条 Important + 相邻 Minors
+        // ==================================================================
+
+        // ---- 修复轮 Finding 1：空闲时点「重试」必须**真的跑起来** ----
+        //
+        // 【被修的缺陷】以前两个逐项动作处理器只调 EnqueueRetry（只入队），而出队点只有密码面板
+        // 的两个按钮；同时 UpdateItemActions 又只在 `!_running`（= 点下去永远跑不起来的那个时刻）
+        // 才启用这两个按钮。于是「空闲时点重试」是一次静默失败：状态行还谎称「当前批次结束后重试」，
+        // 而当时根本没有批次。
+        //
+        // 【为什么断言 SessionRunCount】那是「本会话真的起过几轮运行」的只增计数，在 StartRun 里
+        // **同步**自增 —— 与工作线程的进度无关，所以这条断言是确定性的（不靠竞态）。
+        // 若 TryStartIdleRetry 又被摘掉，这里就是 0，用例当场红。
+        H.Run("Gui.IdleRetryClickActuallyStartsRetry", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(f, "SessionRunCount")), 0);
+
+                string source = MissingSourcePath("重试目标-不存在.zip");
+                PrepareRetryTarget(f, source);
+
+                // 前置条件本身就是契约的一半：空闲 + 选中一条未成功的结果 ⇒ 按钮必须可用。
+                AssertTrue(Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Prop(f, "_btnRetry"), "Enabled")));
+
+                GuiProbe.Call(f, "BtnRetry_Click", new object[] { null, EventArgs.Empty });
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(f, "SessionRunCount")), 1);   // **这一下就起了**
+
+                // 会话日志清单立即可达（修复轮 Finding 3 的第二半）。
+                string[] logs = (string[])GuiProbe.Call(f, "SessionLogPaths", null);
+                AssertEq(logs.Length, 1);
+                AssertTrue(File.Exists(logs[0]));
+
+                // 两个口径的计数标签在起跑那一刻就已经**并排**存在（谁也冒充不了谁）。
+                string counters = GuiProbe.TextOf(GuiProbe.Find(f, "lblCounters"));
+                string session = GuiProbe.TextOf(GuiProbe.Find(f, "lblSessionCounters"));
+                AssertTrue(counters.IndexOf("【本轮】", StringComparison.Ordinal) >= 0);
+                AssertTrue(session.IndexOf("【本次会话】", StringComparison.Ordinal) >= 0);
+            }); });
+
+        // 反证守卫：把 TryStartIdleRetry 从 EnqueueRetry 里摘掉，上面那条用例必须变红 ——
+        // 这里额外直接钉住「入队的同时就会尝试启动」这件事的两半（队列被消费 + 状态行不再说
+        //「当前批次结束后重试」），因为**状态行说谎**本身就是被复核者点名的缺陷之一。
+        H.Run("Gui.IdleRetryNeverClaimsABatchThatDoesNotExist", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                GuiProbe.Call(f, "EnqueueRetry", new object[] { MissingSourcePath("空闲入队.zip"), "重试" });
+
+                // 空闲时入队 ⇒ 立刻开始（队列被消费掉），状态行**不得**再说「当前批次结束后」。
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(f, "SessionRunCount")), 1);
+                string status = GuiProbe.TextOf(GuiProbe.Find(f, "lblStatus"));
+                AssertFalse(status.IndexOf("当前批次结束后", StringComparison.Ordinal) >= 0);
+                AssertTrue(status.IndexOf("开始重试", StringComparison.Ordinal) >= 0);
+                AssertTrue(IsRunning(f));                      // 真的在跑（不是只把话说得好听）
+            }); });
+
+        // ---- 修复轮 Finding 1（第二半）：按钮与右键菜单的可用性必须一致 ----
+        H.Run("Gui.ContextMenuItemsCannotDisagreeWithActionButtons", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                object menu = GuiProbe.Prop(f, "_itemMenu");
+                AssertEq(Convert.ToInt32(GuiProbe.PropPath(menu, "Items.Count")), 4);
+
+                // 没有任何选中项（构造后的初态）：四个按钮与四个菜单项**全部**不可用。
+                string[] names = new string[] { "btnForceArchive", "btnEnterPassword", "btnRetry", "btnOpenOutput" };
+                for (int i = 0; i < 4; i++)
+                {
+                    AssertFalse(Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Find(f, names[i]), "Enabled")));
+                    AssertFalse(MenuItemEnabled(menu, i));
+                }
+
+                // 选中一条失败结局：三个动作可用，且按钮与菜单项**逐一同值**。
+                PrepareRetryTarget(f, MissingSourcePath("菜单一致性.zip"));
+                for (int i = 0; i < 4; i++)
+                {
+                    bool button = Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Find(f, names[i]), "Enabled"));
+                    AssertEq(MenuItemEnabled(menu, i), button);
+                }
+                AssertTrue(Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Find(f, "btnRetry"), "Enabled")));
+
+                // 运行中：四对必须**同时**关掉（以前菜单项从不被禁用，两个入口在这里正好相反）。
+                GuiProbe.Call(f, "SetItemActionsEnabled", new object[] { false });
+                for (int i = 0; i < 4; i++)
+                {
+                    AssertFalse(Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Find(f, names[i]), "Enabled")));
+                    AssertFalse(MenuItemEnabled(menu, i));
+                }
+            }); });
+
+        // ---- 修复轮 Finding 2：每次开始都有的预检摘要（含引擎未定位时的诚实措辞） ----
+        H.Run("Gui.PreflightSummarySaysEverythingEvenWithDeleteOff", delegate {
+            string text = (string)GuiProbe.Static("Rerar.MainForm", "BuildSummaryText",
+                new object[] { 7, false, null });
+            AssertTrue(text.IndexOf("7 项", StringComparison.Ordinal) >= 0);           // 目标项数
+            AssertTrue(text.IndexOf("保留", StringComparison.Ordinal) >= 0);           // 删除关着 ⇒ 原包不动
+            AssertTrue(text.IndexOf("原地", StringComparison.Ordinal) >= 0);           // §6.11 的输出去向
+            AssertTrue(text.IndexOf("将在开始时定位", StringComparison.Ordinal) >= 0);  // 引擎：未定位就说未定位
+            AssertFalse(text.IndexOf("25.00", StringComparison.Ordinal) >= 0);         // 绝不冒充已定位
+
+            // 定位到之后如实换成真值；删除开着时写明后果（含确切数量）。
+            string resolved = (string)GuiProbe.Static("Rerar.MainForm", "FormatEngineSummaryLine",
+                new object[] { "解压引擎：7-Zip 26.01（本机安装）：C:\\Program Files\\7-Zip\\7z.exe" });
+            AssertTrue(resolved.IndexOf("26.01", StringComparison.Ordinal) >= 0);
+            AssertFalse(resolved.IndexOf("将在开始时定位", StringComparison.Ordinal) >= 0);
+
+            string deleting = (string)GuiProbe.Static("Rerar.MainForm", "FormatDeleteSummaryLine",
+                new object[] { true, 3 });
+            AssertTrue(deleting.IndexOf("回收站", StringComparison.Ordinal) >= 0);
+            AssertTrue(deleting.IndexOf("校验通过", StringComparison.Ordinal) >= 0);
+            AssertTrue(deleting.IndexOf("3 项", StringComparison.Ordinal) >= 0);        // 说出确切数量
+
+            // 窗体上真的有一个摘要标签，且初态是收起的（它不是常驻装饰）。
+            GuiProbe.WithForm(delegate(object f) {
+                object summary = GuiProbe.Find(f, "lblSummary");
+                AssertEq(GuiProbe.TypeName(summary), "Label");
+                AssertFalse(Convert.ToBoolean(GuiProbe.Prop(summary, "Visible")));
+            });
+        });
+
+        // ---- 修复轮 Finding 2 的相邻项（Minor 1）：三个固定行为复选框必须**置灰** ----
+        H.Run("Gui.FixedBehaviourOptionsAreDisabledWithReason", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                string[] names = new string[] { "chkCamouflage", "chkVolumes", "chkDict" };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    object box = GuiProbe.Find(f, names[i]);
+                    AssertEq(GuiProbe.TypeName(box), "CheckBox");
+                    // 勾着（那正是 v1.0 的固定行为），但**不能改**：可点却什么都不改变就是在骗人。
+                    AssertTrue(GuiProbe.Checked(box));
+                    AssertFalse(Convert.ToBoolean(GuiProbe.Prop(box, "Enabled")));
+                    AssertTrue(GuiProbe.Prop(box, "AccessibleName").ToString()
+                        .IndexOf("固定行为", StringComparison.Ordinal) >= 0);
+                }
+
+                // 提示语的措辞由纯函数给，用例连文案本身一起钉住。
+                string tip = (string)GuiProbe.Static("Rerar.MainForm", "FixedOptionTooltip",
+                    new object[] { "按内容识别改了后缀名的压缩包" });
+                AssertTrue(tip.IndexOf("按内容识别", StringComparison.Ordinal) >= 0);   // 说清它做什么
+                AssertTrue(tip.IndexOf("v1.0", StringComparison.Ordinal) >= 0);        // 说清为什么点不动
+
+                // 反证：删除开关仍然是**能改**的（置灰不能误伤真正的杠杆）。
+                AssertTrue(Convert.ToBoolean(GuiProbe.Prop(GuiProbe.Find(f, "chkDelete"), "Enabled")));
+            }); });
+
+        // ---- 修复轮 Finding 3：两个口径 + 会话日志清单 + 日志文件名的唯一性 ----
+        H.Run("Gui.CountersCarryTheirOwnScopeAndLogsStayReachable", delegate {
+            // (1) 计数行必须带口径标签 —— 数字不能脱离它自己的范围出现。
+            object round = GuiProbe.NewResultListWith(
+                GuiProbe.NewResult(@"C:\in\a.zip", "Failed", 0),
+                GuiProbe.NewResult(@"C:\in\b.zip", "Completed", 4));
+            string scoped = (string)GuiProbe.Static("Rerar.MainForm", "FormatScopedCountersLine",
+                new object[] { "本轮", round, 1 });
+            AssertTrue(scoped.IndexOf("【本轮】", StringComparison.Ordinal) >= 0);
+            AssertTrue(scoped.IndexOf("❌ 1 个失败", StringComparison.Ordinal) >= 0);
+
+            // (2) 会话口径 = 已收尾各轮 + 当前轮，按路径取**最后一条**（重试过的包绝不数两遍）。
+            //     被复核者点名的那个场景就在这里：200 项 30 失败之后跑一轮 1 项的重试，
+            //     会话口径必须**仍然**报出那 30 个失败和 1 个未处理。
+            object closed = GuiProbe.NewResultListWith(
+                GuiProbe.NewResult(@"C:\in\bad1.zip", "Failed", 0),
+                GuiProbe.NewResult(@"C:\in\bad2.zip", "Failed", 0),
+                GuiProbe.NewResult(@"C:\in\retried.zip", "Failed", 0));
+            object current = GuiProbe.NewResultListWith(
+                GuiProbe.NewResult(@"C:\in\retried.zip", "Completed", 9));
+            string session = (string)GuiProbe.Static("Rerar.MainForm", "FormatSessionCountersLine",
+                new object[] { closed, current, 1, 0 });
+            AssertTrue(session.IndexOf("【本次会话】", StringComparison.Ordinal) >= 0);
+            AssertTrue(session.IndexOf("❌ 2 个失败", StringComparison.Ordinal) >= 0);   // 30→2 的缩样：同一条规则
+            AssertTrue(session.IndexOf("⏳ 1 个未处理", StringComparison.Ordinal) >= 0);
+            AssertFalse(session.IndexOf("❌ 3 个失败", StringComparison.Ordinal) >= 0);  // 重试过的那条**不数两遍**
+
+            // 只报本轮的旧行为就是那句谎：这一条从反面钉住「会话口径 ≠ 本轮口径」。
+            string onlyRound = (string)GuiProbe.Static("Rerar.MainForm", "FormatScopedCountersLine",
+                new object[] { "本轮", current, 0 });
+            AssertTrue(onlyRound.IndexOf("❌ 0 个失败", StringComparison.Ordinal) >= 0);
+
+            // (3) 会话日志清单：**每一轮**的路径都留着，不是只留最后一条。
+            //     两轮都在**起跑那一刻**取清单 —— 判据全部是同步的（这一轮起没起、日志路径是哪份），
+            //     与工作线程的进度无关（那部分由 Core 的用例负责）。
+            GuiProbe.WithForm(delegate(object f) {
+                string[] before = (string[])GuiProbe.Call(f, "SessionLogPaths", null);
+                AssertEq(before.Length, 0);
+
+                GuiProbe.Call(f, "EnqueueRetry", new object[] { MissingSourcePath("日志甲.zip"), "重试" });
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(f, "SessionRunCount")), 1);
+                string[] first = (string[])GuiProbe.Call(f, "SessionLogPaths", null);
+                AssertEq(first.Length, 1);
+                AssertTrue(File.Exists(first[0]));
+
+                // 让第一轮收尾（产品的 FinishRun），这样第二轮才有机会真的起起来。
+                FinishRunningRound(f);
+
+                // 第二轮紧接着开始（同一秒内）—— 这正是 Minor 8 那个「同名截断上一份」的场景。
+                GuiProbe.Call(f, "EnqueueRetry", new object[] { MissingSourcePath("日志乙.zip"), "重试" });
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(f, "SessionRunCount")), 2);
+
+                string[] after = (string[])GuiProbe.Call(f, "SessionLogPaths", null);
+                AssertEq(after.Length, 2);                    // 上一轮的日志路径没有被丢掉
+                AssertEq(after[0], first[0]);
+                AssertTrue(after[0] != after[1]);             // 两份必须是不同的文件
+                AssertTrue(File.Exists(after[0]));
+                AssertTrue(File.Exists(after[1]));
+
+                // 提示标签里能看见逐轮路径（「日志还在，但界面上找不到」等于没有日志）。
+                string hint = GuiProbe.TextOf(GuiProbe.Find(f, "lblLogHint"));
+                AssertTrue(hint.IndexOf(after[0], StringComparison.Ordinal) >= 0);
+                AssertTrue(hint.IndexOf(after[1], StringComparison.Ordinal) >= 0);
+
+                // 第一份仍然有内容（同名截断的旧缺陷会让它变空；现在两轮各写各的文件）。
+                AssertTrue(new FileInfo(after[0]).Length > 0);
+            });
+        });
+
+        // 日志文件名唯一化（修复轮 Minor 8）：秒分辨率 + 秒内序号，且**绝不**覆盖盘上已有的那份。
+        H.Run("Gui.LogFileNameIsUniqueWhenTwoRoundsStartInTheSameSecond", delegate {
+            DateTime fixedMoment = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Local);
+            string baseName = (string)GuiProbe.Static("Rerar.MainForm", "BuildLogFileName",
+                new object[] { fixedMoment });
+            // 锚的格式没变（人读那份仍然是 run-<yyyyMMdd_HHmmss>.log）。
+            AssertEq(baseName, "run-20261002_120000.log");
+
+            string dir = Path.Combine(TestEnv.Tmp, "logs");
+            Directory.CreateDirectory(dir);
+            string wanted = Path.Combine(dir, baseName);
+
+            // 已经存在同名文件（= 同一秒里的第二轮）⇒ 唯一化必须换名，绝不截断上一份。
+            File.WriteAllText(wanted, "第一轮的日志\r\n", new UTF8Encoding(true));
+            string second = (string)GuiProbe.Static("Rerar.MainForm", "UniqueLogPath",
+                new object[] { wanted, 1 });
+            AssertTrue(second != wanted);
+            AssertTrue(second.IndexOf("run-20261002_120000-1.log", StringComparison.Ordinal) >= 0);
+            AssertEq(Path.GetDirectoryName(second), dir);
+
+            File.WriteAllText(second, "第二轮的日志\r\n", new UTF8Encoding(true));
+            // 第一份**原样还在**（这就是以前被截断掉的那一份）。
+            AssertEq(File.ReadAllText(wanted, Encoding.UTF8).IndexOf("第一轮", StringComparison.Ordinal) >= 0, true);
+            AssertEq(File.ReadAllText(second, Encoding.UTF8).IndexOf("第二轮", StringComparison.Ordinal) >= 0, true);
+
+            // 序号继续往后走（第三轮不会撞上前两份）。
+            string third = (string)GuiProbe.Static("Rerar.MainForm", "UniqueLogPath",
+                new object[] { wanted, 2 });
+            AssertTrue(third != wanted && third != second);
+        });
+    }
+
+    private static bool MenuItemEnabled(object menu, int index)
+    {
+        return Convert.ToBoolean(GuiProbe.PropPath(menu, "Items[" + index + "].Enabled"));
     }
 }

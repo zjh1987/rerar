@@ -83,9 +83,21 @@ namespace Rerar
         // J3：30 秒没有任何进度信号就明说「正在处理大文件」，免得与假死无法区分。
         private const int HeartbeatSeconds = 30;
 
+        // 预检摘要（修复轮 Finding 2）自动收起前的秒数。摘要**不是**模态确认框：它在开始按钮上方
+        // 就地出现、不抢焦点、不阻塞运行，几十秒后自动消失（详情面板与日志里都留下同一份文案）。
+        internal const int SummaryVisibleSeconds = 60;
+
+        // 逐项动作的条目数（四个动作：强制 / 输入密码 / 重试 / 打开输出目录）。
+        // 按钮与右键菜单**同序**，SetItemActionsEnabled 按下标同时决定两者的可用性。
+        internal const int ItemActionCount = 4;
+
         // 界面设置的进程级覆盖（与 TestEnv/SettingsPathVariable 同名）：测试靠它把落点挪到临时目录，
         // 于是界面用例构造真的 MainForm 时既不读也不写真实的 %APPDATA%\Rerar。
         private const string SettingsPathVariable = "RERAR_SETTINGS_PATH";
+
+        // 界面运行日志根的进程级覆盖，与 RERAR_JOURNAL_ROOT / RERAR_SETTINGS_PATH 同一机制。
+        // 未设置时生产行为一字不变（仍旧是 %LOCALAPPDATA%\Rerar\logs）。
+        private const string LogRootVariable = "RERAR_LOG_ROOT";
 
         // J11 的空状态文案：一句话说清做什么 + **明确写出原件默认保留**（安全路径要是显而易见的那条）。
         internal const string EmptyStateText =
@@ -129,10 +141,12 @@ namespace Rerar
         private Panel _panelProgress;
         private ProgressBar _progressBar;
         private Label _lblProgress;
+        private Label _lblSummary;
         private Panel _panelStatus;
         private Label _lblStatus;
         private FlowLayoutPanel _panelCounters;
         private Label _lblCounters;
+        private Label _lblSessionCounters;
         private Button _btnDetails;
 
         private Panel _panelPasswordAsk;
@@ -154,6 +168,7 @@ namespace Rerar
         private Button _btnRetry;
         private Button _btnOpenOutput;
         private ContextMenuStrip _itemMenu;
+        private readonly ToolStripMenuItem[] _itemMenuItems = new ToolStripMenuItem[ItemActionCount];
         private LogTailView _logView;
 
         private NotifyIcon _tray;
@@ -208,10 +223,34 @@ namespace Rerar
         private List<ArchiveResult> _results = new List<ArchiveResult>();
         private int _unprocessedCount;
         private List<ArchiveResult> _rows = new List<ArchiveResult>();
+
+        // ---- 会话级（跨轮）累计：修复轮 Finding 3 ----
+        // 「本轮」与「本次会话」是两个不同的口径，界面上必须**两个都说**（只显示一个就是让用户
+        // 把一轮的数字当成整场的数字）。这两个集合刻意分开存放：_session* 只累加**已经收尾**的轮，
+        // 未收尾的那一轮由 _results/_unprocessedCount 现场提供。
+        private readonly List<ArchiveResult> _sessionResults = new List<ArchiveResult>();
+        private readonly List<string> _sessionLogPaths = new List<string>();
+        private int _sessionUnprocessed;
+
+        // 本会话真正起过几轮运行（只增不减）。给用例一个**确定性**的判据：点一次「重试」之后
+        // 这个值必须真的 +1 —— 以前那一下只入队、什么都不跑（修复轮 Finding 1）。
+        private int _sessionRounds;
+
+        // 引擎定位结果的**真实值**（定位到之后由工作线程写入）。没定位到就是空串 ——
+        // 预检摘要据此如实说「将在开始时定位」，绝不把静态占位文案当成定位结果（修复轮 Finding 2）。
+        private string _engineResolvedText = "";
+
+        // 预检摘要自动收起的计时（只在 UI 线程上读写）。
+        private Stopwatch _summaryWatch;
+
         // _results 里已经“过账”到逐项列表的下标（增量追加用，见 RefreshItems）。
         private int _itemsBuilt;
         private bool _logDirty;
         private bool _itemsDirty;
+
+        // 本会话真正起过的运行轮数（只增不减）。给用例一个**确定性**的判据：点一次「重试」之后
+        // 这个值必须真的 +1 —— 以前那一下只入队、什么都不跑（修复轮 Finding 1）。
+        internal int SessionRunCount { get { return _sessionRounds; } }
 
         public MainForm()
         {
@@ -224,6 +263,8 @@ namespace Rerar
             Program.TryApplyJournalRootOverride();
 
             BuildUi();
+            SetLogHint();            // 会话还没有日志：提示与按钮的初始状态由同一处决定
+            RefreshCounterLabels();
             ApplySettings();
             DetectElevation();
         }
@@ -296,19 +337,28 @@ namespace Rerar
                    seconds.ToString("00", CultureInfo.InvariantCulture);
         }
 
-        // 扫描期：Marquee + 「已发现 N 个压缩包」。**没有百分比** —— 扫描期还不知道分母。
+        // 扫描期：Marquee + 「已发现 N 个候选文件」。**没有百分比** —— 扫描期还不知道分母。
+        //
+        // 【口径（修复轮 Minor 2）】这里数的是**候选文件**：目录枚举**不按后缀过滤**（在枚举层筛掉
+        //「不像压缩包」的文件，正好会把伪装后缀的包一起扔掉，那是 §6.3 禁止的静默丢弃），所以
+        //「是不是压缩包」得由 Core 的 Sniffer 逐个判。一个纯文本文件也会被算进 N，随后在结果里
+        // 如实显示为「跳过（无法读取）」。以前这里写「N 个压缩包」，那是**单位与名词不符** ——
+        // 用户看到 N 就该知道它是什么东西的个数。
         internal static string FormatScanningText(int discovered)
         {
-            return "正在扫描…已发现 " + discovered.ToString(CultureInfo.InvariantCulture) + " 个压缩包";
+            return "正在扫描…已发现 " + discovered.ToString(CultureInfo.InvariantCulture) + " 个候选文件";
         }
 
         // 解压期：分母是**已发现的工作量**，只报已用时间。永不报百分比（J1：分母会增长，
         // 百分比会倒退 —— 用户会以为崩了然后强杀进程）。
+        //
+        // 【口径（修复轮 Minor 2）】与 FormatScanningText 同一个数：交给 Core 逐个判定的**候选文件**
+        // 项数，不是「压缩包」个数（枚举层不按后缀过滤，见那里的说明）。所以单位一律写「项」。
         internal static string FormatProgressText(int index, int discovered, TimeSpan elapsed)
         {
             int denominator = discovered > index ? discovered : index;
             return "第 " + index.ToString(CultureInfo.InvariantCulture) +
-                   " / 已发现 " + denominator.ToString(CultureInfo.InvariantCulture) + " 个包" +
+                   " / 已发现 " + denominator.ToString(CultureInfo.InvariantCulture) + " 项" +
                    " · 已用 " + FormatElapsed(elapsed);
         }
 
@@ -368,15 +418,115 @@ namespace Rerar
             return "✅ 已解出 " + files.ToString(CultureInfo.InvariantCulture) + " 个文件";
         }
 
+        // 口径标签（修复轮 Finding 3）：数字**必须**带着它自己的范围一起出现。
+        // 只写「❌ 0 个失败」而不说这是哪一轮的，读者就会把它当成整场的结论 —— 而重试轮的数字
+        // 只描述重试轮。两个口径分别是「本轮」（当前这一轮）与「本次会话」（含之前所有轮）。
+        internal const string ScopeRoundLabel = "本轮";
+        internal const string ScopeSessionLabel = "本次会话";
+
+        // 带口径的计数行：计数器本身仍然只有 FormatCountersLine 一份实现（不复制判定）。
+        internal static string FormatScopedCountersLine(string scope, List<ArchiveResult> results, int unprocessed)
+        {
+            return "【" + scope + "】" + FormatCountersLine(results, unprocessed);
+        }
+
+        // 本次会话的总计数 = 已收尾各轮 + 当前轮（当前轮由调用方现场传入）。
+        // 精确按路径取最后一条：同一个包在重试轮里被重新处理过，**只算最后一次**的结局 ——
+        // 直接相加会把同一件事数两遍（与 §16「NotAttempted 绝不与 Results 相加」同一条纪律）。
+        internal static string FormatSessionCountersLine(List<ArchiveResult> closedRounds,
+                                                        List<ArchiveResult> currentRound,
+                                                        int closedUnprocessed, int currentUnprocessed)
+        {
+            Dictionary<string, ArchiveResult> lastByPath = new Dictionary<string, ArchiveResult>(StringComparer.OrdinalIgnoreCase);
+            List<ArchiveResult> unknownPath = new List<ArchiveResult>();
+
+            AddLastByPath(lastByPath, unknownPath, closedRounds);
+            AddLastByPath(lastByPath, unknownPath, currentRound);
+
+            List<ArchiveResult> merged = new List<ArchiveResult>();
+            foreach (KeyValuePair<string, ArchiveResult> pair in lastByPath) { merged.Add(pair.Value); }
+            merged.AddRange(unknownPath);
+
+            int unprocessed = closedUnprocessed + currentUnprocessed;
+            return FormatScopedCountersLine(ScopeSessionLabel, merged, unprocessed);
+        }
+
+        // path 为空的结果没有可去重的身份：原样保留（绝不为了去重把一条真实结局丢掉）。
+        private static void AddLastByPath(Dictionary<string, ArchiveResult> map, List<ArchiveResult> unknownPath,
+                                          List<ArchiveResult> results)
+        {
+            if (results == null) { return; }
+            foreach (ArchiveResult r in results)
+            {
+                if (r == null) { continue; }
+                if (string.IsNullOrEmpty(r.Path)) { unknownPath.Add(r); continue; }
+                map[r.Path] = r;
+            }
+        }
+
+        // ==================================================================
+        // 预检摘要（修复轮 Finding 2）：**每次**开始解压都要有，删除关着也要有。
+        //
+        // 【为什么必须是纯函数】摘要的四项内容（目标项数 / 删除后果 / 输出去向 / 引擎定位结果）
+        // 正是「用户按下开始之后才知道自己要同意什么」的那四件事。做成静态纯函数，用例就能直接
+        // 断言**真的那一段文案**，而不是断言「某个控件存在」这种什么都证明不了的形状。
+        //
+        // 【绝不显示假值】引擎还没定位时如实说「将在开始时定位」，绝不把静态占位文案（那是
+        //「优先用本机 7-Zip ≥ 25.00…」的说明）当成定位结果印出来。
+        // ==================================================================
+
+        // 引擎状态那一行：resolvedText 非空 = 真的定位到了（工作线程写回来的原话）。
+        internal static string FormatEngineSummaryLine(string resolvedText)
+        {
+            if (string.IsNullOrEmpty(resolvedText)) { return "引擎：将在开始时定位"; }
+            return "引擎：" + resolvedText;
+        }
+
+        // 输出去向（规格 §6.11 的**原地**语义）：每个归档解到它自己所在的目录，输出根没有全局开关。
+        internal static string FormatOutputSummaryLine()
+        {
+            return "输出去向：每个包原地解到它所在的文件夹（第 N 层解出的包放进第 N 层的输出目录之内；" +
+                   "目标同名时改用「名字 (2)」，绝不覆盖）";
+        }
+
+        // 删除后果：关着就明确写「原包一律保留」（这也是空状态的承诺，开始前再确认一次）。
+        // 开着时写出**确切数量**与处置范围 —— 与二次确认框同一个口径（§6.1/A5）。
+        internal static string FormatDeleteSummaryLine(bool deleteEnabled, int count)
+        {
+            string number = count.ToString(CultureInfo.InvariantCulture);
+            if (!deleteEnabled)
+            {
+                return "原件处置：解压成功后删除原包「未」开启 —— 这 " + number + " 项的原包一律保留，一个都不动";
+            }
+            return "原件处置：已开启「解压成功后删除原包」—— 这 " + number +
+                   " 项里，只有解压成功且校验通过的那一项会被移入回收站，" +
+                   "失败、跳过、需要密码、未处理的一律保留";
+        }
+
+        // 整段摘要（多行）。第一行是「要处理几项」，随后是处置、去向、引擎。
+        // 【面向用户的中文】用户可见文案里绝不出现 Core 这类内部术语：这里说「程序」。
+        internal static string BuildSummaryText(int count, bool deleteEnabled, string engineResolvedText)
+        {
+            return "开始前摘要：本次将处理 " + count.ToString(CultureInfo.InvariantCulture) + " 项（候选文件，" +
+                   "由程序逐个判定是不是压缩包）。\r\n" +
+                   FormatDeleteSummaryLine(deleteEnabled, count) + "。\r\n" +
+                   FormatOutputSummaryLine() + "。\r\n" +
+                   FormatEngineSummaryLine(engineResolvedText) + "。";
+        }
+
         // A5：二次确认的措辞。必须写出**确切数量**、说清去向，并说清什么**不会**发生 ——
         // 用户按下确定之前要知道自己同意了什么。
+        //
+        // 【口径（修复轮 Minor 3）】单位是**项**（交给 Core 逐个判定的候选文件），不是「压缩包」：
+        // 枚举层不按后缀过滤，这一批里可能有根本不是压缩包的文件（它们会如实显示为「跳过」）。
+        // 说成「N 个压缩包」就是在替 Core 提前下判定。
         internal static string DeleteConfirmText(int count)
         {
-            return "即将解压 " + count.ToString(CultureInfo.InvariantCulture) + " 个压缩包，" +
+            string number = count.ToString(CultureInfo.InvariantCulture);
+            return "即将处理 " + number + " 项（候选文件，由程序逐个判定是不是压缩包），" +
                    "并勾选了「解压成功后删除原包」：\r\n\r\n" +
-                   "· 解压成功且校验通过的那 " + count.ToString(CultureInfo.InvariantCulture) +
-                   " 个原包会被移入回收站；\r\n" +
-                   "· 失败、跳过、需要密码、未处理的包一律保留，绝不会被删除；\r\n" +
+                   "· 解压成功且校验通过的那一项，其原包会被移入回收站；\r\n" +
+                   "· 失败、跳过、需要密码、未处理的项一律保留，绝不会被删除；\r\n" +
                    "· 回收站不可用或超出配额时，程序会如实报告实际处置方式。\r\n\r\n" +
                    "确定要带着删除开关开始吗？";
         }
@@ -591,6 +741,13 @@ namespace Rerar
                 "把分卷集交给 7-Zip 按权威成员打开；缺卷会报出具体缺哪一个");
             _chkDict = MakeOption("chkDict", "尝试密码字典", true,
                 "先试手动密码，再试内置常用字典与导入的字典，最后看同目录的密码线索");
+            // 修复轮 Minor 1：这三个开关在 v1.0 里是 Core 的**固定行为**，界面没有对应的 RunOptions
+            // 开关（BuildOptions 不读它们）。以前它们是可点的复选框、而取消勾选什么都不改变 ——
+            // 一个点了没反应的控件就是在骗人。控制方裁定：**不加 Core 开关**，把界面改诚实 ——
+            // 置灰 + 提示语写明「v1.0 固定行为，不可关闭」，同时保留给用户看见（说明工具做了什么）。
+            MakeFixedOption(_chkCamouflage);
+            MakeFixedOption(_chkVolumes);
+            MakeFixedOption(_chkDict);
             safeRow.Controls.Add(_chkCamouflage);
             safeRow.Controls.Add(_chkVolumes);
             safeRow.Controls.Add(_chkDict);
@@ -773,6 +930,21 @@ namespace Rerar
             _progressBar.Style = ProgressBarStyle.Continuous;
             _progressBar.AccessibleName = "进度";
 
+            // 预检摘要（修复轮 Finding 2）：**每次**开始解压都在这里就地写出「要做什么」的摘要 ——
+            // 目标项数、删除开关的后果、输出去向（规格 §6.11 的原地语义）、引擎定位结果。
+            // 它不是模态框：不抢焦点、不阻塞运行、不挡按钮（J7/J14 的同一原则）；几十秒后自动收起，
+            // 同一份文案另有一份进了日志文件（复盘时看得见）。**绝不**显示还没定位的引擎占位值。
+            _lblSummary = new Label();
+            _lblSummary.Name = "lblSummary";
+            _lblSummary.AutoSize = true;
+            _lblSummary.MaximumSize = new Size(880, 0);
+            _lblSummary.BackColor = Color.FromArgb(240, 247, 255);
+            _lblSummary.ForeColor = Color.FromArgb(20, 60, 110);
+            _lblSummary.Padding = new Padding(8, 6, 8, 6);
+            _lblSummary.Margin = new Padding(0, 0, 0, 6);
+            _lblSummary.Visible = false;
+            _lblSummary.AccessibleName = "本次运行的预检摘要";
+
             _lblProgress = new Label();
             _lblProgress.Name = "lblProgress";
             _lblProgress.AutoSize = true;
@@ -780,6 +952,8 @@ namespace Rerar
             _lblProgress.Padding = new Padding(0, 2, 0, 2);
             _lblProgress.Text = "空闲。加入压缩包或文件夹后点「开始解压」。";
 
+            // 停靠顺序即层序：先加的在最外侧（Top），所以摘要会出现在进度条**上方**。
+            _panelProgress.Controls.Add(_lblSummary);
             _panelProgress.Controls.Add(_lblProgress);
             _panelProgress.Controls.Add(_progressBar);
             _root.Controls.Add(_panelProgress, 0, 4);
@@ -803,6 +977,15 @@ namespace Rerar
             _lblCounters.Margin = new Padding(0, 4, 12, 0);
             _lblCounters.Text = "";
 
+            // 会话口径（修复轮 Finding 3）：重试轮结束时「本轮」是 0 失败，但整场可能已经攒了 30 个
+            // 失败 —— 只显示一个口径就会把用户骗过去。两个口径**并排常显**，各自带标签。
+            _lblSessionCounters = new Label();
+            _lblSessionCounters.Name = "lblSessionCounters";
+            _lblSessionCounters.AutoSize = true;
+            _lblSessionCounters.ForeColor = Color.FromArgb(70, 70, 70);
+            _lblSessionCounters.Margin = new Padding(0, 4, 12, 0);
+            _lblSessionCounters.Text = "";
+
             _btnDetails = new Button();
             _btnDetails.Name = "btnDetails";
             _btnDetails.Text = "查看详情 ▸";
@@ -812,6 +995,7 @@ namespace Rerar
             _btnDetails.Click += BtnDetails_Click;
 
             _panelCounters.Controls.Add(_lblCounters);
+            _panelCounters.Controls.Add(_lblSessionCounters);
             _panelCounters.Controls.Add(_btnDetails);
 
             _lblStatus = new Label();
@@ -954,13 +1138,23 @@ namespace Rerar
             _lstItems.Columns.Add("文件/失败", 90);
             _lstItems.Columns.Add("说明", 420);
             _lstItems.SelectedIndexChanged += LstItems_SelectedIndexChanged;
-            _lstItems.DoubleClick += BtnOpenOutput_Click;
+            // 修复轮 Minor 12：双击**不再**绑到「打开输出目录」。以前双击列表里任意一行（包括
+            // 还没产出任何东西的失败行）都会去开输出目录，而且选中行的语义与双击目标无关 ——
+            // 一个「打开文件夹」的动作必须有明确的按钮/菜单项，不能挂在双击上。
+            // 打开输出目录由按钮 _btnOpenOutput 与菜单项「打开输出目录」承担（都对选中行生效）。
 
+            // 右键菜单的四个项与四个按钮**逐一同序**地存进数组，于是可用性由 SetItemActionsEnabled
+            // 一处决定（修复轮 Finding 1：以前菜单项从不被禁用，两个界面入口会互相矛盾）。
             _itemMenu = new ContextMenuStrip();
-            _itemMenu.Items.Add("强制按压缩包尝试", null, BtnForceArchive_Click);
-            _itemMenu.Items.Add("输入密码…", null, BtnEnterPassword_Click);
-            _itemMenu.Items.Add("重试", null, BtnRetry_Click);
-            _itemMenu.Items.Add("打开输出目录", null, BtnOpenOutput_Click);
+            _itemMenuItems[0] = new ToolStripMenuItem("强制按压缩包尝试", null, BtnForceArchive_Click);
+            _itemMenuItems[1] = new ToolStripMenuItem("输入密码…", null, BtnEnterPassword_Click);
+            _itemMenuItems[2] = new ToolStripMenuItem("重试", null, BtnRetry_Click);
+            _itemMenuItems[3] = new ToolStripMenuItem("打开输出目录", null, BtnOpenOutput_Click);
+            for (int i = 0; i < _itemMenuItems.Length; i++)
+            {
+                _itemMenuItems[i].Enabled = false;      // 与按钮同样的初值：没有选中项就不可用
+                _itemMenu.Items.Add(_itemMenuItems[i]);
+            }
             _lstItems.ContextMenuStrip = _itemMenu;
 
             _panelItemActions = new FlowLayoutPanel();
@@ -1035,6 +1229,26 @@ namespace Rerar
 
         // 一个共享的 ToolTip（每个控件都 new 一个会在窗体销毁时留下没人释放的组件）。
         private readonly ToolTip _tooltip = new ToolTip();
+
+        // 修复轮 Minor 1：把「v1.0 固定行为、不可关闭」这件事同时写进**控件状态**（置灰）与
+        // **提示语**（ToolTip + AccessibleName）。置灰是必须的那一半：一个可点的复选框被点掉却
+        // 什么都不改变，就是在骗用户。文案与判定都收在这两个成员里，用例直接断言它们。
+        internal const string FixedOptionNote = "（v1.0 固定行为，不可关闭）";
+
+        internal static string FixedOptionTooltip(string behavior)
+        {
+            return behavior + FixedOptionNote;
+        }
+
+        private void MakeFixedOption(CheckBox box)
+        {
+            string behavior = box.AccessibleName == null ? box.Text : box.AccessibleName;
+            if (behavior == null) { behavior = ""; }
+
+            box.Enabled = false;
+            box.AccessibleName = FixedOptionTooltip(behavior);
+            _tooltip.SetToolTip(box, FixedOptionTooltip(behavior));
+        }
 
         private Button MakeItemAction(string name, string text, EventHandler handler)
         {
@@ -1291,8 +1505,10 @@ namespace Rerar
             int folders = 0;
             foreach (KeyValuePair<string, int> pair in _inputRowOf) { folders++; }
 
-            string text = "待处理：" + _inputs.Count + " 个文件（来自 " + folders + " 个文件夹）";
-            if (_scanRemaining > 0) { text += " · 正在统计：" + _scanFound + " 个"; }
+            // 单位是**项**（候选文件），不是「压缩包」：枚举层不按后缀过滤，「是不是压缩包」由 Core
+            // 逐个判（修复轮 Minor 2）。文件夹数照旧写出来 —— 它是用户指过的范围，不是判定结果。
+            string text = "待处理：" + _inputs.Count + " 项（候选文件，来自 " + folders + " 个文件夹）";
+            if (_scanRemaining > 0) { text += " · 正在统计：" + _scanFound + " 个文件"; }
             if (_nextBatchOnly) { text += " · 新加入的项进入「下一批」"; }
             _lblInputs.Text = text;
 
@@ -1472,9 +1688,10 @@ namespace Rerar
         private RunOptions BuildOptions()
         {
             RunOptions options = new RunOptions();
-            // 输入处理开关：这三个复选框在 v1.0 里都是 Core 的**固定行为**的一层显式确认
-            //（Core 没有「关掉伪装后缀识别」的开关，也不该有）。所以它们只用于预检摘要里向用户
-            // 说明「这次会怎么处理」；真正的杠杆只有删除、密码、字典、层数与逐项强制。
+            // 【本方法**只**读真正的杠杆】修复轮 Minor 1：三个安全复选框在 v1.0 里是 Core 的**固定
+            // 行为**（Core 没有「关掉伪装后缀识别」的开关，也不该有），所以它们不再可点、也不再被
+            // 这里读取 —— 界面把这件事如实说出来（置灰 + 提示语），而不是假装它们能改变什么。
+            // 真正的杠杆只有：删除、密码、字典、层数与逐项强制。
             options.DeleteOriginals = _chkDelete.Checked;       // I3：默认关，只有勾上才是 true
             options.MaxDepth = (int)_numDepth.Value;
             options.Password = _txtPassword.Text.Length > 0 ? _txtPassword.Text : null;
@@ -1495,10 +1712,20 @@ namespace Rerar
             return options;
         }
 
-        // 起一次运行。paths 是这一批要处理的文件；retryLabel 用于文案（首次 / 重试）。
+        // 起一次运行。paths 是这一批要处理的文件。
         private void StartRun(List<string> paths, RunOptions options, int discovered)
         {
             if (_running || paths == null || paths.Count == 0) { return; }
+
+            // 会话累计（修复轮 Finding 3）：跨轮累加的真实计数与「本轮」分开存放。
+            // 只加**已经收尾的那几轮**（未结束的那一轮由 _counters/_results 现场提供），于是
+            //「本次会话」= _session* + 当前轮，绝不会把同一件事数两遍。
+            if (_sessionRounds > 0)
+            {
+                _sessionResults.AddRange(_results);
+                _sessionUnprocessed += _unprocessedCount;
+            }
+            _sessionRounds++;
 
             _runCts = new CancellationTokenSource();
             options.Cancellation = _runCts.Token;
@@ -1507,6 +1734,7 @@ namespace Rerar
             _counters.Started = 0;
             _counters.Finished = 0;
             _currentMember = "";
+            _engineResolvedText = "";
             _discoveredAtStart = discovered;
             _lastSignalTicks = DateTime.Now.Ticks;
             _cancelRequestedAt = DateTime.MinValue;
@@ -1515,16 +1743,36 @@ namespace Rerar
             _results = new List<ArchiveResult>();
             _unprocessedCount = 0;
 
-            _log = new LogSink(BuildLogPath());
+            string[] carryOverTail = null;
+
+            // 修复轮 Finding 3：先**释放被丢下的日志接收器** —— 以前这里直接覆盖 _log 字段，
+            // 上一轮的文件句柄一直锁到进程退出（Dispose 只收得到最后一个）。
+            // 顺带把上一轮的**界面尾部**带进新的接收器：日志在界面上是连续的，而每轮的日志文件仍然
+            // 只含自己那一轮的内容（carryOver 只进内存尾部，绝不写文件 —— 逐轮不互相污染）。
+            if (_log != null)
+            {
+                try
+                {
+                    carryOverTail = _log.Snapshot();
+                    _log.Flush();
+                    _log.Dispose();
+                }
+                catch (Exception) { }
+                _log = null;
+            }
+
+            string logPath = BuildLogPath(delegate(string wanted) { return BuildUniqueLogPath(wanted); });
+            _log = new LogSink(logPath, carryOverTail);
+            _sessionLogPaths.Add(logPath);
             if (!string.IsNullOrEmpty(options.Password)) { _log.RegisterSecret(options.Password); }
             if (!string.IsNullOrEmpty(_runWidePassword)) { _log.RegisterSecret(_runWidePassword); }
             foreach (KeyValuePair<string, string> pair in _perItemPassword) { _log.RegisterSecret(pair.Value); }
-            _btnOpenLog.Enabled = true;
             if (!_log.FileOk) { Warn(_log.FileProblem); }     // 写不了文件要**看得见**（绝不静默）
-            _lblLogHint.Text = "运行日志（只显示最后 " + LogTailLines + " 行；完整日志：" + _log.FilePath + "）";
+            SetLogHint();
 
             AppendLog("==== 本次运行开始：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
-                      "，目标 " + paths.Count + " 项 ====");
+                      "，目标 " + paths.Count + " 项，本次会话第 " + _sessionRounds + " 轮（日志：" +
+                      _log.FilePath + "）====");
             if (options.DeleteOriginals) { AppendLog("注意：已开启「解压成功后删除原包」（只处置解压成功且校验通过的原包）。"); }
 
             // J4：清空上一批的尾部（日志文件是新的一份）。
@@ -1541,7 +1789,8 @@ namespace Rerar
 
             // 新一批：逐项列表清空，**增量追加的游标也必须归零**（见 RefreshItems）——
             // 不归零的话，新批的前几条会被当成「已经过账」而漏掉，或者与上一批的行混在一起。
-            // 代价说清楚：重试轮的列表只显示这一轮的结果，整场的完整记录在日志文件里。
+            // 逐项列表仍然只显示**这一轮**（口径写在列表上方的计数行里：本轮 / 本次会话两个口径都在），
+            // 每一轮的完整记录由「打开日志文件」的会话清单逐轮可达。
             _lstItems.Items.Clear();
             _rows = new List<ArchiveResult>();
             _itemsBuilt = 0;
@@ -1549,8 +1798,11 @@ namespace Rerar
 
             _progressBar.Style = ProgressBarStyle.Continuous;
             _progressBar.Value = 0;
-            _lblCounters.Text = FormatCountersLine(_results, 0);
+            RefreshCounterLabels();
             _uiTimer.Start();
+
+            // 修复轮 Finding 2：**每次**开始都写出预检摘要（删除关着也要写）。
+            ShowPreflightSummary(paths.Count, options);
 
             SetKeepAwake(true);
 
@@ -1560,23 +1812,43 @@ namespace Rerar
             worker.Start();
         }
 
-        private string BuildLogPath()
+        private string BuildLogPath(Func<string, string> uniquify)
         {
             string root;
             try
             {
-                root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    Path.Combine("Rerar", "logs"));
+                // 生产默认根：%LOCALAPPDATA%\Rerar\logs。进程级覆盖 RERAR_LOG_ROOT 与
+                // RERAR_JOURNAL_ROOT / RERAR_SETTINGS_PATH 同一机制：**测试与人工验证绝不能**
+                // 往用户真实的应用数据目录里写日志（本轮修复把这个洞补上了）。
+                string overridden = Environment.GetEnvironmentVariable(LogRootVariable);
+                if (!string.IsNullOrEmpty(overridden))
+                {
+                    root = overridden;
+                }
+                else
+                {
+                    root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        Path.Combine("Rerar", "logs"));
+                }
             }
             catch (Exception)
             {
                 root = Path.GetTempPath();
             }
 
-            string name = "run-" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".log";
-            string candidate = Path.Combine(root, name);
-
             // 目录建不出来（权限/漫游配置）就退回临时目录：日志是辅助，绝不能因此跑不起来。
+            try
+            {
+                if (!Directory.Exists(root)) { Directory.CreateDirectory(root); }
+            }
+            catch (Exception)
+            {
+                root = Path.GetTempPath();
+            }
+
+            string candidate = Path.Combine(root, BuildLogFileName(DateTime.Now));
+            if (uniquify != null) { candidate = uniquify(candidate); }
+
             try
             {
                 string dir = Path.GetDirectoryName(candidate);
@@ -1585,8 +1857,154 @@ namespace Rerar
             }
             catch (Exception)
             {
-                return Path.Combine(Path.GetTempPath(), name);
+                return Path.Combine(Path.GetTempPath(), Path.GetFileName(candidate));
             }
+        }
+
+        // 日志文件名的**唯一性**（修复轮 Minor 8）：以前只用「秒」分辨率，于是同一秒内开始的第二轮
+        // 会算出与第一轮**同名**的文件，而 LogSink 用 `new StreamWriter(path, false)` 打开 ——
+        // 那一轮会把上一轮的整份日志**截断**（Findings 3 的日志丢失就是这么发生的）。
+        // 基准名保持「秒」不变（人读方便），后缀只在**同一秒内被用过**时才追加。
+        internal static string BuildLogFileName(DateTime now)
+        {
+            return "run-" + now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".log";
+        }
+
+        // 纯函数版唯一化：base 是不冲突时的首选名；"run-<戳>-1.log"、"…-2.log" 依次备选。
+        internal static string UniqueLogPath(string wanted, int ordinal)
+        {
+            if (ordinal <= 0 || string.IsNullOrEmpty(wanted)) { return wanted; }
+
+            string dir = Path.GetDirectoryName(wanted);
+            string name = Path.GetFileNameWithoutExtension(wanted);
+            string extension = Path.GetExtension(wanted);
+            string unique = name + "-" + ordinal.ToString(CultureInfo.InvariantCulture) + extension;
+            return string.IsNullOrEmpty(dir) ? unique : Path.Combine(dir, unique);
+        }
+
+        // 生产用唯一化：候选名被**本会话**用过或盘上已经存在（上一轮同名被截断的那一份）时换名。
+        private string BuildUniqueLogPath(string wanted)
+        {
+            string candidate = wanted;
+            int ordinal = 1;
+            while (_sessionLogPaths.Contains(candidate) || File.Exists(candidate))
+            {
+                candidate = UniqueLogPath(wanted, ordinal);
+                ordinal++;
+            }
+            return candidate;
+        }
+
+        // ==================================================================
+        // 计数行的三个口径（修复轮 Finding 3）
+        //   * 「本轮」 = 当前这一轮的结局；
+        //   * 「本次会话」 = 已收尾的各轮 + 当前轮，按路径取**最后一条**（重试过的包不数两遍）。
+        // 两个标签**并排常显**，谁也不冒充谁。
+        // ==================================================================
+
+        private void RefreshCounterLabels()
+        {
+            _lblCounters.Text = FormatScopedCountersLine(ScopeRoundLabel, _results, _unprocessedCount);
+            _lblSessionCounters.Text = FormatSessionCountersLine(_sessionResults, _results,
+                _sessionUnprocessed, _unprocessedCount);
+        }
+
+        // 会话口径的「已解出 N 个文件」：带口径标签，于是它不可能被读成「本轮」的数字
+        //（修复轮 Finding 3 要求的正是这件事）。计数行里另有完整的两个口径。
+        internal static string FormatScopedExtractedLine(string scope, List<ArchiveResult> results)
+        {
+            return "【" + scope + "】" + FormatExtractedLine(results);
+        }
+
+        // 运行日志提示（修复轮 Finding 3）：会话**每一轮**的日志都在清单里，绝不只留最后一条 ——
+        // 以前这里只保留一个路径，重试轮一开始，上一轮的日志就从界面上消失了（那就等于没有日志）。
+        private void SetLogHint()
+        {
+            // 逐轮列出（最多最近 LogHintMaxPaths 条，更早的用一行汇总）：**每一轮的日志都必须可达**，
+            // 而且用户得能看见它在哪儿（修复轮 Finding 3）。列表长度有上界，免得几十轮之后把
+            // 详情面板挤满。
+            const int LogHintMaxPaths = 6;
+            int first = _sessionLogPaths.Count - LogHintMaxPaths;
+            if (first < 0) { first = 0; }
+
+            string paths = "";
+            if (first > 0)
+            {
+                paths = "更早的 " + first.ToString(CultureInfo.InvariantCulture) +
+                    " 份日志仍在「打开日志文件」的清单里（下面只列最近 " + LogHintMaxPaths + " 份路径）：";
+            }
+            for (int i = first; i < _sessionLogPaths.Count; i++)
+            {
+                if (paths.Length > 0) { paths += "\r\n"; }
+                paths += "第 " + (i + 1).ToString(CultureInfo.InvariantCulture) + " 轮：" + _sessionLogPaths[i];
+            }
+
+            string heading = _sessionLogPaths.Count == 0
+                ? "运行日志（界面只显示最后 " + LogTailLines + " 行；还没有日志文件）"
+                : "运行日志（界面只显示最后 " + LogTailLines + " 行；本次会话共 " +
+                  _sessionLogPaths.Count.ToString(CultureInfo.InvariantCulture) +
+                  " 份日志，下面列出最近几轮的文件路径）";
+            _lblLogHint.Text = paths.Length == 0 ? heading : heading + "\r\n" + paths;
+
+            _btnOpenLog.Enabled = _sessionLogPaths.Count > 0;
+            _btnOpenLog.AccessibleName = "打开完整日志文件（本次会话共 " + _sessionLogPaths.Count + " 份）";
+        }
+
+        // 打开**某一轮**的日志文件。会话清单里就是逐轮的路径（最早 → 最新）；不给序号时开最近一轮。
+        // 这是「本次会话的每一份日志都还在界面上可达」这条要求的落地动作（修复轮 Finding 3）。
+        private void OpenSessionLog(int index)
+        {
+            if (_sessionLogPaths.Count == 0) { Warn("本次会话还没有日志文件。"); return; }
+            if (index < 0 || index >= _sessionLogPaths.Count) { index = _sessionLogPaths.Count - 1; }
+
+            string path = _sessionLogPaths[index];
+            try
+            {
+                if (File.Exists(path)) { Process.Start(path); }
+                else { Warn("日志文件已经不存在了（可能被清理或移走）：" + path); }
+            }
+            catch (Exception ex)
+            {
+                Warn("无法打开日志文件（" + ex.GetType().Name + "：" + ex.Message + "）：" + path);
+            }
+        }
+
+        // 会话日志清单（最早 → 最新）。只读快照：调用方绝不拿到可变的内部列表。
+        internal string[] SessionLogPaths()
+        {
+            return _sessionLogPaths.ToArray();
+        }
+
+        // ==================================================================
+        // 预检摘要的显示/收起（修复轮 Finding 2）。**非模态**：不抢焦点、不阻塞、不挡按钮。
+        // ==================================================================
+
+        private void ShowPreflightSummary(int count, RunOptions options)
+        {
+            string text = BuildSummaryText(count, options != null && options.DeleteOriginals, _engineResolvedText);
+            _lblSummary.Text = text;
+            _lblSummary.Visible = true;
+            _summaryWatch = Stopwatch.StartNew();
+
+            // 同一份文案另有一份进日志文件：摘要是「本次运行是怎么被配置的」这件事的唯一记录，
+            // 复盘（三小时后）时界面上的摘要早就不在了。
+            AppendLog(text.Replace("\r\n", " "));
+        }
+
+        private void HidePreflightSummary()
+        {
+            _lblSummary.Visible = false;
+            _summaryWatch = null;
+        }
+
+        // 由 UI 心跳调用：摘要显示满 SummaryVisibleSeconds 秒后自动收起（它已经完成了「按开始之前
+        // 让你看清这一步」的职责；常驻只会让界面在长跑之后越来越挤）。
+        private void TickPreflightSummary()
+        {
+            if (_summaryWatch == null || !_lblSummary.Visible) { return; }
+            if (_summaryWatch.Elapsed.TotalSeconds < SummaryVisibleSeconds) { return; }
+            HidePreflightSummary();
+            _lblSummary.Text = "";
         }
 
         // 工作线程：定位引擎 → 跑 Extractor → 补未处理剩余项 → 把摘要编组回 UI。
@@ -1602,6 +2020,9 @@ namespace Rerar
                 string engineText = "解压引擎：7-Zip " + EngineLocator.FormatVersion(engine.Version) +
                     (engine.IsEmbedded ? "（内置便携版，已释放到本机）" : "（本机安装）") + "：" + engine.Path;
                 options.SevenZipPath = engine.Path;
+                // 定位结果也写进字段：预检摘要里那一行从此有**真值**可用（没定位到就是空串，
+                // 摘要如实说「将在开始时定位」—— 修复轮 Finding 2）。
+                _engineResolvedText = engineText;
                 UiPost(delegate { _lblEngineInfo.Text = engineText; });
                 AppendLog(engineText);
 
@@ -1782,6 +2203,7 @@ namespace Rerar
                 }
 
                 if (_running) { UpdateRunningLabels(); }
+                TickPreflightSummary();
             }
             catch (Exception ex)
             {
@@ -1851,7 +2273,7 @@ namespace Rerar
                 _lblStatus.Text = "状态：" + FormatExtractedLine(_results) + " · ⏳ 正在解压 " + _currentMember;
             }
 
-            _lblCounters.Text = FormatCountersLine(_results, _unprocessedCount);
+            RefreshCounterLabels();
         }
 
         // ==================================================================
@@ -1870,6 +2292,7 @@ namespace Rerar
             _unprocessedCount = summary.NotAttempted == null ? 0 : summary.NotAttempted.Count;
 
             SetKeepAwake(false);
+            HidePreflightSummary();
             AppendLog("==== 本次运行结束，已用 " + FormatElapsed(_lastElapsed) + " ====");
             if (!string.IsNullOrEmpty(summary.FatalReason)) { AppendLog("致命错误（整批中止）：" + summary.FatalReason); }
             if (summary.Cancelled) { AppendLog("本次运行已被取消：未完成的项已如实列出，原包一律保留。"); }
@@ -1897,7 +2320,10 @@ namespace Rerar
             _txtPassword.Enabled = true;
             _btnLoadDict.Enabled = true;
             _progressBar.Style = ProgressBarStyle.Continuous;
-            _lblCounters.Text = FormatCountersLine(_results, _unprocessedCount);
+            // 两个口径**都**写出来（修复轮 Finding 3）：只写「本轮」的话，一轮重试跑完就会显示
+            //「❌ 0 个失败」，而整场可能已经攒了几十个失败 —— 那正是被复核者点名的那个谎。
+            RefreshCounterLabels();
+            // 状态行只报**本轮**（口径标签在计数行里，两个口径并排常显，谁也不冒充谁）。
             _lblStatus.Text = FormatExtractedLine(_results);
             if (!string.IsNullOrEmpty(summary.FatalReason))
             {
@@ -2078,7 +2504,8 @@ namespace Rerar
                         item.SubItems.Add(Reporter.StatusText(r.Status));   // 与报告/导出**同一套**中文结局文案
                         item.SubItems.Add(r.Files + " / " + r.Failed);
                         item.SubItems.Add(Shorten(r.Message, 200));
-                        item.Tag = r;
+                        // 修复轮 Minor 12：不再往 item.Tag 里塞结果对象 —— 选中项经 _rows[下标] 取，
+                        // 那个 Tag 从来没有人读过（多一条无人读的路径就等于多一处会说谎的状态）。
                         _lstItems.Items.Add(item);
                     }
                 }
@@ -2114,31 +2541,40 @@ namespace Rerar
         }
 
         // §6.1 的逐项动作按**结局**启用：只有「还没成功」的项才有可做的事，且成功项没有可强制的余地。
+        // 判定本身在 SetItemActionsEnabled 里（按钮与右键菜单共用的那一份），这里只是「按当前选中行
+        // 重算一次」的语义化入口。
         private void UpdateItemActions()
         {
-            ArchiveResult r = SelectedResult();
-            bool idle = !_running;
-            bool actionable = r != null && r.Status != ArchiveStatus.Completed;
-
-            _btnForceArchive.Enabled = idle && actionable;
-            _btnEnterPassword.Enabled = idle && actionable;
-            _btnRetry.Enabled = idle && actionable;
-            bool hasOutput = r != null && !string.IsNullOrEmpty(r.OutputDir) && Directory.Exists(r.OutputDir);
-            _btnOpenOutput.Enabled = hasOutput || (r != null && !string.IsNullOrEmpty(r.OutputDir));
+            SetItemActionsEnabled(true);
         }
 
+        // 逐项动作的**唯一**启用/禁用收口。按钮与右键菜单都必须走这里 ——
+        // 两个界面入口由同一处判定，于是它们不可能互相矛盾（修复轮 Finding 1 的第二半）。
+        // 索引与 UpdateItemActions 里的按钮逐一同序，取判定结果时按下标取。
         private void SetItemActionsEnabled(bool enabled)
         {
-            if (!enabled)
+            bool[] states = new bool[4];
+            if (enabled)
             {
-                _btnForceArchive.Enabled = false;
-                _btnEnterPassword.Enabled = false;
-                _btnRetry.Enabled = false;
-                _btnOpenOutput.Enabled = false;
+                ArchiveResult r = SelectedResult();
+                bool idle = !_running;
+                bool actionable = r != null && r.Status != ArchiveStatus.Completed;
+                bool hasOutput = r != null && !string.IsNullOrEmpty(r.OutputDir) && Directory.Exists(r.OutputDir);
+
+                states[0] = idle && actionable;      // 强制按压缩包尝试
+                states[1] = idle && actionable;      // 输入密码
+                states[2] = idle && actionable;      // 重试
+                states[3] = hasOutput || (r != null && !string.IsNullOrEmpty(r.OutputDir));   // 打开输出目录
             }
-            else
+
+            _btnForceArchive.Enabled = states[0];
+            _btnEnterPassword.Enabled = states[1];
+            _btnRetry.Enabled = states[2];
+            _btnOpenOutput.Enabled = states[3];
+
+            for (int i = 0; i < _itemMenuItems.Length; i++)
             {
-                UpdateItemActions();
+                if (_itemMenuItems[i] != null) { _itemMenuItems[i].Enabled = states[i]; }
             }
         }
 
@@ -2184,11 +2620,21 @@ namespace Rerar
             }
         }
 
+        // 排进重试队列，并**立刻**在没有批次运行时把它跑起来（TryStartIdleRetry 自己会在运行中
+        // 无操作）。修复轮 Finding 1：以前这里只入队，而唯一的出队点只有密码面板的两个按钮，
+        // 于是「空闲时点重试」正好落在「按钮可用但永远跑不起来」的空档里 —— 状态行还会谎称
+        //「当前批次结束后重试」，可当前根本没有批次。
         private void EnqueueRetry(string path, string what)
         {
             if (!_retryQueue.Contains(path)) { _retryQueue.Add(path); }
-            _lblStatus.Text = "状态：已把「" + Path.GetFileName(path) + "」加入重试队列（" + what +
-                              "）；当前批次结束后重试，删除开关沿用当前设置。";
+
+            // 状态文案由**事实**决定：正在跑才说「本批结束后」，空闲就如实说立刻开始。
+            _lblStatus.Text = _running
+                ? "状态：已把「" + Path.GetFileName(path) + "」加入重试队列（" + what +
+                  "）；当前批次结束后重试，删除开关沿用当前设置。"
+                : "状态：空闲，正在就「" + Path.GetFileName(path) + "」开始重试（" + what + "）。";
+
+            TryStartIdleRetry();
         }
 
         // ==================================================================
@@ -2222,7 +2668,6 @@ namespace Rerar
             _pendingPasswordPath = null;
             AppendLog("用户为「" + path + "」提供了密码（仅此压缩包；密码值不记录）。");
             EnqueueRetry(path, "输入密码（仅此压缩包）");
-            TryStartIdleRetry();
         }
 
         private void BtnPwRememberAll_Click(object sender, EventArgs e)
@@ -2245,7 +2690,6 @@ namespace Rerar
             _pendingPasswordPath = null;
             AppendLog("用户选择「本次运行全部记住」（密码值不记录）：后续归档会把它作为首选候选。");
             if (!string.IsNullOrEmpty(path)) { EnqueueRetry(path, "输入密码（本次运行全部记住）"); }
-            TryStartIdleRetry();
         }
 
         private void BtnPwSkip_Click(object sender, EventArgs e)
@@ -2433,20 +2877,39 @@ namespace Rerar
             _logView.AutoScroll = _chkAutoScroll.Checked;
         }
 
+        // 「打开日志文件」：只有一轮时直接开那一份；多轮时先让用户挑是哪一轮 ——
+        // 会话里每一轮的日志路径都留在清单里，所以「开错了轮」这件事是**可修的**，而不是
+        //「上一轮的日志已经从界面上消失」（修复轮 Finding 3）。
         private void BtnOpenLog_Click(object sender, EventArgs e)
         {
-            LogSink sink = _log;
-            if (sink == null || string.IsNullOrEmpty(sink.FilePath)) { return; }
+            if (_sessionLogPaths.Count == 0) { Warn("本次会话还没有日志文件。"); return; }
 
-            try
+            int index = _sessionLogPaths.Count - 1;
+            if (_sessionLogPaths.Count > 1)
             {
-                if (File.Exists(sink.FilePath)) { Process.Start(sink.FilePath); }
-                else { Warn("日志文件还没有内容或已被移走：" + sink.FilePath); }
+                ContextMenuStrip picker = new ContextMenuStrip();
+                try
+                {
+                    for (int i = 0; i < _sessionLogPaths.Count; i++)
+                    {
+                        int captured = i;
+                        string label = "第 " + (i + 1).ToString(CultureInfo.InvariantCulture) + " 轮（" +
+                            Path.GetFileName(_sessionLogPaths[i]) + "）";
+                        ToolStripMenuItem entry = new ToolStripMenuItem(label, null,
+                            delegate(object s, EventArgs a) { OpenSessionLog(captured); });
+                        picker.Items.Add(entry);
+                    }
+                    picker.Show(_btnOpenLog, new Point(0, _btnOpenLog.Height));
+                }
+                catch (Exception ex)
+                {
+                    Warn("无法列出本次会话的日志（" + ex.GetType().Name + "：" + ex.Message + "）。");
+                }
+                // 菜单由 WinForms 在关闭时自行回收（不进 Dispose 链），这里不额外持有它。
+                return;
             }
-            catch (Exception ex)
-            {
-                Warn("无法打开日志文件（" + ex.GetType().Name + "：" + ex.Message + "）：" + sink.FilePath);
-            }
+
+            OpenSessionLog(index);
         }
 
         private void BtnLoadDict_Click(object sender, EventArgs e)
@@ -2511,7 +2974,9 @@ namespace Rerar
             }
         }
 
-        // 析构：把日志、托盘图标、计时器都收干净 —— 尤其是日志文件句柄（否则会把文件锁着）。
+        // 析构：把日志、托盘图标、计时器、共享 ToolTip、右键菜单与扫描取消源都收干净 ——
+        // 尤其是日志文件句柄（否则会把文件锁着）。修复轮 Minor 7：以前 _tooltip / _itemMenu /
+        // _scanCts 三个组件从来没有被释放过（ToolTip 与 ContextMenuStrip 都持有系统资源）。
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -2520,10 +2985,17 @@ namespace Rerar
                 catch (Exception) { }
                 try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } }
                 catch (Exception) { }
+                try { if (_tooltip != null) { _tooltip.Dispose(); } }
+                catch (Exception) { }
+                try { if (_itemMenu != null) { if (_lstItems != null) { _lstItems.ContextMenuStrip = null; } _itemMenu.Dispose(); } }
+                catch (Exception) { }
                 try { if (_log != null) { _log.Dispose(); } }
                 catch (Exception) { }
-                try { if (_scanCts != null) { _scanCts.Cancel(); } }
+                try { if (_scanCts != null) { _scanCts.Cancel(); _scanCts.Dispose(); } }
                 catch (Exception) { }
+                // _runCts 刻意**不**在这里 Dispose：还可能有一个工作线程正持着它的 Token 在跑，
+                // 释放它换不来任何东西，却可能把一个 ObjectDisposedException 抛进正在进行的解压
+                //（「进度回调绝不抛」是硬约束）。运行结束时的 CancellationTokenSource 由 GC 收。
                 try { SetKeepAwake(false); }
                 catch (Exception) { }
             }
@@ -2922,11 +3394,20 @@ namespace Rerar
         private StreamWriter _file;
         private bool _problemReported;
 
-        public LogSink(string filePath)
+        // carryOverTail（可选）：上一轮界面上已有的尾部行。只进**界面尾部**，绝不写进本轮的日志文件 ——
+        // 每轮的日志文件仍然只含自己那一轮的内容（逐轮可查、不互相污染），但界面上滚动的日志是
+        // 连续的：重试轮开始时不会把之前看过的东西「清屏」（修复轮 Finding 3 的第二半）。
+        public LogSink(string filePath) : this(filePath, null) { }
+
+        public LogSink(string filePath, string[] carryOverTail)
         {
             FilePath = filePath;
             FileProblem = "";
             _tail = new LogTailBuffer(MainForm.LogTailLines);
+            if (carryOverTail != null)
+            {
+                for (int i = 0; i < carryOverTail.Length; i++) { _tail.Add(carryOverTail[i]); }
+            }
 
             try
             {
