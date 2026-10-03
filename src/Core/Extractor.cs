@@ -82,6 +82,19 @@ namespace Rerar.Core
         //
         // 它们都不是 Failed（没试过，谈不上失败），也绝不静默丢掉。
         public List<string> NotAttempted = new List<string>();
+
+        // Task 11（修复轮 Finding 1）：崩溃恢复日志的写入失败**必须可见**。
+        //
+        // 0 / null = 本次运行的恢复记录完整写入。>0 = 有 N 处日志 I/O 失败，也就是用户**没有**完整的
+        // 恢复记录：崩溃之后无法据此判断哪些目的地已完成、哪些原包已被处置。修复之前这件事被静默吞掉
+        // ——用户以为自己有恢复记录，其实没有，这与 I3（绝不声称一个文件可恢复）是同一族的不诚实。
+        //
+        // 注意这**只是汇报**：日志 I/O 失败照旧不影响解压 / 校验 / 提交 / 删除（见 NoteJournal），
+        // 盘上的哨兵 + 「(未完成)」改名仍然是失败标记的主路径。
+        public int JournalWriteFailures;
+
+        // 上面那个数字的中文说明（含第一条失败的具体原因与异常类型），可直接展示给用户。
+        public string JournalProblem;
     }
 
     public sealed class Extractor
@@ -133,6 +146,15 @@ namespace Rerar.Core
         // 本次运行的崩溃恢复日志（Task 11）。null = 日志不可用（例如 %LOCALAPPDATA% 建不出来）：
         // 日志是**辅助**记录，它缺席绝不改变解压行为（见 OpenJournal / NoteJournal）。
         private Journal _journal;
+
+        // Task 11（修复轮 Finding 1）：日志 I/O 失败的计数与原因。
+        //   * _journalAttempts：真的尝试过的追加次数（日志根本没打开时是 0 —— 那时一条都没尝试）；
+        //   * _journalFailures：其中失败的次数（日志没打开记 1 次：本次运行整个没有恢复记录）；
+        //   * _journalFailureReason：**第一条**失败的具体原因（中文 + 异常类型），Run 末尾一次性汇报。
+        // 三者都只用于「如实汇报」，不参与任何判定。
+        private int _journalAttempts;
+        private int _journalFailures;
+        private string _journalFailureReason;
 
         // 低水位标志由**轮询线程**写、由解压线程读，故用 volatile（见 RunExtraction 的说明）。
         // 三个标志一起决定判词说的是哪一段（开始前 / 解压中 / 解压后复核），绝不把「其实解压完了」
@@ -243,10 +265,17 @@ namespace Rerar.Core
             // Task 11：干净收尾标记。**没有**这条记录 = 进程死在途中（RunsWithoutCleanShutdown 的
             // 唯一判据）。它说的是「控制流走完了本方法」，与每个归档各自的结局无关 ——
             // 「哪些目的地没有做完」由 about-to-extract / extract-done 逐条回答。
+            // 用户在密码阶段 / 解压前取消、或致命中止（盘满）时**也会**走到这里写 done：那些是
+            // **刻意**的结束（done 明细里的 cancelled= / fatal= 如实标注），所以
+            // RunsWithoutCleanShutdown 的含义是「进程没有死在途中」，不是「这次运行一切顺利」。
             NoteJournal(Journal.DoneStep,
                 "results=" + summary.Results.Count +
                 "\tcancelled=" + (summary.Cancelled ? "true" : "false") +
                 "\tfatal=" + (summary.FatalReason == null ? "false" : "true"));
+
+            // Task 11（修复轮 Finding 1）：日志写失败必须**可见**（此前被静默吞掉）。
+            // 这里只汇报，不改任何结局 —— 上面的记录都已经落了。
+            ReportJournalFailures(summary);
 
             return summary;
         }
@@ -256,7 +285,8 @@ namespace Rerar.Core
         // ------------------------------------------------------------------
 
         // 每次 Run 一条独立的日志（runId = 本地时间戳 + 随机后缀，同秒多次运行也不会撞名）。
-        // 打不开就返回 null：日志缺席绝不能让一次本来正常的解压变成失败。
+        // 打不开就返回 null：日志缺席绝不能让一次本来正常的解压变成失败 —— 但**必须**被数下来并在
+        // Run 末尾如实汇报（修复轮 Finding 1：静默缺席等于让用户以为自己有恢复记录）。
         private Journal OpenJournal()
         {
             try
@@ -265,20 +295,73 @@ namespace Rerar.Core
                     Guid.NewGuid().ToString("N").Substring(0, 8);
                 return Journal.Open(runId);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                // 一次失败而不是每条记录一次：这一天整个日志都不存在，本次运行**没有**任何恢复记录。
+                JournalIOFailed("无法打开崩溃恢复日志", null, ex);
                 return null;
             }
         }
 
         // 落一条记录。**吞掉一切异常**：日志是辅助记录，它的失败绝不能把结果降级成「内部错误」
         // （那会改动 Task 10 的行为）；盘上的哨兵 + 「(未完成)」改名才是主要的失败标记。
+        // 但吞掉**不等于**不吭声（修复轮 Finding 1）：失败被数下来，Run 末尾汇报到运行摘要与判词上。
         private void NoteJournal(string step, string detail)
         {
             Journal journal = _journal;
             if (journal == null) { return; }
+
+            _journalAttempts++;
             try { journal.Note(step, detail); }
-            catch (Exception) { }
+            catch (Exception ex) { JournalIOFailed("无法写入崩溃恢复日志", step, ex); }
+        }
+
+        // 记下一次日志 I/O 失败（原因只留**第一条**：它才是最可能说明问题的那一条 —— 例如权限 / 盘满）。
+        // 绝不重新抛出：日志失败照旧不许影响解压（Task 10 的行为一字不改）。
+        private void JournalIOFailed(string action, string step, Exception ex)
+        {
+            _journalFailures++;
+            if (_journalFailureReason == null)
+            {
+                _journalFailureReason = action + "（" +
+                    (step == null ? "" : "步骤 " + step + "，") +
+                    ex.GetType().Name + "：" + ex.Message + "）";
+            }
+        }
+
+        // Task 11（修复轮 Finding 1）：把「崩溃恢复记录不完整」这件事汇报到**运行摘要**与**至少一条
+        // 结果判词**上。修复前它被静默吞掉：用户以为自己有恢复记录，其实没有 —— 那与 I3（绝不声称
+        // 一个文件可恢复）是同一族的不诚实。
+        //
+        // 只汇报、不判定：解压 / 校验 / 提交 / 删除的任何行为都不受这里影响。
+        private void ReportJournalFailures(RunSummary summary)
+        {
+            if (_journalFailures <= 0) { return; }
+
+            string notice = JournalFailureNotice();
+            summary.JournalWriteFailures = _journalFailures;
+            summary.JournalProblem = notice;
+
+            // 再落到一条**结果判词**上：只把信息放在 RunSummary 上时，那些只渲染每个归档判词的
+            // 消费方（报告 / 界面）仍然看不到它 —— 而「看不到」正是本轮要修的那件事。
+            if (summary.Results.Count > 0)
+            {
+                ArchiveResult donor = summary.Results[summary.Results.Count - 1];
+                donor.Message = AppendMessage(donor.Message, notice);
+            }
+        }
+
+        // 面向用户的中文说明：**具体原因**（异常类型 + 消息）+ 到底少写了多少 —— 用户要据此知道
+        //「这次没有可信的恢复记录，崩溃后不能指望它告诉我哪些目的地做完了」。
+        private string JournalFailureNotice()
+        {
+            string reason = _journalFailureReason == null ? "原因未知" : _journalFailureReason;
+            string scope = _journalAttempts == 0
+                ? "本次运行没有写入任何恢复记录"
+                : "本次运行 " + _journalAttempts + " 条恢复记录中有 " + _journalFailures + " 条未能写入";
+
+            return "崩溃恢复记录不完整：" + reason + "；" + scope +
+                "（崩溃后无法据此判断哪些目的地已完成、哪些原包已被处置）";
         }
 
         // 日志明细的扩展字段（格式见 Journal.cs 文件头：首字段是目的地，其余 key=value）。
@@ -738,13 +821,16 @@ namespace Rerar.Core
             }
 
             // --- 13) 提交已经成功 ⇒ 落「这个目的地处理完了」的持久记录（Task 11 不可逆点 ②）---
-            // 有这一条（且 status=Completed），恢复查询就不会把一个**校验通过**的目录报成半成品；
-            // 没有这一条（崩在提交与它之间）会保守地报成未完成 —— 那是刻意的方向（宁多报，绝不少报）。
+            // 有这一条就说明这个目的地**有完成记录**（提交成功、校验也跑过了），恢复查询因此不会把它
+            // 报成从未提交的半成品；没有这一条（崩在提交与它之间）会保守地报成未完成 —— 那是刻意的
+            // 方向（宁多报，绝不少报）。
             // status 如实带出校验结论：CompletedWithFailures 虽然也已提交，但它在内容上就是不完整的
-            //（少文件），日志把这件事记下来，恢复查询据此继续把它报成未完成（详见 Journal 的说明）。
+            //（少文件），failed= 记下内部失败成员数 —— 恢复查询据此把它报进 FindCommittedWithFailures()
+            //（**不**报进「没有完成记录」的清单，见 Journal 文件头的说明）。
             // 它是否删原包由 I3 决定，明细里的 original 如实记录。
             NoteJournal(Journal.ExtractDoneStep, target +
                 JournalField("status", result.Status.ToString()) +
+                JournalField("failed", result.Failed.ToString(CultureInfo.InvariantCulture)) +
                 JournalField("original", originalDisposition));
 
             return result;

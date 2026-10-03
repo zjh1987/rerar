@@ -3,9 +3,13 @@
 // 【为什么需要它】原文 .bat 最严重的缺陷是「解压失败仍然删除原包」。Task 10 用「暂存 → 校验 →
 // 提交」把删除结构性挂在「完成且校验通过」上；但进程若在解压 / 提交 / 处置原包之间的任意一刻
 // 被杀（断电、任务管理器结束任务、崩溃），盘上就会留下「处理到一半」的状态。下一次启动必须能
-// 只看盘上的记录**独立地**回答两个问题：
-//     1) 哪些目标目录没有完成记录（= 可能是半成品）？        → FindIncompleteDestinations()
-//     2) 哪些运行没有正常结束（= 进程在途中死了）？          → RunsWithoutCleanShutdown()
+// 只看盘上的记录**独立地**回答这些问题：
+//     1) 哪些目标目录**没有完成记录**（= 从未提交的半成品 / 残留）？→ FindIncompleteDestinations()
+//     2) 哪些运行**没有正常结束**（= 进程在途中死了，而不是刻意结束）？→ RunsWithoutCleanShutdown()
+//     3) 哪些目标目录**已提交但内容不全**（提交成功、内部却有成员失败）？→ FindCommittedWithFailures()
+// 第 3 条是修复轮 Finding 2 补的：CompletedWithFailures **有**完成记录（提交成功、校验也跑过了），
+// 所以它绝不能出现在第 1 条的清单里 —— 那会让用户去重新解压一个其实已经在盘上的目录；但它内容
+// 不全这件事仍必须说出来，而且要带上是几个成员失败。
 // 这就是本类：一个**追加式、每条都立刻落盘**的运行记录，写在每一个不可逆动作**之前**。
 //
 // 【为什么在 %LOCALAPPDATA%，绝不在目标卷】
@@ -18,25 +22,31 @@
 // 于是恢复查询不必理解后半段就能工作：
 //     run-start        run=<runId>
 //     about-to-extract <目标目录>\tsource=<源归档>\tstaging=<暂存目录>
-//     extract-done     <目标目录>\tstatus=<Completed|CompletedWithFailures>\toriginal=<kept|deleted|quarantined>
-//                      （status 缺失时按 Completed 处理：步骤名本身就是「完成」的意思。
-//                        CompletedWithFailures **不**关闭目的地 —— 见下面的恢复查询说明。）
+//     extract-done     <目标目录>\tstatus=<Completed|CompletedWithFailures>\tfailed=<失败成员数>\toriginal=<kept|deleted|quarantined>
+//                      （extract-done = 这个目的地**已提交**：提交成功、校验也跑过了。
+//                        status 只说明提交的**内容**是否完整（CompletedWithFailures = 内部有
+//                        failed 个成员失败）。**任何**一条 extract-done 都代表「有完成记录」，
+//                        所以它都会让这个目的地从 FindIncompleteDestinations() 里消失。）
 //     about-to-delete  <原包路径>\tdestination=<目标目录>
 //     done             results=<n>\tcancelled=<true|false>\tfatal=<true|false>
+//                      （done = 进程**刻意走到了控制流末尾**，绝不代表「这次运行一切顺利」：
+//                        用户取消（cancelled=true）与致命中止（fatal=true）**同样**会写 done。
+//                        所以「没有 done」只说明进程死在途中 —— 见 RunsWithoutCleanShutdown()。）
 //
 // 【哪些文件/记录承载恢复查询】
 //   * RunsWithoutCleanShutdown()：逐个日志文件扫描，看**最后一条 run-start 之后**有没有 done。
 //     没有 ⇒ 该 runId 没有正常结束。Open() 每次都会写一条 run-start，所以同一 runId 的第二次
 //     运行自成一个「段」：新一段的结局绝不会被上一段的 done 掩盖，而上一段的记录一条都不会被
 //     改写或丢弃（严格追加式）。
-//   * FindIncompleteDestinations()：按文件顺序扫描，about-to-extract 记下目的地，之后一条
-//     **status=Completed** 的 extract-done 才把它消掉；剩下的就是「不是完整结果」的目的地
-//    （失败、半途、以及「已提交但内容不全」的 CompletedWithFailures 都留在里面 —— 恢复查询要
-//     回答的是「哪些目的地不是完整结果」，不是「这个进程有没有继续碰它」）。
-//     **每个文件各自结算**（一次运行一条日志）：跨文件不做抵消 —— 在某次运行的日志里没做完的
-//     目的地，绝不因为另一次运行的日志里出现过同名目的地就被当成做完了。
+//   * FindIncompleteDestinations()：按文件顺序扫描，about-to-extract 记下目的地，之后**任何一条**
+//     extract-done（无论 status）都把它消掉；剩下的就是**从未提交**的目的地（被中止 / 崩溃留下的
+//     暂存树与「(未完成)」残件）。**每个文件各自结算**（一次运行一条日志）：跨文件不做抵消 ——
+//     在某次运行的日志里没做完的目的地，绝不因为另一次运行的日志里出现过同名目的地就被当成做完了。
 //     方向刻意保守：崩在「提交成功后、完成记录落盘前」也会被报成未完成 —— 宁可多报，绝不少报
 //     （少报就是把一个可能半成品的目的地当成完整结果）。
+//   * FindCommittedWithFailures()：extract-done 里 status=CompletedWithFailures 的目的地，带上
+//     failed=<n>（内部失败成员数）。它们**已提交**，所以不在上面那份清单里，但消费者（报告 / 界面）
+//     仍该提示「目录在盘上，但内容不全」。
 //
 // 【落盘语义】每条 Note：打开 → 追加 → Flush(true) → 关闭。Flush(true) 把数据刷到磁盘
 //（不只是进程缓冲区）—— 一条留在缓冲里的记录遇崩溃等于没写，那正是本类存在的全部意义。
@@ -68,6 +78,11 @@ namespace Rerar.Core
         public const string ExtractDoneStep = "extract-done";
         public const string AboutToDeleteStep = "about-to-delete";
         public const string DoneStep = "done";
+
+        // extract-done 明细里 status= 的两个「已提交」取值（= ArchiveStatus 的两个已提交成员）。
+        // 两者都代表**有完成记录**；差别只在提交的**内容**是否完整。
+        public const string StatusCompleted = "Completed";
+        public const string StatusCompletedWithFailures = "CompletedWithFailures";
 
         public const string FileExtension = ".log";
 
@@ -170,7 +185,16 @@ namespace Rerar.Core
         // 恢复查询（只读日志文件，不依赖任何进程内状态）
         // ------------------------------------------------------------------
 
-        // 没有正常结束的运行（runId，按名称序数排序）。启动恢复路径用它找出「进程死在途中」的那几次运行。
+        // 没有**正常结束**的运行（runId，按名称序数排序）。启动恢复路径用它找出「进程死在途中」的那几次运行。
+        //
+        // 【本查询的**准确**含义（修复轮 Finding 3 要求写在调用方能看见的地方）】
+        // 它问的是「**进程是不是没有死在途中**」，也就是「进程**刻意**走到了控制流末尾，而不是崩掉」。
+        // 它**不是**「这次运行没有未做完的工作」，也**不是**「这次运行一切顺利」：
+        //   * 用户取消（done 明细里 cancelled=true）与致命中止（fatal=true，例如盘满）**同样**会写 done，
+        //     因为那些都是**刻意**的结束 —— 它们不会出现在本清单里；
+        //   * 「哪些目的地没有完成」是**另一件事**，只能问 FindIncompleteDestinations()。
+        // 任何把本清单当成「需要重做的运行清单」的用法都是误读：一次被取消的运行可能留下大量未提交的
+        // 目的地，而它的 runId 永远不会出现在这里。
         public static IEnumerable<string> RunsWithoutCleanShutdown()
         {
             List<string> runs = new List<string>();
@@ -185,7 +209,16 @@ namespace Rerar.Core
             return runs;
         }
 
-        // 没有完成记录的目的地（绝对路径，按序数排序、大小写不敏感去重）。
+        // **从未提交**的目的地（绝对路径，按序数排序、大小写不敏感去重）。
+        //
+        // 【本查询的**准确**含义（修复轮 Finding 2 的控制方裁定）】清单里只有**没有完成记录**的目的地：
+        // 只有 about-to-extract、之后**没有任何** extract-done —— 也就是被中止 / 崩溃留下的暂存树与
+        //「(未完成)」残件。
+        //
+        // 一条 extract-done 就说明这个目的地**有完成记录**：提交成功了、校验也跑过了。
+        // status=CompletedWithFailures（提交成功但内部有成员失败）**同样有完成记录**，所以它**不**在
+        // 这里 —— 把它报成「没有完成记录」会让用户去重新解压一个其实已经在盘上的目录，那是误导。
+        // 它「内容不全」这件事由 FindCommittedWithFailures() 带失败成员数单独报出。
         public static IEnumerable<string> FindIncompleteDestinations()
         {
             List<string> incomplete = new List<string>();
@@ -209,9 +242,8 @@ namespace Rerar.Core
                     }
                     else if (string.Equals(step, ExtractDoneStep, StringComparison.Ordinal))
                     {
-                        // 只有「校验通过 + 提交成功」的记录才算这个目的地做完了：
-                        // CompletedWithFailures 的产物少文件（内容上就是不完整的），必须继续报出来。
-                        if (IsVerifiedComplete(detail)) { pending.Remove(FirstField(detail)); }
+                        // 提交成功这件事与 status 无关：任何 extract-done 都代表「这个目的地有完成记录」。
+                        pending.Remove(FirstField(detail));
                     }
                 }
 
@@ -226,6 +258,55 @@ namespace Rerar.Core
 
             incomplete.Sort(StringComparer.Ordinal);
             return incomplete;
+        }
+
+        // 已提交、但**内容不全**的目的地（extract-done 里 status=CompletedWithFailures），带失败成员数。
+        //
+        // 为什么单独成一条查询：这些目的地**有完成记录**（提交成功、校验跑过），所以它们绝不能出现在
+        // FindIncompleteDestinations() 里（那会让人去重新解压一个已经在盘上的目录）；但它们内部确实有
+        // 成员失败，消费者（报告 / 界面）仍该提示「目录在盘上，但内容不全」，而 failed=<n> 就是那个数字。
+        //
+        // 与 FindIncompleteDestinations() 同一约定：逐个日志文件结算，跨文件不做抵消；同一目的地出现
+        // 多次时保留**第一条**（保守方向：第一次报出的失败数不会被后来的记录抹掉）。
+        public static IEnumerable<CommittedWithFailures> FindCommittedWithFailures()
+        {
+            List<CommittedWithFailures> committed = new List<CommittedWithFailures>();
+
+            foreach (string file in JournalFiles())
+            {
+                foreach (string line in ReadLines(file))
+                {
+                    string step;
+                    string detail;
+                    if (!Split(line, out step, out detail)) { continue; }
+                    if (!string.Equals(step, ExtractDoneStep, StringComparison.Ordinal)) { continue; }
+                    if (!string.Equals(Field(detail, "status"), StatusCompletedWithFailures, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    string destination = FirstField(detail);
+                    if (destination.Length == 0) { continue; }
+                    if (ContainsDestination(committed, destination)) { continue; }
+
+                    CommittedWithFailures one = new CommittedWithFailures();
+                    one.Destination = destination;
+                    one.Failed = FailedCount(detail);
+                    committed.Add(one);
+                }
+            }
+
+            committed.Sort(delegate(CommittedWithFailures x, CommittedWithFailures other) {
+                return string.CompareOrdinal(x.Destination, other.Destination);
+            });
+            return committed;
+        }
+
+        // 「已提交、但内部有成员失败」的目的地。Failed = 记录里 failed=<n> 的 n（缺失 / 非数字按 0）。
+        public sealed class CommittedWithFailures
+        {
+            public string Destination { get; set; }
+            public int Failed { get; set; }
         }
 
         // ------------------------------------------------------------------
@@ -328,12 +409,17 @@ namespace Rerar.Core
             return field.Trim();
         }
 
-        // extract-done 记录是不是「校验通过的完整结果」。status= 缺失按 Completed 处理
-        //（步骤名本身就是「完成」的意思，手写记录也照此解释）。
-        private static bool IsVerifiedComplete(string detail)
+        // extract-done 明细里的失败成员数（failed=<n>）。缺失 / 非数字一律按 0：绝不凭空编造一个数字
+        //（生产路径（Extractor）每条 extract-done 都会带上它，所以那个 0 只会出现在手写/旧格式的记录上）。
+        private static int FailedCount(string detail)
         {
-            string status = Field(detail, "status");
-            return status.Length == 0 || string.Equals(status, "Completed", StringComparison.Ordinal);
+            int value;
+            if (int.TryParse(Field(detail, "failed"), NumberStyles.Integer, CultureInfo.InvariantCulture, out value) &&
+                value > 0)
+            {
+                return value;
+            }
+            return 0;
         }
 
         // 明细里的 key=value 扩展字段（首字段是目的地，不含 '='）。找不到返回 ""。
@@ -367,6 +453,16 @@ namespace Rerar.Core
             foreach (string one in values)
             {
                 if (string.Equals(one, value, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
+
+        // 同上，给「已提交但内容不全」的清单用（去重规则一致：大小写不敏感）。
+        private static bool ContainsDestination(List<CommittedWithFailures> values, string destination)
+        {
+            foreach (CommittedWithFailures one in values)
+            {
+                if (string.Equals(one.Destination, destination, StringComparison.OrdinalIgnoreCase)) { return true; }
             }
             return false;
         }

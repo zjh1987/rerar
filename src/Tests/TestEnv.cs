@@ -1722,6 +1722,16 @@ internal static class TestEnv
         return RunExtractCore(archive, password, 10, null, false, 2);
     }
 
+    // Task 11 修复轮（Finding 1）：把自定义的进度汇（IProgressSink）交给 Extractor —— 用例可以借
+    //「归档开始」这一刻在运行**途中**改变环境（例如让崩溃恢复日志的根变成不是目录），从而真实地
+    // 触发「日志打开成功、写入随后失败」这一档。其余选项与 RunExtract 完全一致
+    //（输出根 = OutRoot、不删原包、深度 10、轮询 2 秒）。
+    public static RunSummary RunExtractWithSink(string archive, IProgressSink sink)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        return new Extractor(options, new DriveSpaceProvider(), sink).Run(new string[] { archive });
+    }
+
     public static RunSummary RunExtractWithDepth(int depth, string archive)
     {
         return RunExtractCore(archive, null, depth, null, false, 2);
