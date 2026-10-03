@@ -124,6 +124,16 @@ internal static class TestEnv
         {
         }
         EnsureDirs();
+
+        // 进程外的残留也一并收拾：上一次运行若在 subst 夹具用例中途被杀，映射会留在机器上
+        //（Cleanup 删得掉目录，删不掉映射）。放在这里而不是只放在夹具里，是因为它属于
+        // 「每个用例开始前让机器回到干净状态」这件事：
+        //   * 僵留映射（目标目录已被删）实测 GetDriveType=1，不干扰任何用例，但它是**机器上的残留**，
+        //     必须由测试自己收掉；
+        //   * 若目标目录还在（映射是"活"的）实测 GetDriveType=3（DRIVE_FIXED），会让
+        //     `Guard.RefusesOnRemovableOrRemote` 的字面量 Z:\ 判成 Quarantine 而误 FAIL ——
+        //     而那条用例比 subst 夹具更早执行，所以自愈必须发生在这里。
+        ReleaseStaleSubstMappings(Path.Combine(_root, "substroot"));
     }
 
     // ------------------------------------------------------------------
@@ -1082,6 +1092,235 @@ internal static class TestEnv
         string outRoot = Path.Combine(_root, "out");
         if (!Directory.Exists(tmp)) { Directory.CreateDirectory(tmp); }
         if (!Directory.Exists(outRoot)) { Directory.CreateDirectory(outRoot); }
+    }
+
+    // ------------------------------------------------------------------
+    // 「卷上没有 $Recycle.Bin」夹具（Task 9 fix 轮）：用 subst 把临时目录映射成一个盘符。
+    //
+    // 为什么用 subst：真造一个「没有 $Recycle.Bin 的卷」需要新建/挂载 VHD（要管理员），
+    // 而 subst 出来的盘符本机实测 —— GetDriveType=3（固定卷）、GetVolumePathName 失败
+    //（RecycleBinGuard.VolumeRoot 于是退回盘符根）、<盘符>:\$Recycle.Bin 不存在 —— 正好落在
+    //「固定卷 + 没有回收站」这条分支上，且 subst /d 即可完全复原，全程无需提权。
+    //
+    // 用例必须用 try/finally 调 ReleaseNoRecycleBinVolume()：subst 映射是**进程外**状态，
+    // H.Run 每用例前的 TestEnv.Cleanup() 删得掉目标目录却删不掉映射。本类只撤自己建的映射：
+    //   * Cleanup() 每用例前都会跑一次自愈（ReleaseStaleSubstMappings）—— 上一次运行若在用例
+    //     中途被杀，僵留的映射（任何盘符，包括 Z:）都会在那里被撤掉；
+    //   * 挑盘符从 Y 起（**刻意避开 Z**）：`Guard.RefusesOnRemovableOrRemote` 用字面量
+    //     `Z:\remote\x.zip` 钉「盘符没有卷」这条分支，夹具不该去占那个盘符；
+    //   * 只用 QueryDosDevice 认领映射（目标是本类的 substroot 才撤），绝不 subst /d 别人的盘。
+    // ------------------------------------------------------------------
+    private static string _noBinLetter;
+    private const string SubstMarkerName = ".rerar_subst_marker";
+    private const uint DriveNoRootDir = 1;
+
+    public static string NoRecycleBinVolumeRoot
+    {
+        get
+        {
+            if (_noBinLetter == null) { _noBinLetter = CreateNoBinVolume(); }
+
+            // Cleanup() 会删掉整个临时根，subst 的目标目录可能被连带删掉；
+            // 映射本身只是路径，补建目录即恢复。
+            string target = Path.Combine(_root, "substroot");
+            if (!Directory.Exists(target)) { Directory.CreateDirectory(target); }
+
+            string root = _noBinLetter + @":\";
+            // 自检：这个盘下必须真的没有回收站目录，否则夹具名不副实（用例会退化成假的「无回收站」）。
+            if (Directory.Exists(Path.Combine(root, "$Recycle.Bin")))
+            {
+                throw new InvalidOperationException(
+                    "subst 映射盘 " + root + " 下竟然出现了 $Recycle.Bin，夹具已失效");
+            }
+            return root;
+        }
+    }
+
+    public static string NoRecycleBinFile
+    {
+        get
+        {
+            string path = Path.Combine(NoRecycleBinVolumeRoot, "no_recycle_bin_probe.txt");
+            if (!File.Exists(path)) { File.WriteAllText(path, "x", new UTF8Encoding(false)); }
+            return path;
+        }
+    }
+
+    // 撤销我们自己建的 subst 映射（幂等：没建过、或已经撤掉时什么都不做）。
+    public static void ReleaseNoRecycleBinVolume()
+    {
+        string letter = _noBinLetter;
+        _noBinLetter = null;
+        if (letter == null) { return; }
+
+        try { RunSubst(letter + ": /d"); }
+        catch (Exception) { }
+    }
+
+    private static string CreateNoBinVolume()
+    {
+        string target = Path.Combine(_root, "substroot");
+        if (!Directory.Exists(target)) { Directory.CreateDirectory(target); }
+
+        // 僵留映射已由 Cleanup()（每用例前都跑）撤掉了，这里只管找盘符。
+        List<string> tried = new List<string>();
+        for (char c = 'Y'; c >= 'P'; c--)
+        {
+            string letter = c.ToString();
+            // 只挑「没有卷」的盘符：有卷的（包括空光驱）绝不碰，也绝不会去动别人的映射。
+            if (GetDriveType(letter + @":\") != DriveNoRootDir) { continue; }
+            tried.Add(letter);
+            if (TrySubst(letter, target)) { return letter; }
+        }
+
+        throw new InvalidOperationException(
+            "找不到可用盘符来 subst 出「没有 $Recycle.Bin 的卷」夹具（已试：" + string.Join("、", tried.ToArray()) + "）");
+    }
+
+    // 撤掉「目标正好是本夹具的 substroot」的僵留映射（上一次运行被中断留下的进程外状态）。
+    // 只认自己人：别人的映射目标不是这个路径，QueryDosDevice 也读不出匹配 —— 绝不碰。
+    // 任何失败都吞掉：自愈失败只意味着夹具可能挑到别的盘符，不该让用例失败。
+    private static void ReleaseStaleSubstMappings(string target)
+    {
+        for (char c = 'Z'; c >= 'P'; c--)
+        {
+            string letter = c.ToString();
+            string mapped = SubstTarget(letter + ":");
+            if (mapped == null) { continue; }
+            if (!string.Equals(TrimTrailingSlash(mapped), TrimTrailingSlash(target), StringComparison.OrdinalIgnoreCase)) { continue; }
+
+            try { RunSubst(letter + ": /d"); }
+            catch (Exception) { }
+        }
+    }
+
+    // 盘符的设备映射目标。subst 映射形如 "\??\C:\...\substroot"；真卷是 "\Device\HarddiskVolume3"
+    //（与夹具目标不可能相等）。查不到返回 null。
+    private static string SubstTarget(string deviceName)
+    {
+        try
+        {
+            StringBuilder sb = new StringBuilder(1024);
+            if (QueryDosDevice(deviceName, sb, sb.Capacity) <= 0) { return null; }
+
+            string path = sb.ToString();
+            const string dosPrefix = @"\??\";
+            if (path.StartsWith(dosPrefix, StringComparison.Ordinal)) { path = path.Substring(dosPrefix.Length); }
+            return path;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static string TrimTrailingSlash(string path)
+    {
+        if (path == null) { return null; }
+        return path.TrimEnd('\\');
+    }
+
+    // 成功判据是**可观察的事实**而不是 subst 的退出码：映射之后该盘下必须能看到我们写的身份标记。
+    private static bool TrySubst(string letter, string target)
+    {
+        File.WriteAllText(Path.Combine(target, SubstMarkerName), "rerar subst fixture", new UTF8Encoding(false));
+        RunSubst(letter + ": " + Quote(target));
+        return File.Exists(Path.Combine(letter + @":\", SubstMarkerName));
+    }
+
+    private static void RunSubst(string arguments)
+    {
+        string systemDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
+        string exe = string.IsNullOrEmpty(systemDir) ? "subst.exe" : Path.Combine(systemDir, "subst.exe");
+
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = exe;
+        psi.Arguments = arguments;              // 参数由本类拼装，路径已加引号
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+
+        Process process = new Process();
+        process.StartInfo = psi;
+        try
+        {
+            process.Start();
+            string stdOut = process.StandardOutput.ReadToEnd();
+            string stdErr = process.StandardError.ReadToEnd();
+            if (!process.WaitForExit(15000))
+            {
+                try { process.Kill(); } catch (Exception) { }
+                process.WaitForExit();
+                throw new InvalidOperationException(
+                    "subst 15 秒未返回（已杀掉）：subst " + arguments);
+            }
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "subst 失败（退出码 " + process.ExitCode + "）：subst " + arguments +
+                    "；stdout=[" + Head(stdOut) + "]；stderr=[" + Head(stdErr) + "]");
+            }
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
+    private static string Quote(string value)
+    {
+        return "\"" + value + "\"";
+    }
+
+    // subst 夹具用：查盘符类型（1 = DRIVE_NO_ROOT_DIR，即该盘符没有卷）。
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetDriveType(string lpRootPathName);
+
+    // subst 夹具自愈用：把盘符解析成设备映射目标（QueryDosDevice，UTF-16，无编码坑）。
+    // 实测：subst 映射的 Y: → "\??\C:\Users\…\rerar-tests\substroot"；真卷 C: → "\Device\HarddiskVolume3"。
+    // 注意 subst 不带参数时**不打印**映射表（本机实测 stdout 为空），所以只能走这个 API，不能解析输出。
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+
+    // ------------------------------------------------------------------
+    // 「回环管理共享」夹具（Task 9 fix 轮）：把本地路径换成同一台机器经**未映射 UNC** 的写法
+    //（C:\a\b → \\localhost\C$\a\b），从而拿到一条 GetDriveType=DRIVE_REMOTE 的真实路径。
+    //
+    // 为什么必须用它：本机没有真实远端主机，也不允许测试去 `net share`（要提权、还会改机器状态），
+    // 未映射 UNC 是唯一能在不改机器状态的前提下得到 DRIVE_REMOTE 的办法（探针实测 GetDriveType=4）。
+    //
+    // 代价：`<盘符>$` 是**管理共享**，只有提权进程连得上；未提权时访问不到。此时本方法抛
+    // InvalidOperationException，用例如实打印 SKIPPED 行 —— 绝不假装测过远程卷。
+    // ------------------------------------------------------------------
+    public static string UncViewOf(string localPath)
+    {
+        if (string.IsNullOrEmpty(localPath)) { throw new ArgumentNullException("localPath"); }
+
+        string root;
+        try { root = Path.GetPathRoot(localPath); }
+        catch (Exception) { root = null; }
+
+        if (string.IsNullOrEmpty(root) || root.Length < 3 || root[1] != ':')
+        {
+            throw new InvalidOperationException("无法把「" + localPath + "」换成 UNC 视图：路径不在盘符根下");
+        }
+
+        string share = @"\\localhost\" + char.ToUpperInvariant(root[0]) + "$";
+        string unc = share + localPath.Substring(2);   // "C:\a\b" → "\\localhost\C$\a\b"
+
+        string dir;
+        try { dir = Path.GetDirectoryName(unc); }
+        catch (Exception) { dir = null; }
+
+        if (dir == null || !Directory.Exists(dir))
+        {
+            throw new InvalidOperationException(
+                "回环管理共享 " + share + " 不可达（管理共享只有提权进程连得上），拿不到 DRIVE_REMOTE 路径：" + unc);
+        }
+        return unc;
     }
 
     private static string LocateSevenZip()
