@@ -35,6 +35,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -129,6 +130,10 @@ namespace Rerar.Core
         private HashSet<string> _processed;
         private Dictionary<ArchiveTask, ArchiveResult> _resultsByTask;
 
+        // 本次运行的崩溃恢复日志（Task 11）。null = 日志不可用（例如 %LOCALAPPDATA% 建不出来）：
+        // 日志是**辅助**记录，它缺席绝不改变解压行为（见 OpenJournal / NoteJournal）。
+        private Journal _journal;
+
         // 低水位标志由**轮询线程**写、由解压线程读，故用 volatile（见 RunExtraction 的说明）。
         // 三个标志一起决定判词说的是哪一段（开始前 / 解压中 / 解压后复核），绝不把「其实解压完了」
         // 说成「已在解压中途中止」。
@@ -167,6 +172,7 @@ namespace Rerar.Core
             _verifiedPasswords = new List<string>();
             _processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _resultsByTask = new Dictionary<ArchiveTask, ArchiveResult>();
+            _journal = OpenJournal();
 
             List<ArchiveTask> round = FreezeTargets(targets, summary);
             int depth = 1;
@@ -234,7 +240,51 @@ namespace Rerar.Core
                 round = next;
             }
 
+            // Task 11：干净收尾标记。**没有**这条记录 = 进程死在途中（RunsWithoutCleanShutdown 的
+            // 唯一判据）。它说的是「控制流走完了本方法」，与每个归档各自的结局无关 ——
+            // 「哪些目的地没有做完」由 about-to-extract / extract-done 逐条回答。
+            NoteJournal(Journal.DoneStep,
+                "results=" + summary.Results.Count +
+                "\tcancelled=" + (summary.Cancelled ? "true" : "false") +
+                "\tfatal=" + (summary.FatalReason == null ? "false" : "true"));
+
             return summary;
+        }
+
+        // ------------------------------------------------------------------
+        // 崩溃恢复日志（Task 11）：只**增加**记录，不改动任何安全路径
+        // ------------------------------------------------------------------
+
+        // 每次 Run 一条独立的日志（runId = 本地时间戳 + 随机后缀，同秒多次运行也不会撞名）。
+        // 打不开就返回 null：日志缺席绝不能让一次本来正常的解压变成失败。
+        private Journal OpenJournal()
+        {
+            try
+            {
+                string runId = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + "-" +
+                    Guid.NewGuid().ToString("N").Substring(0, 8);
+                return Journal.Open(runId);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // 落一条记录。**吞掉一切异常**：日志是辅助记录，它的失败绝不能把结果降级成「内部错误」
+        // （那会改动 Task 10 的行为）；盘上的哨兵 + 「(未完成)」改名才是主要的失败标记。
+        private void NoteJournal(string step, string detail)
+        {
+            Journal journal = _journal;
+            if (journal == null) { return; }
+            try { journal.Note(step, detail); }
+            catch (Exception) { }
+        }
+
+        // 日志明细的扩展字段（格式见 Journal.cs 文件头：首字段是目的地，其余 key=value）。
+        private static string JournalField(string key, string value)
+        {
+            return "\t" + key + "=" + (value == null ? "" : value);
         }
 
         // 冻结顶层候选清单。不存在的目标逐项记为 SkippedUnreadable（Review Focus #5：不得崩溃、
@@ -504,6 +554,12 @@ namespace Rerar.Core
                 {
                 }
 
+                // Task 11（不可逆点 ①）：解压**开始之前**落一条记录，说明「即将写什么、写到哪里」。
+                // 崩溃在这一步之后、提交之前，恢复路径就能从这一条（而没有随后的 extract-done）
+                // 认出「这个目的地没有完成记录」。暂存目录也记下来，好让残留的暂存树可被定位。
+                NoteJournal(Journal.AboutToExtractStep, target +
+                    JournalField("source", sourcePath) + JournalField("staging", stagingBase));
+
                 extraction = RunExtraction(archiveArg, sourcePath, stagingBase, password, destRoot, linked);
 
                 // --- 8) 先分类「被打断」：1223 是被 Job Object 打断，不是解压失败，更不是成功 ---
@@ -667,17 +723,29 @@ namespace Rerar.Core
             }
 
             // --- 12) 删除（默认关；只有「完成且校验通过」才有资格）---
+            // 返回值只喂给下面那条崩溃恢复记录（原包的最终去向），不参与任何安全判定。
+            string originalDisposition = "kept";
             if (_options.DeleteOriginals)
             {
                 if (result.Status == ArchiveStatus.Completed)
                 {
-                    DeleteEligibleOriginal(task, result);
+                    originalDisposition = DeleteEligibleOriginal(task, result);
                 }
                 else
                 {
                     result.Message = AppendMessage(result.Message, "未删除原包（只有「完成且校验通过」的归档才允许删除）");
                 }
             }
+
+            // --- 13) 提交已经成功 ⇒ 落「这个目的地处理完了」的持久记录（Task 11 不可逆点 ②）---
+            // 有这一条（且 status=Completed），恢复查询就不会把一个**校验通过**的目录报成半成品；
+            // 没有这一条（崩在提交与它之间）会保守地报成未完成 —— 那是刻意的方向（宁多报，绝不少报）。
+            // status 如实带出校验结论：CompletedWithFailures 虽然也已提交，但它在内容上就是不完整的
+            //（少文件），日志把这件事记下来，恢复查询据此继续把它报成未完成（详见 Journal 的说明）。
+            // 它是否删原包由 I3 决定，明细里的 original 如实记录。
+            NoteJournal(Journal.ExtractDoneStep, target +
+                JournalField("status", result.Status.ToString()) +
+                JournalField("original", originalDisposition));
 
             return result;
         }
@@ -975,9 +1043,12 @@ namespace Rerar.Core
 
         // ------------------------------------------------------------------
         // 删除（I3）—— 默认关；只有「完成且校验通过」才走到这里
+        //
+        // 返回值 = 原包的最终去向（"kept" / "deleted" / "quarantined"），只用于崩溃恢复日志的
+        // extract-done 明细；它**不参与任何安全判定**，判定仍然只由 Plan / 删前删后的检查决定。
         // ------------------------------------------------------------------
 
-        private void DeleteEligibleOriginal(ArchiveTask task, ArchiveResult result)
+        private string DeleteEligibleOriginal(ArchiveTask task, ArchiveResult result)
         {
             string origin = task.Path;
 
@@ -988,7 +1059,7 @@ namespace Rerar.Core
             {
                 result.Message = AppendMessage(result.Message, "分卷集（" + task.VolumeMembers.Count +
                     " 个成员）：按「全部不处置」处理，原包全部保留（避免只删一个、留下孤儿分卷）");
-                return;
+                return "kept";
             }
 
             string why;
@@ -997,13 +1068,19 @@ namespace Rerar.Core
             if (plan == DeletePlan.Refuse)
             {
                 result.Message = AppendMessage(result.Message, "未删除原包：" + why);
-                return;
+                return "kept";
             }
+
+            // Task 11（不可逆点 ③）：处置是**不可逆**的（回收站未必可核实、隔离是一次移动），
+            // 所以在这一刻之前先落一条记录。崩在「记录已写、处置未做」之间时，日志留下的是
+            //「已计划删除、结局未知」—— 回读它的人绝不能据此认为原包已经安全消失，必须去盘上核实。
+            // 结局（deleted / quarantined / kept）写在随后的 extract-done 明细里。
+            NoteJournal(Journal.AboutToDeleteStep, origin + JournalField("destination", result.OutputDir));
 
             if (plan == DeletePlan.Quarantine)
             {
                 QuarantineOriginal(origin, result, why);
-                return;
+                return File.Exists(origin) ? "kept" : "quarantined";
             }
 
             // Recycle：删前取基线，删后核实**本次删除新增了条目**。
@@ -1017,13 +1094,14 @@ namespace Rerar.Core
             {
                 result.Message = AppendMessage(result.Message,
                     called ? "原包删除未生效，文件仍在" : "回收站删除失败，原包仍在（" + why + "）");
-                return;
+                return "kept";
             }
 
             bool verified = called && RecycleBinGuard.VerifyInBin(fileName, before);
             result.Message = AppendMessage(result.Message, verified
                 ? "原包已移入回收站（已核实：回收站里新增了该条目）"
                 : "原包已被删除，但回收站未能核实（很可能已被永久删除）");
+            return "deleted";
         }
 
         // 隔离：同卷移动到 `_originals_<时间戳>\`。不删除，只换位置；任何失败都如实报「原包仍在」。

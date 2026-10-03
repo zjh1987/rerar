@@ -43,6 +43,22 @@ internal static class TestEnv
         }
     }
 
+    // 崩溃恢复日志（Task 11）在测试期间的根目录：Tmp 之下，与 Tmp/OutRoot 一样每用例重建。
+    //
+    // 为什么必须重定向：Journal 的生产默认根是 %LOCALAPPDATA%\Rerar\journal（绝不在目标卷上）。
+    // 测试若写真实 %LOCALAPPDATA%，既污染用户的应用数据，又让用例不再自洽（上一次运行的记录
+    // 会被下一次的查询读到）。Cleanup() 每用例把 Journal.Root 指到这里，于是每个用例都从
+    // **空**日志根开始。与其它 fixture 一致：不做静态缓存，访问时现算路径（Journal.Open 按需建目录）。
+    public static string JournalRoot
+    {
+        get
+        {
+            string dir = Path.Combine(Tmp, "journal");
+            if (!Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+            return dir;
+        }
+    }
+
     // 本机 7-Zip 的绝对路径。缺失时抛异常并给出明确提示：
     // H.Main 在开跑前就访问它，于是整轮测试以一条 FAIL 结束，而不是逐个用例莫名其妙地失败。
     public static string SevenZip
@@ -124,6 +140,10 @@ internal static class TestEnv
         {
         }
         EnsureDirs();
+
+        // Task 11：把崩溃恢复日志的根重定向到临时目录（Tmp 之下）—— 生产默认根在
+        // %LOCALAPPDATA%，测试绝不能往那里写（污染用户应用数据 + 用例之间互相串记录）。
+        Journal.Root = Path.Combine(_root, "tmp", "journal");
 
         // 进程外的残留也一并收拾：上一次运行若在 subst 夹具用例中途被杀，映射会留在机器上
         //（Cleanup 删得掉目录，删不掉映射）。放在这里而不是只放在夹具里，是因为它属于
