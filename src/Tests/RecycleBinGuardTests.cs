@@ -19,6 +19,20 @@
 //      就返回 Refuse、**没走到卷类型分支**，故期望值改回 Refuse 并把这一点写进注释；
 //      远程卷本身的两条裁定另用两条用例覆盖（需要提权会话的回环管理共享，拿不到就如实 SKIPPED）。
 //
+// Task 9 **第二轮** fix（本轮）改了两件事，都在这份文件里有明确痕迹：
+//   4. 卷类型判定被抽成纯函数（`RecycleBinGuard.ClassifyDriveType` 分类 +
+//      `RecycleBinGuard.DecideVolumePlan` 决策），因为 DRIVE_REMOTE 这条安全关键分支原先只能靠
+//      `\\localhost\C$` 端到端覆盖，而那是管理共享、**只有提权会话**连得上 —— 未提权的机器上
+//      等于没有钉子。本文件因此新增一组**不需要真卷、不需要提权**的钉子：
+//      `Guard.ClassifiesDriveTypes` 以及 `Guard.VolumePlan*`（远程/可移动/内存盘/无回收站/
+//      配额内/超配额/配额为 0/配额未知/NukeOnDelete/文件不存在/光驱/无卷）。
+//      其中 `Guard.VolumePlanRemoteIsNotRecyclable` 把「远程 = 网络位置」的**判词断言**钉了回来
+//      ——上一轮在改 `Guard.RefusesOnUncPath` 期望值时把它弄丢了，而那条路径根本走不到卷类型分支。
+//      提权门控的两条端到端用例（`Guard.QuarantinesOnWritableRemoteVolume` /
+//      `Guard.RefusesOnRemoteVolumeWhenUnwritable`）**原样保留**：它们是能跑时的真集成证据。
+//   5. 跳过改用 `H.Skip(name, reason)`：它记成一条 SKIPPED（带原因）、**不计入 PASS**、在汇总里
+//      单独列出；不再用 `Console.WriteLine("SKIPPED …") + return` 冒充通过。
+//
 // 与 brief 示例的另一处偏离（上一轮已写进 task-9-report.md）：回收站核实不再靠「名字在不在里面」，
 // 所以固定文件名不再会造成假 PASS；但回收用例仍用带随机后缀的文件名，避免在用户回收站里
 // 反复堆积同名残留。
@@ -61,8 +75,8 @@ internal sealed class RecycleBinGuardTests : TestBase
             }
             catch (InvalidOperationException ex)
             {
-                // 造不出超配额夹具时如实打印 SKIPPED（绝不假 PASS），并写进报告。
-                Console.WriteLine("SKIPPED Guard.PlansQuarantineWhenTooLargeForQuota：" + ex.Message);
+                // 造不出超配额夹具时如实记一条 SKIPPED（绝不假 PASS），并写进报告。
+                H.Skip("Guard.PlansQuarantineWhenTooLargeForQuota", ex.Message);
                 return;
             }
 
@@ -91,13 +105,168 @@ internal sealed class RecycleBinGuardTests : TestBase
         //   * 但该路径上的文件**根本不存在**（未提权时连这个管理共享都看不见），Plan 在
         //     「文件不存在」这一关就返回 Refuse，压根没走到卷类型那一支。
         // 所以这条钉的是「远程路径 + 文件不在 → Refuse」——任何权限下都成立、不需要提权；
-        // 远程卷本身的两条裁定（可写 → Quarantine、不可写 → Refuse）由下面两条用例覆盖。
+        // 远程卷本身「不走回收站」这条决定由下面**纯分类/纯决策块**（任何机器都真跑）覆盖，
+        // 真远程卷上的端到端行为再由那两条提权门控用例覆盖。
         H.Run("Guard.RefusesOnUncPath", delegate {
             string path = @"\\localhost\C$\Users\Public\remote_archive.zip";
             AssertFalse(File.Exists(path));                  // 前置：正因文件不在，才轮不到卷类型分支
             string why;
             AssertEq(RecycleBinGuard.Plan(path, out why), DeletePlan.Refuse);
             AssertTrue(why != null && why.Length > 0);
+        });
+
+        // ==================================================================
+        // 纯分类 / 纯决策的钉子（Task 9 第二轮 fix）—— **不依赖任何真卷、任何权限**。
+        //
+        // 为什么要这一组：DRIVE_REMOTE 是删除路径上最安全关键的一支（实测该卷上删除不报错却会
+        // 静默永久删除），而能真正走到它的端到端用例（下面两条 `Guard.*RemoteVolume*`）用的是
+        // `\\localhost\C$` —— 管理共享，**只有提权会话**连得上。未提权的机器上它们只会 SKIPPED，
+        // 于是「远程卷不走回收站」这条决定一个钉子都没有。下面这组把「卷类型分类 → 用哪种机制」
+        // 直接喂常量进纯函数，在任何机器（提权与否、有没有对应硬件）上都真跑。
+        //
+        // DecideVolumePlan 的参数（除卷类型外，纯函数不碰文件系统，路径只出现在判词里）：
+        //   卷类型 / 判词回显路径 / 文件存在 / 文件字节数 / 卷根有 $Recycle.Bin / 配额已记录 / 配额 MB / NukeOnDelete
+        // 契约提醒：本函数返回的 Quarantine 是**卷层面**的结论（隔离机制在卷层面可行）；真 `Plan`
+        // 之后还会查一次目录可写性，写不了就降级 Refuse（`Guard.RefusesWhenVolumeNotWritable` 钉这一层）。
+        // ==================================================================
+
+        // 分类本身：7 个 Win32 值各归哪一类；未识别的值必须落到 Unknown
+        //（Unknown 在决策里是 Refuse，所以「认不出来」绝不会被当成「可以回收」）。
+        H.Run("Guard.ClassifiesDriveTypes", delegate {
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeUnknown), VolumeKind.Unknown);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeNoRootDir), VolumeKind.Unknown);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeRemovable), VolumeKind.Removable);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeFixed), VolumeKind.Fixed);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeRemote), VolumeKind.Remote);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeCdrom), VolumeKind.CdRom);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(RecycleBinGuard.DriveTypeRamdisk), VolumeKind.RamDisk);
+            AssertEq(RecycleBinGuard.ClassifyDriveType(42), VolumeKind.Unknown);
+        });
+
+        // DRIVE_CDROM → Refuse：只读介质，回收与同卷移动都不可能。
+        H.Run("Guard.VolumePlanRefusesOnCdRom", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeCdrom, PureVolumePath, true, 1L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Refuse);
+            AssertTrue(why.IndexOf("光驱") >= 0);
+        });
+
+        // DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR → Refuse：没有卷，既没有回收站也没有地方建隔离文件夹。
+        H.Run("Guard.VolumePlanRefusesOnUnknownVolume", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeUnknown, PureVolumePath, true, 1L, false, false, 0L, false, out why);
+            AssertEq(plan, DeletePlan.Refuse);
+            AssertTrue(why.IndexOf("盘符不存在") >= 0);
+            AssertTrue(why.IndexOf("隔离文件夹") >= 0);
+
+            DeletePlan noRoot = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeNoRootDir, PureVolumePath, true, 1L, false, false, 0L, false, out why);
+            AssertEq(noRoot, DeletePlan.Refuse);
+        });
+
+        // DRIVE_REMOTE → 不回收（判词必须点明「网络」：这是用户唯一能看懂的线索）。
+        // 这是**安全关键**的钉子：实测远程卷上 SendToRecycleBin 不报错、也不报失败，文件却真的没了，
+        // 回收站里核实不到。这里刻意喂「有回收站 + 配额够」的事实，证明卷类型一旦是远程，
+        // 回收站事实再好看也不能把它救回 Recycle。
+        // （第二轮 fix：`Guard.RefusesOnUncPath` 在改对期望值时丢掉了「网络」断言，而那个路径根本
+        //   走不到卷类型分支 —— 这条把它钉回来了，且不需要提权。）
+        H.Run("Guard.VolumePlanRemoteIsNotRecyclable", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeRemote, PureVolumePath, true, 1024L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("网络") >= 0);       // 用户必须被告知「这是网络位置」
+            AssertTrue(why.IndexOf("不回收") >= 0);     // 且必须说清「不走回收站」
+        });
+
+        // DRIVE_REMOVABLE → 不回收（换机/换卷后可能无法还原）。
+        H.Run("Guard.VolumePlanRemovableIsNotRecyclable", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeRemovable, PureVolumePath, true, 1024L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("可移动") >= 0);
+        });
+
+        // DRIVE_RAMDISK → 不回收（内存盘的回收站不持久、本机无从核实）。第二轮 fix 由「按可回收处理」改来。
+        H.Run("Guard.VolumePlanRamDiskIsNotRecyclable", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeRamdisk, PureVolumePath, true, 1024L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("内存盘") >= 0);
+        });
+
+        // DRIVE_FIXED 但卷根没有 $Recycle.Bin → 不回收（走隔离文件夹）。
+        H.Run("Guard.VolumePlanFixedWithoutRecycleBin", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 1024L, false, false, 0L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("$Recycle.Bin") >= 0);
+        });
+
+        // DRIVE_FIXED + 有回收站 + 文件在配额内 → Recycle（唯一会返回 Recycle 的组合）。
+        H.Run("Guard.VolumePlanFixedRecyclesWithinQuota", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 1L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Recycle);
+            AssertTrue(why.IndexOf("回收站可用") >= 0);
+        });
+
+        // 超配额 → 不回收（实测超配额时 API 同样静默永久删除）。
+        H.Run("Guard.VolumePlanFixedQuarantinesOverQuota", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 2048L * 1024L * 1024L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("配额") >= 0);
+        });
+
+        // 配额为 0 MB（等于不回收）→ 不回收。
+        H.Run("Guard.VolumePlanFixedQuarantinesOnZeroQuota", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 1L, true, true, 0L, false, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("配额为 0") >= 0);
+        });
+
+        // 读不到配额（注册表缺项）→ 按保守默认 1024 MB 判：大文件不回收、小文件仍可回收。
+        // 这条把「保守默认」也变成任何机器都真跑的钉子（此前只有稀疏文件夹具间接覆盖）。
+        H.Run("Guard.VolumePlanFixedQuarantinesWhenQuotaUnknown", delegate {
+            string why;
+            DeletePlan big = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 64L * 1024L * 1024L * 1024L,
+                true, false, 1024L, false, out why);
+            AssertEq(big, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("保守默认") >= 0);
+
+            DeletePlan small = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 1L, true, false, 1024L, false, out why);
+            AssertEq(small, DeletePlan.Recycle);
+        });
+
+        // NukeOnDelete=1（「删除时不回收」）→ 不回收。此前这一支只有一次性探针（要写用户注册表，
+        // 不进自动化）；纯函数把这条分支也变成了任何机器都能真跑的钉子。
+        H.Run("Guard.VolumePlanFixedQuarantinesOnNukeOnDelete", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, true, 1L, true, true, 1024L, true, out why);
+            AssertEq(plan, DeletePlan.Quarantine);
+            AssertTrue(why.IndexOf("NukeOnDelete") >= 0);
+        });
+
+        // 文件不存在 → Refuse，且这个判定**先于**回收站/配额（配额再宽也不能「回收」一个不存在的文件）。
+        H.Run("Guard.VolumePlanRefusesWhenFileMissing", delegate {
+            string why;
+            DeletePlan plan = RecycleBinGuard.DecideVolumePlan(
+                RecycleBinGuard.DriveTypeFixed, PureVolumePath, false, 0L, true, true, 1024L, false, out why);
+            AssertEq(plan, DeletePlan.Refuse);
+            AssertTrue(why.IndexOf("文件不存在") >= 0);
         });
 
         // 裁定 §6.8 的一半：远程卷不可回收 → **不删**，改提供同卷隔离文件夹（Quarantine）。
@@ -111,7 +280,7 @@ internal sealed class RecycleBinGuardTests : TestBase
             try { unc = TestEnv.UncViewOf(local); }
             catch (InvalidOperationException ex)
             {
-                Console.WriteLine("SKIPPED Guard.QuarantinesOnWritableRemoteVolume：" + ex.Message);
+                H.Skip("Guard.QuarantinesOnWritableRemoteVolume", ex.Message);
                 return;
             }
 
@@ -142,7 +311,7 @@ internal sealed class RecycleBinGuardTests : TestBase
             try { unc = TestEnv.UncViewOf(local); }
             catch (InvalidOperationException ex)
             {
-                Console.WriteLine("SKIPPED Guard.RefusesOnRemoteVolumeWhenUnwritable：" + ex.Message);
+                H.Skip("Guard.RefusesOnRemoteVolumeWhenUnwritable", ex.Message);
                 return;
             }
 
@@ -237,7 +406,7 @@ internal sealed class RecycleBinGuardTests : TestBase
                 }
                 catch (InvalidOperationException ex)
                 {
-                    Console.WriteLine("SKIPPED Guard.QuarantinesWhenVolumeHasNoRecycleBin：" + ex.Message);
+                    H.Skip("Guard.QuarantinesWhenVolumeHasNoRecycleBin", ex.Message);
                     return;
                 }
 
@@ -273,7 +442,7 @@ internal sealed class RecycleBinGuardTests : TestBase
                 }
                 catch (InvalidOperationException ex)
                 {
-                    Console.WriteLine("SKIPPED Guard.RefusesWhenVolumeNotWritable：" + ex.Message);
+                    H.Skip("Guard.RefusesWhenVolumeNotWritable", ex.Message);
                     return;
                 }
 
@@ -391,4 +560,8 @@ internal sealed class RecycleBinGuardTests : TestBase
     {
         return prefix + "_" + Guid.NewGuid().ToString("N").Substring(0, 10) + ".txt";
     }
+
+    // 纯函数用例用的路径：DecideVolumePlan 不碰文件系统，路径只出现在判词里，
+    // 所以这里用一个**故意不存在**的合成路径，保证这组用例与任何真卷无关。
+    private const string PureVolumePath = @"X:\pure-classification\payload.bin";
 }

@@ -7,7 +7,13 @@
 //      与 brief 里所有示例的写法一致；
 //   4. 断言一律写成 AssertEq(实际值, 期望值) —— brief 全部示例都是这个参数顺序；
 //   5. 每个用例开始前 H.Run 会调 TestEnv.Cleanup()，故 Tmp/OutRoot 每用例都是全新的空目录；
-//   6. 任一用例失败不中断整轮，最后 H.Report() 汇总并以退出码 1 结束。
+//   6. 用例有三种结局：PASS / FAIL / **SKIPPED**。夹具在本机造不出来（例如需要提权的回环管理共享）
+//      时，用例体调 `H.Skip(name, reason)` 并紧接着 return —— 它会记成一条 SKIPPED（带原因），
+//      **绝不计入 PASS**，绝不会与真跑通的用例混在一起（Task 9 第二轮 fix 之前它被记成 PASS）。
+//      跳过必须用本用例 H.Run 的那个名字，名字对不上会当场变成 FAIL（防止「用例改名后静默消失」）。
+//   7. 任一用例失败不中断整轮，最后 H.Report() 汇总：PASS/FAIL/SKIPPED 分列，跳过用例逐个带原因列出；
+//      有 FAIL 时以退出码 1 结束；**只有跳过、没有 FAIL 时仍以退出码 0 结束**（不许因为夹具提权不了
+//      就把整轮测试判红），但跳过必须在大声可见的汇总里如实呈现。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM（csc 另加 /codepage:65001 双保险）。
 
@@ -18,11 +24,13 @@ using System.Text;
 
 internal static class H
 {
-    // 单个用例的结果：Error 为 null 表示通过。
+    // 单个用例的结果：Error 非 null = FAIL；SkipReason 非 null = SKIPPED（未执行任何断言）；
+    // 两者都为 null = PASS。三者互斥 —— 尤其「跳过」绝不能同时算成 PASS。
     private sealed class Result
     {
         public string Name;
         public string Error;
+        public string SkipReason;
     }
 
     // 断言失败专用异常：与「测试体自己抛的异常」区分开，便于报告里给出不同措辞。
@@ -33,20 +41,57 @@ internal static class H
 
     private static readonly List<Result> _results = new List<Result>();
 
+    // 当前用例名（H.Skip 用它校验名字）与本次用例声明的跳过原因（由 H.Run 收口记录）。
+    private static string _currentCase;
+    private static string _skipReason;
+
     // 执行一个用例：先重置每用例独立的临时目录，再跑测试体。
-    // 断言失败或任何异常都只记为一条 FAIL，不中断整轮测试。
+    // 断言失败或任何异常都只记为一条 FAIL，不中断整轮测试；用例体调用过 H.Skip 则记为 SKIPPED。
     public static void Run(string name, Action body)
     {
+        _currentCase = name;
+        _skipReason = null;
         try
         {
             TestEnv.Cleanup();
             body();
-            Record(name, null);
         }
         catch (Exception ex)
         {
+            // 跳过**不是**免死金牌：声明跳过后又抛异常，那仍然是 FAIL。
+            _currentCase = null;
+            _skipReason = null;
             Record(name, Describe(ex));
+            return;
         }
+
+        string skipReason = _skipReason;
+        _currentCase = null;
+        _skipReason = null;
+
+        if (skipReason != null)
+        {
+            RecordSkip(name, skipReason);
+            return;
+        }
+        Record(name, null);
+    }
+
+    // 把当前用例声明为 SKIPPED（未执行任何断言），并给出**原因**（原因会原样出现在输出与汇总里）。
+    // 契约：紧接着必须 return（用例体剩余部分不再执行）；name 必须与本用例 H.Run 的名字一致。
+    // 名字对不上这里会抛 AssertionException —— 于是该用例变成 FAIL，而不是「改名后静默消失」。
+    public static void Skip(string name, string reason)
+    {
+        if (_currentCase == null)
+        {
+            throw new AssertionException("H.Skip 必须在 H.Run 的用例体里调用（当前没有正在执行的用例）");
+        }
+        if (!string.Equals(name, _currentCase, StringComparison.Ordinal))
+        {
+            throw new AssertionException(
+                "H.Skip 的名字「" + name + "」与本用例「" + _currentCase + "」不一致；跳过必须用本用例的名字");
+        }
+        _skipReason = string.IsNullOrEmpty(reason) ? "（未给出原因）" : reason;
     }
 
     // 断言相等。参数顺序与 brief 全部示例一致：a = 实际值，b = 期望值。
@@ -74,18 +119,34 @@ internal static class H
         }
     }
 
-    // 打印 PASS/FAIL 汇总表：任一用例失败返回 1，全通过返回 0。
+    // 打印 PASS/FAIL/SKIPPED 汇总表：任一用例失败返回 1；全通过（可以有跳过）返回 0。
+    // 跳过用例一律**单独成行列出来并带原因** —— 读者绝不该把「跳过」误当成「通过」。
     public static int Report()
     {
         int pass = 0;
         int fail = 0;
+        int skip = 0;
         foreach (Result r in _results)
         {
-            if (r.Error == null) { pass++; } else { fail++; }
+            if (r.SkipReason != null) { skip++; }
+            else if (r.Error == null) { pass++; }
+            else { fail++; }
         }
 
         Console.WriteLine("----");
-        Console.WriteLine("用例 " + _results.Count + " 个：PASS " + pass + "，FAIL " + fail);
+        Console.WriteLine("用例 " + _results.Count + " 个：PASS " + pass + "，FAIL " + fail + "，SKIPPED " + skip);
+
+        if (skip > 0)
+        {
+            Console.WriteLine("跳过用例（" + skip + " 个，未执行任何断言）：");
+            foreach (Result r in _results)
+            {
+                if (r.SkipReason != null)
+                {
+                    Console.WriteLine("  SKIPPED " + r.Name + "：" + r.SkipReason);
+                }
+            }
+        }
 
         if (fail > 0)
         {
@@ -94,8 +155,16 @@ internal static class H
             {
                 if (r.Error != null) { Console.WriteLine("  " + r.Name); }
             }
-            Console.WriteLine("FAIL: " + fail + " 个用例未通过");
+            Console.WriteLine("FAIL: " + fail + " 个用例未通过" + (skip > 0 ? "（另有 " + skip + " 个用例被跳过）" : ""));
             return 1;
+        }
+
+        if (skip > 0)
+        {
+            // 不许因为「夹具需要提权」就把整轮判红，但也绝不说「全部用例通过」——
+            // 跳过的用例根本没执行，那样说就是不诚实。
+            Console.WriteLine("PASS: 无失败用例，但有 " + skip + " 个用例被跳过（未执行，见上）");
+            return 0;
         }
 
         Console.WriteLine("PASS: 全部用例通过");
@@ -152,7 +221,7 @@ internal static class H
 
     private static void Record(string name, string error)
     {
-        _results.Add(new Result { Name = name, Error = error });
+        _results.Add(new Result { Name = name, Error = error, SkipReason = null });
         if (error == null)
         {
             Console.WriteLine("PASS " + name);
@@ -162,6 +231,14 @@ internal static class H
             Console.WriteLine("FAIL " + name);
             Console.WriteLine("     " + error);
         }
+    }
+
+    // 记录一条 SKIPPED：用例位置就打一行（含原因），汇总里再逐条重列 —— 双重可见，绝不像 PASS。
+    private static void RecordSkip(string name, string reason)
+    {
+        _results.Add(new Result { Name = name, Error = null, SkipReason = reason });
+        Console.WriteLine("SKIPPED " + name);
+        Console.WriteLine("     " + reason);
     }
 
     // 发现约定：类名以 Tests 结尾，且自身声明了 public static void Run()。

@@ -13,11 +13,20 @@
 //
 // 三种机制（控制方在 Task 9 fix 轮的裁定）：
 //   * Recycle    —— 卷可回收（固定卷 + 有 $Recycle.Bin + 配额够 + 未设 NukeOnDelete）时的首选；
-//   * Quarantine —— **每一个不可回收的卷**（无 $Recycle.Bin / 超配额 / 远程 / 可移动 / 卷类型未知），
-//                   只要「同卷移动到隔离文件夹」这一步可行，就走这里：不删，改提供
+//   * Quarantine —— **每一个不可回收的卷**（无 $Recycle.Bin / 超配额 / 远程 / 可移动 / 内存盘 /
+//                   卷类型未知），只要「同卷移动到隔离文件夹」这一步可行，就走这里：不删，改提供
 //                   同卷 `_originals_<时间戳>\`（规格 §6.8「不满足 3/4 时」）；
 //   * Refuse     —— 只留给「连同卷移动都不安全」：源目录不可写（隔离文件夹无处可建）、卷是只读卷、
 //                   盘符/卷不存在、只读介质、路径本身非法/文件不存在。Refuse 也是非破坏性的。
+//
+// Task 9 第二轮 fix（本文件）：把「给定卷类型 + 回收站事实 → 用哪种机制」这条判定抽成**纯函数**
+// （`ClassifyDriveType` 分类 + `DecideVolumePlan` 决策），与「查询机器状态」（GetDriveType /
+// $Recycle.Bin / 注册表配额 / 目录可写性）彻底分开。为什么必须这样切：DRIVE_REMOTE 是本任务最
+// 安全关键的一支（实测该卷上删除会**静默永久删除**），而它原先只能靠 `\\localhost\C$` 端到端
+// 覆盖 —— 那是管理共享，**只有提权会话**连得上；于是未提权的机器上，这条决定一个钉子都没有。
+// 现在「DRIVE_REMOTE → 不回收」可以直接用常量钉住，与有没有真卷、提不提权全无关系。
+// 另：`DRIVE_RAMDISK` 由「按可回收处理」改为「不回收」（内存盘的回收站不持久、重启即丢，
+// 本机无从核实），理由同 I3 的诚实层。
 //
 // 设计要点（安全方向）：
 //   * Plan 的任何不确定输入（空/非法路径、盘符不存在、卷不可读、$Recycle.Bin 缺失、
@@ -46,6 +55,19 @@ namespace Rerar.Core
         Recycle,
         Quarantine,
         Refuse
+    }
+
+    // 卷类型的**语义分类**：GetDriveType 的 7 个 Win32 值归成 6 类。
+    // 之所以要有这一层：判定用的是「哪一类卷」而不是「Win32 的哪个数字」，分类是纯函数，
+    // 于是判定可以在任何机器上直接钉住（见 RecycleBinGuard.ClassifyDriveType）。
+    public enum VolumeKind
+    {
+        Unknown,     // DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR / 任何未识别的值
+        Removable,   // DRIVE_REMOVABLE
+        Fixed,       // DRIVE_FIXED
+        Remote,      // DRIVE_REMOTE
+        CdRom,       // DRIVE_CDROM
+        RamDisk      // DRIVE_RAMDISK
     }
 
     // 回收站里「与某个文件名匹配的条目」的快照 —— VerifyInBin 判断「这次删除有没有**新增**条目」
@@ -87,13 +109,14 @@ namespace Rerar.Core
     public static class RecycleBinGuard
     {
         // ---- GetDriveType 返回值（winbase.h）----
-        private const uint DriveUnknown = 0;
-        private const uint DriveNoRootDir = 1;
-        private const uint DriveRemovable = 2;
-        private const uint DriveFixed = 3;
-        private const uint DriveRemote = 4;
-        private const uint DriveCdrom = 5;
-        private const uint DriveRamdisk = 6;
+        // public：纯分类/纯决策的用例要用它们当输入（不依赖任何真卷），且这 7 个数值是 Win32 契约本身。
+        public const uint DriveTypeUnknown = 0;
+        public const uint DriveTypeNoRootDir = 1;
+        public const uint DriveTypeRemovable = 2;
+        public const uint DriveTypeFixed = 3;
+        public const uint DriveTypeRemote = 4;
+        public const uint DriveTypeCdrom = 5;
+        public const uint DriveTypeRamdisk = 6;
 
         // ---- GetVolumeInformation 的 lpFileSystemFlags 位（winbase.h）----
         private const uint FileReadOnlyVolume = 0x00080000;
@@ -153,7 +176,153 @@ namespace Rerar.Core
         }
 
         // ------------------------------------------------------------------
+        // ClassifyDriveType：**纯分类函数** —— Win32 的 GetDriveType 返回值 → 语义分类。
+        // 只依赖入参，不碰任何机器状态。它与「查询」（GetDriveType 这个 P/Invoke）分开，是为了让
+        // 「哪类卷不走回收站」这条判定可以在**任何机器**上直接钉住（不需要真卷、不需要提权）。
+        // 未识别的值一律归到 Unknown —— 保守方向：Unknown 在决策里是 Refuse，绝不落到 Recycle。
+        // ------------------------------------------------------------------
+        public static VolumeKind ClassifyDriveType(uint driveType)
+        {
+            switch (driveType)
+            {
+                case DriveTypeRemovable: return VolumeKind.Removable;
+                case DriveTypeFixed: return VolumeKind.Fixed;
+                case DriveTypeRemote: return VolumeKind.Remote;
+                case DriveTypeCdrom: return VolumeKind.CdRom;
+                case DriveTypeRamdisk: return VolumeKind.RamDisk;
+                case DriveTypeUnknown: return VolumeKind.Unknown;
+                case DriveTypeNoRootDir: return VolumeKind.Unknown;
+                default: return VolumeKind.Unknown;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // DecideVolumePlan：**纯决策函数** —— 给定「卷类型 + 文件事实 + 该卷回收站事实」，
+        // 回答该用哪种机制。不查机器状态、不读注册表、不碰文件系统（displayPath 只出现在判词里）。
+        //
+        // 返回值语义（调用方必须按这个理解，Plan 就是这么用的）：
+        //   * Recycle    —— 卷层面够格走回收站，是**终局**；
+        //   * Quarantine —— 卷层面不可回收，但「同卷移动到隔离文件夹」在卷层面仍然可行；这是
+        //                    **卷层面**的结论，调用方还必须自己确认该目录可写（写不了要降级 Refuse）；
+        //   * Refuse     —— 卷层面连同卷移动都不可能（盘符/卷不存在、只读介质），是**终局**。
+        // 本函数**不**判「只读卷」与「目录可写性」：那两项是机器状态查询，留在 Plan 里
+        //（这也是纯与不纯的分界线）。
+        //
+        // reason 一定会被赋值，且具体到「为什么」（用户要能分清走的是哪条路）。Quarantine 时
+        // reason 是**卷层面**的原因（例如「文件在网络位置…；不回收」），至于「改用同卷隔离文件夹…」
+        // 那句由 Plan 在定稿时追加 —— 只有 Plan 才能确认那一步真的可行。
+        // ------------------------------------------------------------------
+        public static DeletePlan DecideVolumePlan(
+            uint driveType,
+            string displayPath,
+            bool fileExists,
+            long fileLengthBytes,
+            bool hasRecycleBin,
+            bool quotaDocumented,
+            long maxCapacityMb,
+            bool nukeOnDelete,
+            out string reason)
+        {
+            VolumeKind kind = ClassifyDriveType(driveType);
+
+            // 卷/盘符不存在（或卷类型完全认不出来）：既不能回收，也没有地方建隔离文件夹。
+            if (kind == VolumeKind.Unknown)
+            {
+                reason = "盘符不存在或卷不可用（GetDriveType=" + driveType + "），连同卷的隔离文件夹都无处可建；拒绝删除：" + Shorten(displayPath);
+                return DeletePlan.Refuse;
+            }
+            // 只读介质（光驱）：回收与同卷移动都不可能。
+            if (kind == VolumeKind.CdRom)
+            {
+                reason = "文件在只读介质（光驱）上，既不能回收也不能同卷移动；拒绝自动处理：" + Shorten(displayPath);
+                return DeletePlan.Refuse;
+            }
+
+            // 文件事实先定下来：文件不在就无从谈起（连回收站配额都不必看）。
+            if (!fileExists)
+            {
+                reason = "文件不存在，无法删除：" + Shorten(displayPath);
+                return DeletePlan.Refuse;
+            }
+
+            // 卷层面的不可回收原因：为 null 表示回收站仍有希望。判词要能说清是哪一条。
+            string notRecyclable = null;
+
+            if (kind == VolumeKind.Remote)
+            {
+                // 实测：远程卷上 SendToRecycleBin 不报错却永久删除，且本机回收站里核实不到。
+                notRecyclable = "文件在网络位置（UNC/映射盘）：回收站在对端、本机无从核实，实测此卷上删除不报错却会静默永久删除；不回收";
+            }
+            else if (kind == VolumeKind.Removable)
+            {
+                notRecyclable = "文件在可移动介质上，回收站不可靠（换机/换卷后可能无法还原）；不回收";
+            }
+            else if (kind == VolumeKind.RamDisk)
+            {
+                // 内存盘的回收站不持久（重启即丢），而且本机无从核实 —— 与远程卷同理，不走回收站。
+                notRecyclable = "文件在内存盘（DRIVE_RAMDISK）上，回收站不持久（重启即丢、本机无从核实）；不回收";
+            }
+            else if (kind == VolumeKind.Fixed)
+            {
+                // 固定卷还要再看回收站自身：目录在不在、是不是被设成「不回收」、装不装得下。
+                if (!hasRecycleBin)
+                {
+                    // brief Step 3 原文判 Refuse；控制方在 fix 轮裁定从规格 §6.8 —— 该卷不可回收，
+                    // 但同卷隔离仍然可行且更有用，故走 Quarantine。
+                    notRecyclable = "该卷根目录下没有 $Recycle.Bin（外壳还没建出来，或该卷不支持回收站）；不回收";
+                }
+                else
+                {
+                    long limitMb = quotaDocumented ? maxCapacityMb : DefaultQuotaMb;
+                    long fileMb = Mb(fileLengthBytes);
+
+                    if (nukeOnDelete)
+                    {
+                        notRecyclable = "该卷回收站被设为「删除时不回收」（NukeOnDelete=1），删除会绕过回收站；不回收";
+                    }
+                    else if (quotaDocumented && maxCapacityMb <= 0)
+                    {
+                        notRecyclable = "该卷回收站配额为 0 MB（等于不回收）；不回收";
+                    }
+                    else if (fileLengthBytes > limitMb * BytesPerMb)
+                    {
+                        if (quotaDocumented)
+                        {
+                            notRecyclable = "文件 " + fileMb + " MB 超过该卷回收站配额 " + limitMb +
+                                            " MB，超配额会被永久删除而不进回收站；不回收";
+                        }
+                        else
+                        {
+                            // 注册表没有该卷的记录：配额未知，按保守默认判定，绝不假设「装得下」。
+                            notRecyclable = "读不到该卷回收站配额（按保守默认 " + limitMb + " MB 判定）：文件 " + fileMb +
+                                            " MB 超过保守默认，可能在回收站里被永久删除；不回收";
+                        }
+                    }
+                    else
+                    {
+                        reason = quotaDocumented
+                            ? "该卷回收站可用（配额 " + limitMb + " MB ≥ 文件 " + fileMb + " MB）"
+                            : "该卷回收站可用（配额未知，按保守默认 " + limitMb + " MB 判定）；删除后仍需核实";
+                        return DeletePlan.Recycle;
+                    }
+                }
+            }
+            else
+            {
+                // 分类只有上面那几种；真出现新分类，绝不默认「可以回收」。
+                notRecyclable = "卷类型未覆盖（VolumeKind=" + kind + "），不冒险走回收站";
+            }
+
+            // 走到这里：回收站这条路走不通（规格 §6.8 的「不满足 3/4」），卷层面唯一剩下的机制是
+            // 「同卷移动到隔离文件夹 _originals_<时间戳>\」。目录可写性由 Plan 接着查。
+            reason = notRecyclable;
+            return DeletePlan.Quarantine;
+        }
+
+        // ------------------------------------------------------------------
         // Plan：决定用哪种机制（Recycle / Quarantine / Refuse），并给出中文判词。
+        // 它负责**查询**机器状态（路径、卷根、GetDriveType、只读卷、文件事实、$Recycle.Bin、
+        // 注册表配额、目录可写性），判定本身交给纯函数 DecideVolumePlan。
         // reason 一定会被赋值（调用方可以直接显示），且一定具体到「为什么」——
         // 用户要能分清「这次走的是哪条路、为什么没走回收站」。
         // ------------------------------------------------------------------
@@ -194,55 +363,24 @@ namespace Rerar.Core
                 return DeletePlan.Refuse;
             }
 
-            // 卷/盘符不存在：既不能回收，也没有地方建隔离文件夹 —— 连同卷移动都不可能。
-            if (driveType == DriveUnknown || driveType == DriveNoRootDir)
-            {
-                reason = "盘符不存在或卷不可用（GetDriveType=" + driveType + "），连同卷的隔离文件夹都无处可建；拒绝删除：" + Shorten(full);
-                return DeletePlan.Refuse;
-            }
-            // 只读介质（光驱）：回收与同卷移动都不可能。
-            if (driveType == DriveCdrom)
-            {
-                reason = "文件在只读介质（光驱）上，既不能回收也不能同卷移动；拒绝自动处理：" + Shorten(full);
-                return DeletePlan.Refuse;
-            }
-            // 只读卷（例如写保护的移动介质 / 以只读挂载的卷）：同上。
+            // 只读卷（例如写保护的移动介质 / 以只读挂载的卷）：机器状态查询，留在这一层。
             if (IsReadOnlyVolume(root))
             {
                 reason = "该卷是只读卷（FILE_READ_ONLY_VOLUME），既不能回收也不能同卷移动；拒绝自动处理：" + Shorten(full);
                 return DeletePlan.Refuse;
             }
 
-            // 卷层面的不可回收原因（与文件是否存在无关，先定下来）：回收站这条路走不通时把
-            // 「为什么」记在这里；为 null 表示回收站仍有希望。判词要能说清是哪一条。
-            string notRecyclable = null;
+            VolumeKind kind = ClassifyDriveType(driveType);
 
-            if (driveType == DriveRemote)
-            {
-                // 实测：远程卷上 SendToRecycleBin 不报错却永久删除，且本机回收站里核实不到。
-                notRecyclable = "文件在网络位置（UNC/映射盘）：回收站在对端、本机无从核实，实测此卷上删除不报错却会静默永久删除；不回收";
-            }
-            else if (driveType == DriveRemovable)
-            {
-                notRecyclable = "文件在可移动介质上，回收站不可靠（换机/换卷后可能无法还原）；不回收";
-            }
-            else if (driveType != DriveFixed && driveType != DriveRamdisk)
-            {
-                notRecyclable = "卷类型未知（GetDriveType=" + driveType + "），不冒险走回收站";
-            }
-
-            long length;
+            // 文件事实。Exists 与 Length 必须在同一个 try 里读：文件恰好被移走 / 无权限时
+            // Length 会抛，抛给调用方就等于把「判断不出来」变成「不知道该怎么办」，只能保守拒绝。
+            bool fileExists;
+            long length = 0;
             try
             {
                 FileInfo info = new FileInfo(full);
-                if (!info.Exists)
-                {
-                    reason = "文件不存在，无法删除：" + Shorten(full);
-                    return DeletePlan.Refuse;
-                }
-                // Length 必须在同一个 try 里读：文件恰好被移走 / 无权限时这里会抛，
-                // 抛给调用方就等于把「判断不出来」变成「不知道该怎么办」，只能保守拒绝。
-                length = info.Length;
+                fileExists = info.Exists;
+                if (fileExists) { length = info.Length; }
             }
             catch (Exception ex)
             {
@@ -250,63 +388,38 @@ namespace Rerar.Core
                 return DeletePlan.Refuse;
             }
 
-            // 卷本身还能回收时，再看回收站自身：目录在不在、是不是被设成「不回收」、装不装得下。
-            if (notRecyclable == null)
+            // 回收站事实：只有「固定卷 + 文件真的在」才可能用到这两个值（纯函数也只在 Fixed 那一支
+            // 看它们），其余情况连查都不必查。查不出来一律按「没有回收站」处理 —— 保守方向。
+            bool hasRecycleBin = false;
+            bool quotaDocumented = false;
+            long maxCapacityMb = 0;
+            bool nukeOnDelete = false;
+            if (kind == VolumeKind.Fixed && fileExists)
             {
-                if (!HasRecycleBinFolder(root))
-                {
-                    // brief Step 3 原文判 Refuse；控制方在 fix 轮裁定从规格 §6.8 —— 该卷不可回收，
-                    // 但同卷隔离仍然可行且更有用，故走 Quarantine。
-                    notRecyclable = "该卷根目录下没有 $Recycle.Bin（外壳还没建出来，或该卷不支持回收站）；不回收";
-                }
-                else
+                hasRecycleBin = HasRecycleBinFolder(root);
+                if (hasRecycleBin)
                 {
                     Quota quota = ReadQuota(root);
-                    long limitMb = quota.Documented ? quota.MaxCapacityMb : DefaultQuotaMb;
-                    long fileMb = Mb(length);
-
-                    if (quota.NukeOnDelete)
-                    {
-                        notRecyclable = "该卷回收站被设为「删除时不回收」（NukeOnDelete=1），删除会绕过回收站；不回收";
-                    }
-                    else if (quota.Documented && quota.MaxCapacityMb <= 0)
-                    {
-                        notRecyclable = "该卷回收站配额为 0 MB（等于不回收）；不回收";
-                    }
-                    else if (length > limitMb * BytesPerMb)
-                    {
-                        if (quota.Documented)
-                        {
-                            notRecyclable = "文件 " + fileMb + " MB 超过该卷回收站配额 " + limitMb +
-                                            " MB，超配额会被永久删除而不进回收站；不回收";
-                        }
-                        else
-                        {
-                            // 注册表没有该卷的记录：配额未知，按保守默认判定，绝不假设「装得下」。
-                            notRecyclable = "读不到该卷回收站配额（按保守默认 " + limitMb + " MB 判定）：文件 " + fileMb +
-                                            " MB 超过保守默认，可能在回收站里被永久删除；不回收";
-                        }
-                    }
-                    else
-                    {
-                        reason = quota.Documented
-                            ? "该卷回收站可用（配额 " + limitMb + " MB ≥ 文件 " + fileMb + " MB）"
-                            : "该卷回收站可用（配额未知，按保守默认 " + limitMb + " MB 判定）；删除后仍需核实";
-                        return DeletePlan.Recycle;
-                    }
+                    quotaDocumented = quota.Documented;
+                    maxCapacityMb = quota.MaxCapacityMb;
+                    nukeOnDelete = quota.NukeOnDelete;
                 }
             }
 
-            // 走到这里：回收站这条路走不通（规格 §6.8 的「不满足 3/4」），唯一剩下的机制是
-            // 「同卷移动到隔离文件夹 _originals_<时间戳>\」。只有连这个都做不了时才 Refuse。
+            DeletePlan plan = DecideVolumePlan(driveType, full, fileExists, length,
+                hasRecycleBin, quotaDocumented, maxCapacityMb, nukeOnDelete, out reason);
+
+            // Recycle / Refuse 都是终局；Quarantine 只是**卷层面**的结论：还要确认「同卷移动」真的做得到。
+            if (plan != DeletePlan.Quarantine) { return plan; }
+
             string moveBlocked;
             if (!CanWriteSourceDirectory(full, out moveBlocked))
             {
-                reason = moveBlocked + "（回收站同样不可用：" + notRecyclable + "）；连同卷移动都不安全，拒绝自动处理";
+                reason = moveBlocked + "（回收站同样不可用：" + reason + "）；连同卷移动都不安全，拒绝自动处理";
                 return DeletePlan.Refuse;
             }
 
-            reason = notRecyclable + "；改用同卷隔离文件夹 _originals_<时间戳>\\（不删除）";
+            reason = reason + "；改用同卷隔离文件夹 _originals_<时间戳>\\（不删除）";
             return DeletePlan.Quarantine;
         }
 

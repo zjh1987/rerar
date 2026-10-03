@@ -147,7 +147,7 @@ internal static class TestEnv
     // brief 给的两种造法是「临时把 MaxCapacity 改小」或「如实跳过」。这里都不采用：改配额要动
     // 用户注册表（留着没恢复就是真的坑），而稀疏文件一个字节的注册表都不碰 —— 偏离理由见
     // task-9-report.md。造不出来（非 NTFS / 稀疏不支持）时抛 InvalidOperationException，
-    // 由用例打印 SKIPPED 行，绝不假 PASS。
+    // 由用例 H.Skip(name, reason) 记一条 SKIPPED（带原因、不计入 PASS），绝不假 PASS。
     //
     // H.Run 每用例前都 Cleanup()，故这里绝不静态缓存，访问时按需重建（与 TestEnv 其余 fixture 一致）。
     // ------------------------------------------------------------------
@@ -1293,7 +1293,8 @@ internal static class TestEnv
     // 未映射 UNC 是唯一能在不改机器状态的前提下得到 DRIVE_REMOTE 的办法（探针实测 GetDriveType=4）。
     //
     // 代价：`<盘符>$` 是**管理共享**，只有提权进程连得上；未提权时访问不到。此时本方法抛
-    // InvalidOperationException，用例如实打印 SKIPPED 行 —— 绝不假装测过远程卷。
+    // InvalidOperationException，用例 H.Skip(name, reason) 记一条 SKIPPED（带原因、不计入 PASS）
+    // —— 绝不假装测过远程卷。
     // ------------------------------------------------------------------
     public static string UncViewOf(string localPath)
     {
