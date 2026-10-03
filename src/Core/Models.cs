@@ -52,7 +52,20 @@ namespace Rerar.Core
         //（每个归档恰好一个对象）。为什么不让 Extractor 自己发：Task 10 的裁定是「除深度触顶外的
         // 未处理原因**没有** Results 条目（它们没被处理过，谈不上结局）」—— 那是引擎的事实；
         //「机器可读报告里必须逐项可见」是**呈现**责任，交给 CLI / Task 14 更合适，引擎语义一字不动。
-        NotAttemptedFatal
+        NotAttemptedFatal,
+
+        // 【Task 12 留下来、由 Task 14 关掉的那笔账（progress.md 明写「Task 14 must add a distinct
+        // status member for the cancelled remainder」）】「用户**取消**之后这一项还没轮到处理」。
+        //
+        // 为什么不能沿用 NotAttemptedFatal：取消**不是**致命事件。Task 12 修复轮的裁定把取消从
+        // 退出码 2 降到 1，理由正是「2 的定义是什么都没跑成，而一次被取消的运行跑过」。若把取消的
+        // 剩余项写成 NotAttemptedFatal，同一件事在两个地方有两种说法：退出码说「不致命」，
+        // 结果集说「整批中止」。用户在界面上会读到「未处理（整批中止）」——一句与事实相反的话。
+        // 这个成员**只**改标签的诚实度：结局、计数、删除资格、退出码一个字都没变。
+        //
+        // 谁发它：与 NotAttemptedFatal 同一处（Program.AddUnprocessedRemainder，CLI 与界面共用），
+        // 判据是 RunSummary.Cancelled 且**没有** FatalReason（真致命时仍然报致命——那才是事实）。
+        NotAttemptedCancelled
     }
 
     // 一个源归档的处理结果：汇总表 / 导出报告 / CLI JSON 的唯一数据源。

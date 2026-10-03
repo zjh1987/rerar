@@ -127,18 +127,25 @@ internal sealed class ReporterTests : TestBase
             ArchiveResult aborted = TestEnv.SampleResult("中止未处理.zip");
             aborted.Status = ArchiveStatus.NotAttemptedFatal; aborted.Layers = 0; aborted.Files = 0; aborted.Failed = 0;
 
-            Reporter.WriteSummary(new ArchiveResult[] { ok, bad, locked, deep, aborted }, TestEnv.TmpFile("s.txt"));
+            // 【Task 14】第 9 个成员：**取消**之后没轮到处理的项。它与「整批中止」必须分开计数与
+            // 分开措辞 —— 取消在退出码裁定里是非致命的（取消 ⇒ 1），把非致命的事说成「整批中止」
+            // 就是同一件事两种说法。这一档是 Task 12 留给 Task 14 的账，在这里当场钉住。
+            ArchiveResult cancelled = TestEnv.SampleResult("取消未处理.zip");
+            cancelled.Status = ArchiveStatus.NotAttemptedCancelled; cancelled.Layers = 0; cancelled.Files = 0; cancelled.Failed = 0;
+
+            Reporter.WriteSummary(new ArchiveResult[] { ok, bad, locked, deep, aborted, cancelled }, TestEnv.TmpFile("s.txt"));
             string s = File.ReadAllText(TestEnv.TmpFile("s.txt"), Encoding.UTF8);
 
             AssertTrue(s.Contains("成功包.zip")); AssertTrue(s.Contains("失败包.rar"));
             AssertTrue(s.Contains("加密包.7z")); AssertTrue(s.Contains("太深.zip"));
-            AssertTrue(s.Contains("中止未处理.zip"));
-            // 各类之和 == 归档总数（5 = 1+0+1+1+1+1），且分类与 CLI stdout 的汇总行逐字同形。
-            AssertTrue(s.Contains("归档总数：5（完成 1，部分失败 0，跳过 1，失败 1，未处理（深度上限）1，未处理（整批中止）1）"));
+            AssertTrue(s.Contains("中止未处理.zip")); AssertTrue(s.Contains("取消未处理.zip"));
+            // 各类之和 == 归档总数（6 = 1+0+1+1+1+1+1），且分类与 CLI stdout 的汇总行逐字同形。
+            AssertTrue(s.Contains("归档总数：6（完成 1，部分失败 0，跳过 1，失败 1，未处理（深度上限）1，未处理（整批中止）1，未处理（已取消）1）"));
             AssertTrue(s.Contains("文件总数：7，失败文件数：3"));
             AssertTrue(s.Contains("跳过（需要密码）"));        // 中文结局文案（汇总表的「结果」列）
             AssertTrue(s.Contains("未处理（深度上限）"));
             AssertTrue(s.Contains("未处理（整批中止）"));
+            AssertTrue(s.Contains("未处理（已取消）"));        // 取消**绝不**与「整批中止」共用一行文案
             AssertFalse(s.Contains("\uFFFD")); });
 
         // ---- 枚举里**每一个**结局都要有自己的中文文案（漏一个就会在表里露出英文枚举名）----
@@ -155,7 +162,7 @@ internal sealed class ReporterTests : TestBase
         //   4) 各成员文案两两不同（两个结局在表里长得一样，读者就分不出它们的区别）。
         H.Run("Reporter.TableLabelsEveryArchiveStatus", delegate {
             ArchiveStatus[] statuses = (ArchiveStatus[])Enum.GetValues(typeof(ArchiveStatus));
-            AssertTrue(statuses.Length >= 8);   // 7 个原有成员 + NotAttemptedFatal；少一个说明枚举被改小了
+            AssertTrue(statuses.Length >= 9);   // 7 个原有成员 + 致命中止 + Task 14 的取消未处理；少一个说明枚举被改小了
 
             ArchiveResult[] list = new ArchiveResult[statuses.Length];
             for (int i = 0; i < statuses.Length; i++)
@@ -223,6 +230,8 @@ internal sealed class ReporterTests : TestBase
             case ArchiveStatus.Failed: return "失败";
             case ArchiveStatus.NotAttemptedDepthLimit: return "未处理（深度上限）";
             case ArchiveStatus.NotAttemptedFatal: return "未处理（整批中止）";
+            // Task 14：取消后的剩余项 —— 与「整批中止」文案必须不同（用例还会断言两两不同）。
+            case ArchiveStatus.NotAttemptedCancelled: return "未处理（已取消）";
         }
         return null;
     }

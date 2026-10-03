@@ -82,6 +82,7 @@ namespace Rerar.Core
             List<ArchiveResult> list = new List<ArchiveResult>(Enumerate(results));
 
             int completed = 0, partial = 0, skipped = 0, failed = 0, notAttemptedDepthLimit = 0, notAttemptedFatal = 0;
+            int notAttemptedCancelled = 0;
             int files = 0, fileFailures = 0;
             // 刻意不写 default：枚举里不存在的值（后续任务可能新增成员）不进任何一类 ——
             // 它照样会出现在下面的表格里，计数不会骗人，只是各类之和可能小于归档总数。
@@ -104,6 +105,10 @@ namespace Rerar.Core
                     case ArchiveStatus.Failed: failed++; break;
                     case ArchiveStatus.NotAttemptedDepthLimit: notAttemptedDepthLimit++; break;
                     case ArchiveStatus.NotAttemptedFatal: notAttemptedFatal++; break;
+                    // Task 14：取消后的剩余项**单列一档**。取消不是致命错误（退出码裁定见
+                    // Models.cs 的 NotAttemptedCancelled），把它并进「整批中止」就是在报告里
+                    // 把一件非致命的事说成致命的事。
+                    case ArchiveStatus.NotAttemptedCancelled: notAttemptedCancelled++; break;
                 }
                 files += r.Files;
                 fileFailures += r.Failed;
@@ -113,7 +118,7 @@ namespace Rerar.Core
             sb.Append("Rerar 解压汇总\r\n");
             // 计数行的形状与 CLI stdout 的汇总行**逐字一致**（Program.PrintSummary）：同一份报告
             // 不管从 TXT 导出还是从无头 stdout 看，读者读到的分类与数字都是同一套。
-            // 「未处理」拆成两档（深度上限 / 整批中止），各类之和因此**恒等于**归档总数。
+            // 「未处理」拆成三档（深度上限 / 整批中止 / 已取消），各类之和因此**恒等于**归档总数。
             sb.Append("归档总数：").Append(Int(list.Count))
               .Append("（完成 ").Append(Int(completed))
               .Append("，部分失败 ").Append(Int(partial))
@@ -121,6 +126,7 @@ namespace Rerar.Core
               .Append("，失败 ").Append(Int(failed))
               .Append("，未处理（深度上限）").Append(Int(notAttemptedDepthLimit))
               .Append("，未处理（整批中止）").Append(Int(notAttemptedFatal))
+              .Append("，未处理（已取消）").Append(Int(notAttemptedCancelled))
               .Append("）\r\n");
             sb.Append("文件总数：").Append(Int(files))
               .Append("，失败文件数：").Append(Int(fileFailures))
@@ -176,7 +182,11 @@ namespace Rerar.Core
         // 搞崩；任何**具名成员**走到那一行都是缺陷。这条不再靠人眼把关：
         // ReporterTests.TableLabelsEveryArchiveStatus 迭代 Enum.GetValues，逐个成员断言文案非空且
         // **不等于**枚举名 —— 新增成员不补文案就当场变红。
-        private static string StatusText(ArchiveStatus status)
+        //
+        // 【Task 14 起它是 public】界面（src\App\MainForm.cs）的逐项列表也要显示同一套结局文案。
+        // 让它 public 是**为了避免两张表**：界面自己再写一份 switch 的话，同一个结局在两处可以
+        // 长得不一样，而用户会同时看到这两处（详情列表与导出的报告）。一处定义、两处消费。
+        public static string StatusText(ArchiveStatus status)
         {
             switch (status)
             {
@@ -194,6 +204,10 @@ namespace Rerar.Core
                 // 这条不再靠人眼：ReporterTests.TableLabelsEveryArchiveStatus 迭代 Enum.GetValues
                 // 逐个成员断言「有文案、且不等于枚举名」，将来新增成员会当场变红。
                 case ArchiveStatus.NotAttemptedFatal: return "未处理（整批中止）";
+
+                // 【Task 14】取消是**非致命**事件（退出码裁定：取消 ⇒ 1，不是 2）。它的剩余项
+                // 绝不与「整批中止」共用一行文案 —— 那会把用户读到的事实说反。
+                case ArchiveStatus.NotAttemptedCancelled: return "未处理（已取消）";
             }
 
             // 兜底：只该被「枚举外的非法数值」命中；任何具名成员走到这里都是缺陷（见方法头注释）。

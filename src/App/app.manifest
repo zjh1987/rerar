@@ -1,0 +1,55 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Rerar 应用清单（Task 14；规格 §6.1 / 研究 J2、J15、I7、F4）。
+
+  三个声明各有硬理由，一条都不能少：
+
+  1) requestedExecutionLevel level="asInvoker"（审计 J2 / 研究 J2）
+     **绝不请求提权**。提权之后 Windows 的 UIPI 会**静默**拦截资源管理器送来的拖放消息
+     （WM_DROPFILES / OLE 拖放）：用户拖了半天，窗口毫无反应，**连一个错误都没有**。
+     所以正确做法不是「提权后想办法拖放」，而是根本不提权 —— 拖放失效时界面上还有与它
+     同等显眼的「选择文件夹…」「选择压缩包…」按钮（启动时还会检测已提权并显示常驻横幅）。
+     注意 csc 不给 manifest 时也会自动生成 asInvoker，这里显式写出来是为了让它成为**被声明**的
+     契约（用例 Gui.ManifestDeclaresPerMonitorV2AndAsInvoker 逐字断言它，并断言不含
+     requireAdministrator / highestAvailable）。
+
+  2) dpiAwareness PerMonitorV2 + dpiAware true/pm（审计 J15）
+     150% 缩放下不模糊、不错位；跨不同 DPI 的显示器拖动时重新布局。
+
+  3) longPathAware true（研究 F4）
+     深层嵌套解压出来的路径很容易超过 MAX_PATH(260)。清单里声明之后，Win10 1607+ 上
+     .NET Framework 的路径处理才能拿到长路径（AppContext 开关 / 枚举用 \\?\ 前缀是另一回事，
+     那些是 Core 的既有实现）。这是「长路径不对称性」（V24）在**打包层**的那一半对策。
+
+  这里刻意**不**声明任何 requestedExecutionLevel 之外的 privileges、不注册任何 COM、
+  不引入任何扩展点：一个解不可信压缩包的工具，攻击面越小越好。
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="Rerar.app" type="win32" />
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 7 / 8 / 8.1 / 10 / 11：声明支持哪些系统，免得被当成「不认识的旧程序」套兼容垫片。 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

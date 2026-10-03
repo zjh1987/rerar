@@ -24,6 +24,14 @@
 //（修复轮 Finding 3 的控制方裁定）：CLI 是真进程，测试够不着进程内的 Journal.Root 接缝，有了它
 // 就不必再去真实的 %LOCALAPPDATA%\Rerar 里删自己写下的文件。它同时也是可移植 / 调试运行的正规用法。
 //
+// 【Task 14：本文件多了三件事】
+//   1) `[STAThread]` —— WinForms 要求主线程 STA；无头 CLI 走同一入口，STA 对它无害；
+//   2) 无参数即起界面（Application.Run(new MainForm())）—— 界面本身全在 MainForm.cs，这里只管入口；
+//   3) 带 `--cli` 时先尝试接管父控制台（AttachConsole）：winexe 从终端手敲时没有父控制台，
+//      Console.WriteLine 会凭空消失（重定向不受影响，所以验收脚本一直是对的）。
+//      判定只看标准输出**句柄的类型**：管道/文件（脚本）一个字节都不动，字符设备/无句柄才接管；
+//      没有父控制台时行为与今天完全一致（输出丢弃、不抛异常、退出码不受影响，--json-out 照旧落盘）。
+//
 // 【凭据卫生】密码只经 RunOptions 交给 Extractor，绝不写进 stdout / stderr / JSON / 日志
 //（Task 10 只记「候选序号 + 来源类别」）。需要如实说明的一点：`--password` 在命令行上对同机其它
 // 进程是**可见**的（它们能读到自己进程的命令行），这是「无头驱动面」这个形状本身的代价，
@@ -41,7 +49,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows.Forms;
 using Rerar.Core;
 
 namespace Rerar
@@ -61,12 +71,30 @@ namespace Rerar
             "用法：Rerar.exe --cli --target <路径> [--target <路径>...] [--delete] [--password <密码>] " +
             "[--dict <字典文件>] [--depth <层数>] [--json-out <报告文件>]";
 
+        // 【STAThread 是必须的（Task 14 的控制方要求 1）】WinForms 要求主线程是 STA：不是的话
+        // OLE 拖放 / 通用文件对话框（COM）会以各种奇怪的方式不工作（拖放注册失败、对话框不响应）。
+        // 无头 CLI 走同一个入口，STA 对它完全无害（它不碰 COM）。
+        [STAThread]
         private static int Main(string[] args)
         {
-            // 先接管标准输出：无头模式的输出必须是确定性 UTF-8（理由见 UseUtf8Stdio）。
-            UseUtf8Stdio();
-
             if (args == null) { args = new string[0]; }
+
+            // 【控制方要求 2：交互式 CLI 的输出必须看得见】/target:winexe 的进程 PE 子系统是 GUI，
+            // 从终端手敲 `Rerar.exe --cli …` 时它没有连着父控制台，Console.WriteLine 的输出就没地方去
+            //（重定向时不受影响 —— 那正是验收脚本一直能跑通的原因）。所以带 --cli 时先尝试接管父控制台。
+            //
+            // 关键约束：**绝不能碰重定向**。判定用的是「标准输出句柄的类型」而不是猜：
+            //   * 管道 / 文件（所有脚本、所有验收测试）⇒ 已经是有效句柄，**一个字节都不改**；
+            //   * 字符设备 / 没有句柄（终端手敲的典型形状）⇒ 尝试 AttachConsole；
+            //   * 本来就连着控制台 ⇒ 什么都不做。
+            // 接管成功之后**不**再把标准流接管成 UTF-8（见 ConfigureStdio）：写 UTF-8 字节到一个
+            // CP936 的控制台上，用户看到的中文就是乱码 —— 那种情形要用控制台自己的代码页。
+            bool consoleAttached = false;
+            bool wantCli = Array.IndexOf(args, "--cli") >= 0;
+            if (wantCli) { consoleAttached = TryAttachParentConsole(); }
+
+            // 接管标准输出（重定向 / 无头模式的输出必须是确定性 UTF-8，理由见 UseUtf8Stdio）。
+            ConfigureStdio(consoleAttached);
 
             // 构建骨架的契约（tests\smoke.ps1）：打印 version=<n> 并以 0 退出。
             // 它是「这个 exe 能不能跑」的自检，带不带 --cli 都成立，也不该被别的开关影响。
@@ -76,14 +104,98 @@ namespace Rerar
                 return ExitSuccess;
             }
 
-            if (Array.IndexOf(args, "--cli") < 0)
+            if (!wantCli)
             {
-                // 界面模式：Task 14 的 MainForm 落地后这里接 Application.Run(new MainForm())。
-                // 本任务不含界面代码，故保持「无参数即静默成功」的既有行为，也不引入 WinForms 依赖。
-                return ExitSuccess;
+                // 界面模式：Task 14 的 MainForm 就从这里起（无参数双击即是它）。
+                return RunGui();
             }
 
             return RunCli(args);
+        }
+
+        // ------------------------------------------------------------------
+        // 界面入口（Task 14）
+        // ------------------------------------------------------------------
+
+        // 起界面。构造函数里的任何意外都在这里收口：**绝不让一个异常静默吞掉整个进程**
+        //（双击没反应是最难排查的一类故障），而是弹一条中文对话框并以退出码 2 结束。
+        private static int RunGui()
+        {
+            try
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new MainForm());
+                return ExitSuccess;
+            }
+            catch (Exception ex)
+            {
+                string detail = "界面无法启动（" + ex.GetType().Name + "：" + ex.Message + "）：" +
+                    "可以改用命令行模式 Rerar.exe --cli --target <路径>";
+                try { MessageBox.Show(detail, "Rerar", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                catch (Exception) { }
+                Console.Error.WriteLine("错误：" + detail);
+                return ExitFatal;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 父控制台接管（控制方要求 2）
+        // ------------------------------------------------------------------
+
+        private const uint AttachParentProcess = 0xFFFFFFFF;
+        private const int StdOutputHandle = -11;
+        private const uint FileTypeUnknown = 0x0000;
+        private const uint FileTypeChar = 0x0002;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetFileType(IntPtr hFile);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        // 尝试接管**父**进程的控制台。返回 true = 现在真的连着一个控制台。
+        //
+        // 【没有任何父控制台时怎么办（控制方要求回答的问题）】AttachConsole 返回 false
+        //（实测错误码 ERROR_INVALID_HANDLE 6 / ERROR_ACCESS_DENIED 5），于是：
+        //   * 进程行为与今天**完全一致**：Console 拿不到有效句柄，写入被静默丢弃（Stream.Null），
+        //     既不抛异常也不写乱码；
+        //   * 退出码不受影响 —— 「输出看不见」绝不能被读成「这次运行失败了」；
+        //   * 机器读的那条路仍然完整：--json-out 照旧落盘（它写文件，与控制台无关），
+        //     退出码照旧是 0/1/2。这也是 Task 12 把「无头驱动面」设计成文件 + 退出码的原因。
+        private static bool TryAttachParentConsole()
+        {
+            try
+            {
+                // 已经连着控制台（例如从某些启动器起）：不做任何事，免得把标准句柄搞乱。
+                if (GetConsoleWindow() != IntPtr.Zero) { return true; }
+
+                IntPtr handle = GetStdHandle(StdOutputHandle);
+                uint type = FileTypeUnknown;
+                if (handle != IntPtr.Zero && handle != new IntPtr(-1)) { type = GetFileType(handle); }
+
+                // 管道(3) / 磁盘文件(1)：重定向。**绝不接管** —— 那会把脚本的管道输出变成控制台输出，
+                // 于是 TestEnv.RunCli / tests\smoke.ps1 / tests\acceptance.ps1 全都会读不到东西。
+                if (type != FileTypeUnknown && type != FileTypeChar) { return false; }
+
+                if (!AttachConsole(AttachParentProcess)) { return false; }
+
+                // 接管成功后先空一行：控制台里光标通常停在 shell 的提示符后面，直接输出会和提示符粘在
+                // 一起（cmd 不等 GUI 进程，提示符已经打出来了）。脚本路径不会走到这里。
+                Console.WriteLine();
+                return true;
+            }
+            catch (Exception)
+            {
+                // 接管失败绝不是致命错误：输出看不见 ≠ 这次运行没跑成。
+                return false;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -237,7 +349,7 @@ namespace Rerar
 
             // 致命中止之后**没轮到处理**的候选也补进结果集（修复轮 Finding 1 的控制方裁定）：
             // 机器读方只读 --json-out 时，否则会完全看不到这部分。
-            AddFatalUnprocessedRemainder(summary);
+            AddUnprocessedRemainder(summary);
 
             PrintSummary(summary);
 
@@ -268,7 +380,34 @@ namespace Rerar
         // 崩溃恢复日志根（进程级覆盖；修复轮 Finding 3）
         // ------------------------------------------------------------------
 
-        // 应用日志根覆盖并**如实报出有效根**。
+        // 应用环境变量覆盖（**唯一实现**，CLI 与界面共用）。
+        //
+        // 【为什么界面也要认它（Task 14 补）】这个覆盖的定义是「**进程级**」（Task 12 修复轮的裁定），
+        // 而界面模式与 CLI 是同一个进程 —— 界面不认它，这条定义就不成立。补上之后有两件实际好处：
+        //   * 可移植 / 调试运行：把恢复日志指到一个指定目录，两种模式行为一致；
+        //   * 测试与人工验证不必往真实的 %LOCALAPPDATA%\Rerar\journal 里写东西（界面模式下
+        //     Journal 由 Core 的 Extractor 打开，落点是生产默认根）。
+        // 返回 true = 确实覆盖了（调用方据此决定要不要把有效根印出来）。
+        internal static bool TryApplyJournalRootOverride()
+        {
+            try
+            {
+                string overridden = Environment.GetEnvironmentVariable(JournalRootVariable);
+                // 空串按「没有设置」处理：绝不让一个空值把日志根变成当前目录。
+                if (!string.IsNullOrEmpty(overridden))
+                {
+                    Journal.Root = overridden;
+                    return true;
+                }
+            }
+            catch (Exception)
+            {
+                // 读环境变量失败（极罕见）：沿用生产默认根，绝不因此中断。
+            }
+            return false;
+        }
+
+        // 如实报出有效根（人读面）。
         //
         // 为什么把有效的根印出来（而不是只写进日志）：用例要证明「没设变量时仍然用生产默认根」，
         // 而**那个分支不能真的去写真实日志根**（真实根在用户的 %LOCALAPPDATA% 下）—— 于是那条
@@ -278,9 +417,7 @@ namespace Rerar
         {
             try
             {
-                string overridden = Environment.GetEnvironmentVariable(JournalRootVariable);
-                // 空串按「没有设置」处理：绝不让一个空值把日志根变成当前目录。
-                if (!string.IsNullOrEmpty(overridden)) { Journal.Root = overridden; }
+                TryApplyJournalRootOverride();
 
                 Console.WriteLine("崩溃恢复日志根：" + Journal.Root +
                     "（可用环境变量 " + JournalRootVariable + " 覆盖）");
@@ -376,23 +513,32 @@ namespace Rerar
         // 未处理剩余项 → 结果集（修复轮 Finding 1）
         // ------------------------------------------------------------------
 
-        // 致命中止之后**没轮到处理**的候选（RunSummary.NotAttempted 里没有 Results 条目的那一部分）
-        // 合成为结果对象，于是 --json-out 里**每个归档恰好一条**，只读 JSON 的机器读方也看得见
-        // 「这一批还有哪些归档根本没被处理过」。
+        // 致命中止 / 取消之后**没轮到处理**的候选（RunSummary.NotAttempted 里没有 Results 条目的
+        // 那一部分）合成为结果对象，于是 --json-out 里**每个归档恰好一条**，只读 JSON 的机器读方
+        // 也看得见「这一批还有哪些归档根本没被处理过」。界面的逐项列表**复用同一份合成**
+        //（MainForm 直接调它）—— 两处各写一遍的话，「不重复计数」这条规则就有了两个实现。
         //
-        // 为什么不谎报原因：合成的状态是 ArchiveStatus.NotAttemptedFatal（Task 12 修复轮新增的成员，
-        // 加法、不破坏任何按名字匹配的消费方），判词里写明真正的致命原因。绝不复用
-        // NotAttemptedDepthLimit —— 那会把「盘满/取消」谎报成「深度触顶」。
+        // 为什么不谎报原因：合成的状态按事实分两种（Task 12 的 NotAttemptedFatal，与 Task 14 新增的
+        // NotAttemptedCancelled），判词里写明真正的原因。绝不复用 NotAttemptedDepthLimit ——
+        // 那会把「盘满/取消」谎报成「深度触顶」；也绝不用「整批中止」去说一次**取消**
+        //（取消在退出码裁定里是非致命的，同一件事不能有两种说法）。
         //
         // 绝不重复发：深度触顶的那一项在 Results 里**已经**有 NotAttemptedDepthLimit 条目，
         // 这里按路径匹配跳过它（两个集合各自都含它，但对象只有一个）。
-        private static void AddFatalUnprocessedRemainder(RunSummary summary)
+        internal static void AddUnprocessedRemainder(RunSummary summary)
         {
             if (summary == null || summary.NotAttempted == null) { return; }
 
+            // 致命原因非空 ⇒ 事实就是「整批因致命错误中止」；只有**取消**（且没有致命原因）才是
+            // 那个非致命的剩余项。两者同时成立时如实报致命 —— 那才是真正的肇因。
+            bool cancelled = summary.Cancelled && string.IsNullOrEmpty(summary.FatalReason);
+            ArchiveStatus status = cancelled
+                ? ArchiveStatus.NotAttemptedCancelled
+                : ArchiveStatus.NotAttemptedFatal;
+
             string reason = !string.IsNullOrEmpty(summary.FatalReason)
                 ? "整批因致命错误中止：" + summary.FatalReason
-                : (summary.Cancelled ? "本次运行已被取消" : "整批已中止（原因未记录）");
+                : (cancelled ? "本次运行已被取消" : "整批已中止（原因未记录）");
 
             foreach (string path in summary.NotAttempted)
             {
@@ -401,7 +547,7 @@ namespace Rerar
 
                 ArchiveResult synthesized = new ArchiveResult();
                 synthesized.Path = path;
-                synthesized.Status = ArchiveStatus.NotAttemptedFatal;
+                synthesized.Status = status;
                 synthesized.Layers = 0;          // 没开始过：计数器一律 0，绝不编造层数 / 文件数
                 synthesized.Files = 0;
                 synthesized.Failed = 0;
@@ -437,6 +583,7 @@ namespace Rerar
             Console.WriteLine("----");
 
             int total = 0, completed = 0, partial = 0, skipped = 0, failed = 0, depthLimit = 0, fatalUnprocessed = 0;
+            int cancelledUnprocessed = 0;
             if (summary.Results != null)
             {
                 total = summary.Results.Count;
@@ -453,6 +600,9 @@ namespace Rerar
                         case ArchiveStatus.Failed: failed++; break;
                         case ArchiveStatus.NotAttemptedDepthLimit: depthLimit++; break;
                         case ArchiveStatus.NotAttemptedFatal: fatalUnprocessed++; break;
+                        // Task 14：取消后的剩余项单列一档（取消是非致命的，绝不并进「整批中止」）。这一行
+                        // 与 Reporter.WriteSummary 的计数行**逐字同形**（ReporterTests 钉住这一点）。
+                        case ArchiveStatus.NotAttemptedCancelled: cancelledUnprocessed++; break;
                     }
                 }
             }
@@ -463,7 +613,8 @@ namespace Rerar
                 "，跳过 " + Int(skipped) +
                 "，失败 " + Int(failed) +
                 "，未处理（深度上限）" + Int(depthLimit) +
-                "，未处理（整批中止）" + Int(fatalUnprocessed) + "）");
+                "，未处理（整批中止）" + Int(fatalUnprocessed) +
+                "，未处理（已取消）" + Int(cancelledUnprocessed) + "）");
 
             // 【控制方裁定 1】未处理数量 = RunSummary.NotAttempted.Count —— **唯一权威**的「没处理」清单，
             // 与原因无关（深度触顶、致命中止后没轮到的候选都在里面）。绝不与 Results 相加：
@@ -580,8 +731,14 @@ namespace Rerar
         //     —— 实测中文会变成 GBK 字节，按 UTF-8 读回的脚本直接得到乱码；
         //   * 所以这里直接接管两个标准流。句柄无效时 Console.OpenStandard* 返回 Stream.Null，
         //     相应的写入被静默丢弃 —— 不抛异常、也不写乱码（无参数启动的界面模式正是这种情形）。
-        private static void UseUtf8Stdio()
+        //
+        // 【Task 14：连上真控制台时**不**接管】接管之后写出去的是 UTF-8 字节，而控制台按它自己的
+        // 输出代码页（中文系统默认 936）解释这些字节 —— 用户看到的中文会是乱码。所以只有
+        //「重定向 / 没有控制台」这条路径才接管，真控制台交给 Console 自己按控制台代码页去写。
+        private static void ConfigureStdio(bool consoleAttached)
         {
+            if (consoleAttached) { return; }
+
             try
             {
                 UTF8Encoding utf8 = new UTF8Encoding(false);

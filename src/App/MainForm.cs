@@ -1,0 +1,3192 @@
+﻿// Rerar 主窗口（Task 14）：界面形态 A（规格 §6.1）。
+//
+// ============================================================================================
+// 【这是一层薄壳 —— 请先读这段再读代码】
+// 全部业务逻辑都在 src\Core，而且已经被独立复核过：解压顺序（Sniffer → 分卷 → 索引 → 门控 →
+// 预检 → 密码 → 暂存 → 解压 → 校验 → 提交 → 可选删除）、五条不变式、密码阶梯、回收站资格判定、
+// 崩溃恢复日志，**一条都不在这里重做**。本文件只做三件事：
+//   1) 收集输入与选项（原样映射到 RunOptions），并按 RunOptions 的既有语义配置它们；
+//   2) 把 IProgressSink 的回调**防御性编组**到 UI 线程后显示（回调绝不许抛）；
+//   3) 把 RunSummary / ArchiveResult 如实呈现 —— 绝不改写任何结局、绝不自己判成功。
+// 「未处理」的数量只取自 RunSummary.NotAttempted（**权威清单**），绝不与 Results 相加：
+// 深度触顶那一项同时出现在两个集合里，相加就是同一件事数两遍。逐项列表里也是同一个对象，
+// 只显示一次（未处理剩余项的合成复用 Program.AddUnprocessedRemainder，不另写一份）。
+//
+// ============================================================================================
+// 【本文件落地的审计裁决（UI/UX 复核；每条都写在它对应的代码旁边）】
+//   * 绝不提权：app.manifest 是 asInvoker，启动时检测已提权则显示**常驻非模态横幅**（J2）。
+//     理由：提权后 Windows UIPI 会**静默**拦截资源管理器的拖放 —— 用户拖了、窗口毫无反应、没有
+//     任何报错。所以「选择文件夹…／选择压缩包…」两个按钮做成与拖放区同等显眼、可键盘操作，
+//     始终可用的那条路不能是藏起来的那条。
+//   * 删除默认关（A5 / 不变式 I3）：独立的红色「危险操作」区、措辞写明后果、二次确认里报出
+//     **确切数量**、且**不默认聚焦确定按钮**（AcceptButton 为空）。
+//   * 密码是**停靠式非模态面板**（J6），绝不从工作线程弹模态框（那会阻塞该线程、对话框还可能
+//     落到主窗后面，整批停滞）。三个动作：仅此压缩包 / 本次运行全部记住 / 跳过此压缩包。
+//     跳过的包记为「跳过（需要密码）」，「不是失败」。
+//   * 两阶段进度（J1）：扫描期 Marquee + 「已发现 N 个压缩包」（数量是事实，未知工作的百分比是
+//     谎话）；解压期定值，分母是**已发现的工作量**。只显示「已用时间」；ETA 标「粗略」且满 3 个
+//     归档后才出现。
+//   * 日志绝不冻结界面（J4）：完整日志流式写文件（可「打开日志文件」）；界面只画尾部 ~2000 行的
+//     **自绘虚拟化**视图（只绘制可见行）；UI 刷新**合并到 200ms 一次**（绝不逐行 append，也绝不
+//     用 TextBox/ListBox 存日志）；另有「自动滚动」开关 —— 用户往上翻的时候日志一直往下跳本身
+//     就是个 bug。
+//   * 逐项动作（§6.1）：强制按压缩包尝试（映射到 RunOptions.ForceTreatAsArchive）/ 输入密码 /
+//     重试 / 打开输出目录。
+//   * FormClosing 三选一（J7）：继续在后台运行（最小化到通知区域）/ 取消任务并退出 / 返回。
+//     长任务默认「继续在后台运行」；绝不静默丢下一个还在跑的批次。
+//   * .lnk 解析并**显式展示**（J8）：拖进来的快捷方式给到的是 .lnk 路径，不解析的话用户只会看到
+//     「不是有效压缩包」。解析失败是**逐项告警**，不是崩溃。
+//   * 空状态写明「原件默认保留」（J11）+ 一句话说清这个工具做什么；高级选项默认折叠。
+//   * 长任务期间阻止睡眠（G5：SetThreadExecutionState），结束/取消时清除。
+//   * 完成时通知（J14）：FlashWindowEx + 托盘气泡 + **非模态**结果面板（不抢焦点）。
+//   * 窗口几何与上次目录存到 %APPDATA%，原子写（临时文件 + 替换），加载时校验目录仍然存在。
+//   * 字体显式 Microsoft YaHei UI（回退 Microsoft YaHei → SimSun），AutoScaleMode.Dpi，
+//     布局一律 TableLayoutPanel / FlowLayoutPanel，**没有一处绝对坐标**。
+//   * **刻意不做暗色主题**：WinForms 不跟随系统主题，做一半的暗色（黑底黑字）比不做更糟。
+//   * 刻意不做：向导、动画、托盘常驻、导出报告按钮（YAGNI；规格没要求，审计里那半条另记）。
+//
+// C# 5 语法；源码一律 UTF-8 带 BOM。窗口布局用 TableLayoutPanel/FlowLayoutPanel，无绝对坐标。
+// ============================================================================================
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using Rerar.Core;
+
+namespace Rerar
+{
+    internal sealed class MainForm : Form
+    {
+        // ------------------------------------------------------------------
+        // 契约常量（用例按名字/数值钉住其中的一部分）
+        // ------------------------------------------------------------------
+
+        // J4：界面里只保留尾部这么多行（完整日志在文件里）。
+        internal const int LogTailLines = 2000;
+
+        // J4：UI 刷新合并窗口 150–250ms。一次 Tick 同时刷新进度、日志与列表，于是无论 Core 回调
+        // 多密集（几百个包 × 每个几十行 = 几十万行），UI 每秒最多被碰 5 次。
+        internal const int UiCoalesceMs = 200;
+
+        // J1：满 3 个归档才出现 ETA，且必须标「粗略」。
+        internal const int EtaMinimumCompleted = 3;
+
+        // J3：30 秒没有任何进度信号就明说「正在处理大文件」，免得与假死无法区分。
+        private const int HeartbeatSeconds = 30;
+
+        // 界面设置的进程级覆盖（与 TestEnv/SettingsPathVariable 同名）：测试靠它把落点挪到临时目录，
+        // 于是界面用例构造真的 MainForm 时既不读也不写真实的 %APPDATA%\Rerar。
+        private const string SettingsPathVariable = "RERAR_SETTINGS_PATH";
+
+        // J11 的空状态文案：一句话说清做什么 + **明确写出原件默认保留**（安全路径要是显而易见的那条）。
+        internal const string EmptyStateText =
+            "自动找出多层嵌套的压缩包并解压（含伪装后缀、分卷、常用密码字典）。\r\n" +
+            "原件默认保留：不勾选下面的「解压成功后删除原包」，就一个原包都不会被处置。\r\n" +
+            "把压缩包或文件夹拖到这里，或点上面的「选择文件夹…」「选择压缩包…」。";
+
+        // ------------------------------------------------------------------
+        // 控件（Name 是契约：用例按名字找 dropZone / chkDelete / grpDanger …）
+        // ------------------------------------------------------------------
+
+        private TableLayoutPanel _root;
+        private Label _lblElevation;
+        private Panel _dropZone;
+        private Label _lblDropHint;
+        private Button _btnPickFolder;
+        private Button _btnPickFiles;
+        private Label _lblEmptyState;
+        private Label _lblInputs;
+        private ListView _lstInputs;
+        private Label _lblEngineInfo;
+
+        private FlowLayoutPanel _panelOptions;
+        private CheckBox _chkCamouflage;
+        private CheckBox _chkVolumes;
+        private CheckBox _chkDict;
+        private GroupBox _grpDanger;
+        private CheckBox _chkDelete;
+        private Button _btnAdvanced;
+        private Panel _panelAdvanced;
+        private Label _lblPasswordHint;
+        private TextBox _txtPassword;
+        private CheckBox _chkRememberRun;
+        private Button _btnLoadDict;
+        private Label _lblDict;
+        private NumericUpDown _numDepth;
+
+        private FlowLayoutPanel _panelActions;
+        private Button _btnStart;
+        private Button _btnCancel;
+        private Panel _panelProgress;
+        private ProgressBar _progressBar;
+        private Label _lblProgress;
+        private Panel _panelStatus;
+        private Label _lblStatus;
+        private FlowLayoutPanel _panelCounters;
+        private Label _lblCounters;
+        private Button _btnDetails;
+
+        private Panel _panelPasswordAsk;
+        private Label _lblPasswordAsk;
+        private TextBox _txtPasswordAsk;
+        private Button _btnPwThisOnly;
+        private Button _btnPwRememberAll;
+        private Button _btnPwSkip;
+
+        private Panel _panelDetails;
+        private FlowLayoutPanel _panelLogTools;
+        private Button _btnOpenLog;
+        private CheckBox _chkAutoScroll;
+        private Label _lblLogHint;
+        private ListView _lstItems;
+        private FlowLayoutPanel _panelItemActions;
+        private Button _btnForceArchive;
+        private Button _btnEnterPassword;
+        private Button _btnRetry;
+        private Button _btnOpenOutput;
+        private ContextMenuStrip _itemMenu;
+        private LogTailView _logView;
+
+        private NotifyIcon _tray;
+        private System.Windows.Forms.Timer _uiTimer;
+
+        // ------------------------------------------------------------------
+        // 状态
+        // ------------------------------------------------------------------
+
+        private readonly AppSettings _settings;
+        // 规范化全路径去重（J9：重复拖入同一项不该变成两行）。
+        private readonly HashSet<string> _seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> _inputs = new List<string>();          // 交给 Extractor 的候选文件
+        private readonly Dictionary<string, int> _inputRowOf = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> _retryQueue = new List<string>();
+        private readonly HashSet<string> _forcedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _perItemPassword = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private string _dictPath;
+        private string _pendingPasswordPath;
+        private int _scanRemaining;
+        private int _scanFound;
+        private CancellationTokenSource _scanCts;
+        private bool _nextBatchOnly;         // J10：运行中拖进来的项进「下一批」
+
+        private bool _running;
+        private CancellationTokenSource _runCts;
+        private RunOptions _options;
+        private LogSink _log;
+        private Stopwatch _watch;
+        private TimeSpan _lastElapsed;
+        private int _discoveredAtStart;
+        // 进度计数：由工作线程写、UI 线程读。放在一个普通对象上，而不是直接放窗体上 ——
+        // Form 继承自 MarshalByRefObject，对它自己的字段取 ref（Interlocked 需要）会得到 CS0197
+        //（跨应用域取地址可能抛异常）。计数对象是普通引用，Interlocked 用得干净。
+        private sealed class ProgressCounters
+        {
+            public int Started;
+            public int Finished;
+        }
+
+        private readonly ProgressCounters _counters = new ProgressCounters();
+        private string _currentMember = "";
+        private long _lastSignalTicks;
+        private DateTime _cancelRequestedAt = DateTime.MinValue;
+        private bool _exitWhenDone;
+        private bool _allowClose;
+        private string _runWidePassword = "";
+
+        private readonly object _pendingGate = new object();
+        private readonly List<ArchiveResult> _pendingResults = new List<ArchiveResult>();
+        private List<ArchiveResult> _results = new List<ArchiveResult>();
+        private int _unprocessedCount;
+        private List<ArchiveResult> _rows = new List<ArchiveResult>();
+        // _results 里已经“过账”到逐项列表的下标（增量追加用，见 RefreshItems）。
+        private int _itemsBuilt;
+        private bool _logDirty;
+        private bool _itemsDirty;
+
+        public MainForm()
+        {
+            _uiThreadId = Thread.CurrentThread.ManagedThreadId;   // 编组判据（见 UiPost）
+            _settings = new AppSettings(AppSettings.DefaultFilePath);
+            _settings.Load();
+
+            // 恢复日志根的**进程级**覆盖（RERAR_JOURNAL_ROOT）：界面模式与 CLI 是同一个进程，这条
+            // 覆盖必须两种模式都认（否则「进程级」就不成立）。界面模式不往控制台打印任何东西。
+            Program.TryApplyJournalRootOverride();
+
+            BuildUi();
+            ApplySettings();
+            DetectElevation();
+        }
+
+        // 建窗体的那个线程就是 UI 线程。UiPost 靠它（而不是 Control.InvokeRequired）判断该就地执行
+        // 还是 BeginInvoke —— 没有句柄时 InvokeRequired 会返回 false，那会把界面动作放到工作线程上跑。
+        private readonly int _uiThreadId;
+
+        // ==================================================================
+        // 构造与静态纯函数（用例直接断言这一批）
+        // ==================================================================
+
+        // 字体：显式中文字体 + 回退链（J15）。**绝不**依赖系统默认字体（那样在非中文系统上会
+        // 变成一个没有中文字形的字体，界面上全是方框）。
+        internal static string PickFontFamily()
+        {
+            string family = PickFirstInstalledFamily(new string[] { "Microsoft YaHei UI", "Microsoft YaHei", "SimSun" });
+            if (family.Length > 0) { return family; }
+
+            // 三个都没有（例如极简的系统）：退回 WinForms 的默认界面字体，并如实接受这个结果 ——
+            // 宁可字体不好看，也不要一个装不上的字体名让整个窗口起不来。
+            try { return Control.DefaultFont.Name; }
+            catch (Exception) { return "Microsoft Sans Serif"; }
+        }
+
+        // 从候选链里挑第一个**真的装上**的字体族；一个都没有返回 ""。
+        // Font 构造对不存在的族名可能是「抛异常」也可能是「静默回退到别的族」，两条路都要挡住，
+        // 所以既 catch 又回读 Name 比对（静默回退正是这里要防的那种「悄悄用了错字体」）。
+        internal static string PickFirstInstalledFamily(string[] wanted)
+        {
+            if (wanted == null) { return ""; }
+
+            foreach (string name in wanted)
+            {
+                if (string.IsNullOrEmpty(name)) { continue; }
+                try
+                {
+                    using (Font probe = new Font(name, 9F))
+                    {
+                        if (string.Equals(probe.Name, name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return probe.Name;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // 这一族不存在（或建不出来）：试下一个。
+                }
+            }
+            return "";
+        }
+
+        // 已用时间。只显示已用时间 —— 未知工作的百分比是谎话（J1）。
+        internal static string FormatElapsed(TimeSpan elapsed)
+        {
+            if (elapsed < TimeSpan.Zero) { elapsed = TimeSpan.Zero; }
+            long total = (long)elapsed.TotalSeconds;
+            long hours = total / 3600;
+            long minutes = (total % 3600) / 60;
+            long seconds = total % 60;
+
+            if (hours > 0)
+            {
+                return hours.ToString(CultureInfo.InvariantCulture) + ":" +
+                       minutes.ToString("00", CultureInfo.InvariantCulture) + ":" +
+                       seconds.ToString("00", CultureInfo.InvariantCulture);
+            }
+            return minutes.ToString("00", CultureInfo.InvariantCulture) + ":" +
+                   seconds.ToString("00", CultureInfo.InvariantCulture);
+        }
+
+        // 扫描期：Marquee + 「已发现 N 个压缩包」。**没有百分比** —— 扫描期还不知道分母。
+        internal static string FormatScanningText(int discovered)
+        {
+            return "正在扫描…已发现 " + discovered.ToString(CultureInfo.InvariantCulture) + " 个压缩包";
+        }
+
+        // 解压期：分母是**已发现的工作量**，只报已用时间。永不报百分比（J1：分母会增长，
+        // 百分比会倒退 —— 用户会以为崩了然后强杀进程）。
+        internal static string FormatProgressText(int index, int discovered, TimeSpan elapsed)
+        {
+            int denominator = discovered > index ? discovered : index;
+            return "第 " + index.ToString(CultureInfo.InvariantCulture) +
+                   " / 已发现 " + denominator.ToString(CultureInfo.InvariantCulture) + " 个包" +
+                   " · 已用 " + FormatElapsed(elapsed);
+        }
+
+        // ETA：满 EtaMinimumCompleted 个归档之后才出现，且**必须**标「粗略」。
+        internal static string FormatEta(TimeSpan elapsed, int completed, int remaining)
+        {
+            if (completed < EtaMinimumCompleted || remaining <= 0) { return ""; }
+
+            double perArchive = elapsed.TotalSeconds / completed;
+            double seconds = perArchive * remaining;
+            if (seconds < 1.0 || double.IsNaN(seconds) || double.IsInfinity(seconds)) { return ""; }
+
+            return "剩余约 " + FormatElapsed(TimeSpan.FromSeconds(seconds)) + "（粗略）";
+        }
+
+        // 计数行（J6 / §7）：跳过（需密码）与失败**分开数** —— 把「需要密码」说成失败是最伤信任的
+        // 一类谎话（用户会以为文件坏了）。未处理数量由调用方按权威清单（NotAttempted）传入。
+        internal static string FormatCountersLine(List<ArchiveResult> results, int unprocessed)
+        {
+            int failed = 0, needsPassword = 0, skipped = 0;
+            if (results != null)
+            {
+                foreach (ArchiveResult r in results)
+                {
+                    if (r == null) { continue; }
+                    switch (r.Status)
+                    {
+                        case ArchiveStatus.Failed: failed++; break;
+                        case ArchiveStatus.SkippedNeedsPassword: needsPassword++; break;
+                        case ArchiveStatus.SkippedContainer:
+                        case ArchiveStatus.SkippedUnreadable: skipped++; break;
+                    }
+                }
+            }
+
+            return "❌ " + failed.ToString(CultureInfo.InvariantCulture) + " 个失败" +
+                   " · 🔒 " + needsPassword.ToString(CultureInfo.InvariantCulture) + " 个需密码" +
+                   " · ⏭ " + skipped.ToString(CultureInfo.InvariantCulture) + " 个跳过" +
+                   " · ⏳ " + unprocessed.ToString(CultureInfo.InvariantCulture) + " 个未处理";
+        }
+
+        // 已解出的文件数（只数真的解出过东西的两种结局）。
+        internal static string FormatExtractedLine(List<ArchiveResult> results)
+        {
+            long files = 0;
+            if (results != null)
+            {
+                foreach (ArchiveResult r in results)
+                {
+                    if (r == null) { continue; }
+                    if (r.Status == ArchiveStatus.Completed || r.Status == ArchiveStatus.CompletedWithFailures)
+                    {
+                        files += r.Files;
+                    }
+                }
+            }
+            return "✅ 已解出 " + files.ToString(CultureInfo.InvariantCulture) + " 个文件";
+        }
+
+        // A5：二次确认的措辞。必须写出**确切数量**、说清去向，并说清什么**不会**发生 ——
+        // 用户按下确定之前要知道自己同意了什么。
+        internal static string DeleteConfirmText(int count)
+        {
+            return "即将解压 " + count.ToString(CultureInfo.InvariantCulture) + " 个压缩包，" +
+                   "并勾选了「解压成功后删除原包」：\r\n\r\n" +
+                   "· 解压成功且校验通过的那 " + count.ToString(CultureInfo.InvariantCulture) +
+                   " 个原包会被移入回收站；\r\n" +
+                   "· 失败、跳过、需要密码、未处理的包一律保留，绝不会被删除；\r\n" +
+                   "· 回收站不可用或超出配额时，程序会如实报告实际处置方式。\r\n\r\n" +
+                   "确定要带着删除开关开始吗？";
+        }
+
+        // J8：解析 .lnk 的目标。用 WScript.Shell 晚绑定（本项目不引 COM 接口定义，也不需要）。
+        // 任何失败都只是**逐项告警**（返回 false + 中文原因），绝不抛异常把整批拖下水。
+        internal static bool TryResolveShortcut(string lnkPath, out string target, out string problem)
+        {
+            target = null;
+            problem = null;
+
+            if (string.IsNullOrEmpty(lnkPath)) { problem = "快捷方式路径为空"; return false; }
+
+            string full;
+            try { full = Path.GetFullPath(lnkPath); }
+            catch (Exception ex) { problem = "快捷方式路径无效（" + ex.GetType().Name + "）：" + lnkPath; return false; }
+
+            if (!File.Exists(full)) { problem = "快捷方式不存在或不可读：" + full; return false; }
+            if (!string.Equals(Path.GetExtension(full), ".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                problem = "不是 .lnk 快捷方式：" + full;
+                return false;
+            }
+
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) { problem = "本机没有注册 WScript.Shell，无法解析快捷方式：" + full; return false; }
+
+                object shell = Activator.CreateInstance(shellType);
+                object link = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell,
+                    new object[] { full });
+                if (link == null) { problem = "无法打开快捷方式：" + full; return false; }
+
+                object value = link.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, link, null);
+                string resolved = value == null ? "" : value.ToString();
+                if (resolved.Length == 0)
+                {
+                    problem = "快捷方式没有可用的目标路径（可能已损坏）：" + full;
+                    return false;
+                }
+
+                target = resolved;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                problem = "解析快捷方式失败（" + ex.GetType().Name + "：" + ex.Message + "）：" + full;
+                return false;
+            }
+        }
+
+        // ==================================================================
+        // 界面构造（一律 TableLayoutPanel / FlowLayoutPanel，无绝对坐标）
+        // ==================================================================
+
+        private void BuildUi()
+        {
+            SuspendLayout();
+
+            Text = "Rerar 递归解压";
+            Font = new Font(PickFontFamily(), 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            // 设计基准：96 DPI。这是设计器生成代码的既有写法，运行时按当前 DPI 由 PerformAutoScale 缩放。
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(940, 660);
+            MinimumSize = new Size(780, 560);
+            AllowDrop = true;
+
+            _root = new TableLayoutPanel();
+            _root.Dock = DockStyle.Fill;
+            _root.ColumnCount = 1;
+            _root.RowCount = 8;
+            _root.Padding = new Padding(10);
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            for (int i = 0; i < 7; i++) { _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); }
+            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 最后一行：详情（可折叠）
+
+            // ---- 0) 提权横幅（J2；非模态、常驻、不挡按钮）----
+            _lblElevation = new Label();
+            _lblElevation.Name = "lblElevation";
+            _lblElevation.AutoSize = true;
+            _lblElevation.MaximumSize = new Size(880, 0);
+            _lblElevation.BackColor = Color.FromArgb(255, 248, 220);
+            _lblElevation.ForeColor = Color.FromArgb(150, 60, 0);
+            _lblElevation.Padding = new Padding(8);
+            _lblElevation.Margin = new Padding(0, 0, 0, 6);
+            _lblElevation.Text = "⚠ 本程序正在以管理员身份运行：Windows 会「静默」拦截资源管理器的拖放" +
+                "（拖了没反应、也没有任何报错）。请改用下面的「选择文件夹…」「选择压缩包…」按钮 —— " +
+                "它们在任何权限下都可用。建议关闭本窗口，改用普通权限重新打开。";
+            _lblElevation.AccessibleName = "提权提示";
+            _lblElevation.Visible = false;
+            _root.Controls.Add(_lblElevation, 0, 0);
+
+            // ---- 1) 拖放区 + 两个同等显眼的选择按钮（J2）----
+            _dropZone = new DropZonePanel();
+            _dropZone.Name = "dropZone";
+            _dropZone.Dock = DockStyle.Fill;
+            _dropZone.AutoSize = true;
+            _dropZone.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _dropZone.Padding = new Padding(12);
+            _dropZone.Margin = new Padding(0, 0, 0, 8);
+            _dropZone.AllowDrop = true;
+            _dropZone.AccessibleName = "拖放区";
+            _dropZone.DragEnter += DropZone_DragEnter;
+            _dropZone.DragOver += DropZone_DragEnter;
+            _dropZone.DragDrop += DropZone_DragDrop;
+
+            TableLayoutPanel dropInner = new TableLayoutPanel();
+            dropInner.Dock = DockStyle.Fill;
+            dropInner.AutoSize = true;
+            dropInner.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            dropInner.ColumnCount = 1;
+            dropInner.RowCount = 6;
+            for (int i = 0; i < 5; i++) { dropInner.RowStyles.Add(new RowStyle(SizeType.AutoSize)); }
+            dropInner.RowStyles.Add(new RowStyle(SizeType.Absolute, 104F));   // 输入清单（固定高度，可滚动）
+
+            _lblDropHint = new Label();
+            _lblDropHint.AutoSize = true;
+            _lblDropHint.Font = new Font(Font.FontFamily, 12F, FontStyle.Bold);
+            _lblDropHint.Text = "⬇  把压缩包 / 文件夹拖到这里";
+            _lblDropHint.Margin = new Padding(0, 0, 0, 6);
+
+            FlowLayoutPanel pickRow = new FlowLayoutPanel();
+            pickRow.AutoSize = true;
+            pickRow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            pickRow.FlowDirection = FlowDirection.LeftToRight;
+            pickRow.Margin = new Padding(0, 0, 0, 6);
+
+            _btnPickFolder = new Button();
+            _btnPickFolder.Name = "btnPickFolder";
+            _btnPickFolder.Text = "选择文件夹…";
+            _btnPickFolder.AutoSize = true;
+            _btnPickFolder.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnPickFolder.Padding = new Padding(10, 4, 10, 4);
+            _btnPickFolder.AccessibleName = "选择文件夹（拖放失效时的备用入口）";
+            _btnPickFolder.Click += BtnPickFolder_Click;
+
+            _btnPickFiles = new Button();
+            _btnPickFiles.Name = "btnPickFiles";
+            _btnPickFiles.Text = "选择压缩包…";
+            _btnPickFiles.AutoSize = true;
+            _btnPickFiles.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnPickFiles.Padding = new Padding(10, 4, 10, 4);
+            _btnPickFiles.AccessibleName = "选择一个或多个压缩包（拖放失效时的备用入口）";
+            _btnPickFiles.Click += BtnPickFiles_Click;
+
+            pickRow.Controls.Add(_btnPickFolder);
+            pickRow.Controls.Add(_btnPickFiles);
+
+            _lblEmptyState = new Label();
+            _lblEmptyState.Name = "lblEmptyState";
+            _lblEmptyState.AutoSize = true;
+            _lblEmptyState.MaximumSize = new Size(860, 0);
+            _lblEmptyState.ForeColor = Color.FromArgb(70, 70, 70);
+            _lblEmptyState.Margin = new Padding(0, 0, 0, 6);
+            _lblEmptyState.Text = EmptyStateText;
+
+            _lblInputs = new Label();
+            _lblInputs.Name = "lblInputs";
+            _lblInputs.AutoSize = true;
+            _lblInputs.MaximumSize = new Size(860, 0);
+            _lblInputs.Text = "待处理：0 项";
+
+            _lblEngineInfo = new Label();
+            _lblEngineInfo.Name = "lblEngineInfo";
+            _lblEngineInfo.AutoSize = true;
+            _lblEngineInfo.MaximumSize = new Size(860, 0);
+            _lblEngineInfo.ForeColor = Color.FromArgb(70, 70, 70);
+            _lblEngineInfo.Text = "解压引擎：开始解压时自动定位（优先用本机 7-Zip ≥ 25.00，找不到或版本过低就用内置便携版）";
+
+            _lstInputs = new ListView();
+            _lstInputs.Name = "lstInputs";
+            _lstInputs.View = View.Details;
+            _lstInputs.FullRowSelect = true;
+            _lstInputs.MultiSelect = false;
+            _lstInputs.Height = 96;
+            _lstInputs.Dock = DockStyle.Fill;
+            _lstInputs.AccessibleName = "待处理的输入";
+            _lstInputs.Columns.Add("来源", 420);
+            _lstInputs.Columns.Add("类型", 70);
+            _lstInputs.Columns.Add("数量", 70);
+            _lstInputs.Columns.Add("解析结果", 320);
+
+            dropInner.Controls.Add(_lblDropHint, 0, 0);
+            dropInner.Controls.Add(pickRow, 0, 1);
+            dropInner.Controls.Add(_lblEmptyState, 0, 2);
+            dropInner.Controls.Add(_lblInputs, 0, 3);
+            dropInner.Controls.Add(_lblEngineInfo, 0, 4);
+            dropInner.Controls.Add(_lstInputs, 0, 5);
+            _dropZone.Controls.Add(dropInner);
+            _root.Controls.Add(_dropZone, 0, 1);
+
+            // ---- 2) 选项：三个安全复选框 + 独立的红色「危险操作」区 + 可折叠高级项 ----
+            _panelOptions = new FlowLayoutPanel();
+            _panelOptions.Name = "panelOptions";
+            _panelOptions.AutoSize = true;
+            _panelOptions.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelOptions.FlowDirection = FlowDirection.TopDown;
+            _panelOptions.WrapContents = false;
+            _panelOptions.Margin = new Padding(0, 0, 0, 8);
+
+            FlowLayoutPanel safeRow = new FlowLayoutPanel();
+            safeRow.AutoSize = true;
+            safeRow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            safeRow.FlowDirection = FlowDirection.LeftToRight;
+
+            _chkCamouflage = MakeOption("chkCamouflage", "识别伪装后缀", true,
+                "按内容识别改了后缀名的压缩包（.jpg 其实是 zip 这类）");
+            _chkVolumes = MakeOption("chkVolumes", "拼合分卷", true,
+                "把分卷集交给 7-Zip 按权威成员打开；缺卷会报出具体缺哪一个");
+            _chkDict = MakeOption("chkDict", "尝试密码字典", true,
+                "先试手动密码，再试内置常用字典与导入的字典，最后看同目录的密码线索");
+            safeRow.Controls.Add(_chkCamouflage);
+            safeRow.Controls.Add(_chkVolumes);
+            safeRow.Controls.Add(_chkDict);
+            _panelOptions.Controls.Add(safeRow);
+
+            // A5：危险项独立成区、红色、措辞写明后果（默认**不勾**）。
+            _grpDanger = new GroupBox();
+            _grpDanger.Name = "grpDanger";
+            _grpDanger.Text = "⚠ 危险操作";
+            _grpDanger.ForeColor = Color.FromArgb(178, 34, 34);
+            _grpDanger.AutoSize = true;
+            _grpDanger.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _grpDanger.Padding = new Padding(8);
+
+            FlowLayoutPanel dangerInner = new FlowLayoutPanel();
+            dangerInner.AutoSize = true;
+            dangerInner.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            dangerInner.FlowDirection = FlowDirection.TopDown;
+            dangerInner.WrapContents = false;
+
+            _chkDelete = new CheckBox();
+            _chkDelete.Name = "chkDelete";
+            _chkDelete.Text = "解压成功后删除原包（移入回收站）";
+            _chkDelete.AutoSize = true;
+            _chkDelete.Checked = false;      // 不变式 I3：界面层也是默认**关**
+            _chkDelete.ForeColor = Color.FromArgb(178, 34, 34);
+            _chkDelete.AccessibleName = "解压成功后删除原包（默认关闭）";
+
+            Label lblDangerNote = new Label();
+            lblDangerNote.AutoSize = true;
+            lblDangerNote.MaximumSize = new Size(820, 0);
+            lblDangerNote.ForeColor = Color.FromArgb(178, 34, 34);
+            lblDangerNote.Text = "勾选之后的后果：解压成功且校验通过的原包会被移入回收站；" +
+                "失败、跳过、需要密码、未处理的包一律保留。开始前还会再确认一次。";
+
+            dangerInner.Controls.Add(_chkDelete);
+            dangerInner.Controls.Add(lblDangerNote);
+            _grpDanger.Controls.Add(dangerInner);
+            _panelOptions.Controls.Add(_grpDanger);
+
+            // 高级选项（J11：默认折叠）。
+            _btnAdvanced = new Button();
+            _btnAdvanced.Name = "btnAdvanced";
+            _btnAdvanced.Text = "▸ 密码设置（可折叠）";
+            _btnAdvanced.AutoSize = true;
+            _btnAdvanced.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnAdvanced.AccessibleName = "展开或折叠密码设置";
+            _btnAdvanced.Click += BtnAdvanced_Click;
+            _panelOptions.Controls.Add(_btnAdvanced);
+
+            _panelAdvanced = new Panel();
+            _panelAdvanced.Name = "panelAdvanced";
+            _panelAdvanced.AutoSize = true;
+            _panelAdvanced.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelAdvanced.Visible = false;
+            _panelAdvanced.Padding = new Padding(12, 6, 0, 6);
+
+            FlowLayoutPanel advancedInner = new FlowLayoutPanel();
+            advancedInner.AutoSize = true;
+            advancedInner.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            advancedInner.FlowDirection = FlowDirection.TopDown;
+            advancedInner.WrapContents = false;
+
+            _lblPasswordHint = new Label();
+            _lblPasswordHint.AutoSize = true;
+            _lblPasswordHint.MaximumSize = new Size(820, 0);
+            _lblPasswordHint.Text = "手动密码（密码只交给解压引擎，绝不写进日志、报告或恢复记录）：";
+
+            _txtPassword = new TextBox();
+            _txtPassword.Name = "txtPassword";
+            _txtPassword.UseSystemPasswordChar = true;
+            _txtPassword.Width = 260;
+            _txtPassword.AccessibleName = "手动密码";
+
+            _chkRememberRun = new CheckBox();
+            _chkRememberRun.Name = "chkRememberRun";
+            _chkRememberRun.Text = "本次运行记住此密码";
+            _chkRememberRun.AutoSize = true;
+
+            FlowLayoutPanel dictRow = new FlowLayoutPanel();
+            dictRow.AutoSize = true;
+            dictRow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            dictRow.FlowDirection = FlowDirection.LeftToRight;
+
+            _btnLoadDict = new Button();
+            _btnLoadDict.Name = "btnLoadDict";
+            _btnLoadDict.Text = "导入密码字典…";
+            _btnLoadDict.AutoSize = true;
+            _btnLoadDict.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnLoadDict.Click += BtnLoadDict_Click;
+
+            _lblDict = new Label();
+            _lblDict.AutoSize = true;
+            _lblDict.Text = "未导入字典（将使用内置常用字典）";
+
+            dictRow.Controls.Add(_btnLoadDict);
+            dictRow.Controls.Add(_lblDict);
+
+            FlowLayoutPanel depthRow = new FlowLayoutPanel();
+            depthRow.AutoSize = true;
+            depthRow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            depthRow.FlowDirection = FlowDirection.LeftToRight;
+
+            Label lblDepth = new Label();
+            lblDepth.AutoSize = true;
+            lblDepth.Text = "递归层数上限：";
+            lblDepth.Margin = new Padding(0, 6, 0, 0);
+
+            _numDepth = new NumericUpDown();
+            _numDepth.Name = "numDepth";
+            _numDepth.Minimum = 1;
+            _numDepth.Maximum = 64;
+            _numDepth.Value = new RunOptions().MaxDepth;   // 规格 §10.1 的默认 10 层，取默认值而不是硬编码
+            _numDepth.Width = 60;
+
+            Label lblDepthNote = new Label();
+            lblDepthNote.AutoSize = true;
+            lblDepthNote.Text = "（触顶的项会被显式列为「未处理」，绝不静默停止）";
+            lblDepthNote.ForeColor = Color.FromArgb(70, 70, 70);
+            lblDepthNote.Margin = new Padding(8, 6, 0, 0);
+
+            depthRow.Controls.Add(lblDepth);
+            depthRow.Controls.Add(_numDepth);
+            depthRow.Controls.Add(lblDepthNote);
+
+            advancedInner.Controls.Add(_lblPasswordHint);
+            advancedInner.Controls.Add(_txtPassword);
+            advancedInner.Controls.Add(_chkRememberRun);
+            advancedInner.Controls.Add(dictRow);
+            advancedInner.Controls.Add(depthRow);
+            _panelAdvanced.Controls.Add(advancedInner);
+            _panelOptions.Controls.Add(_panelAdvanced);
+            _root.Controls.Add(_panelOptions, 0, 2);
+
+            // ---- 3) 开始 / 取消 ----
+            _panelActions = new FlowLayoutPanel();
+            _panelActions.AutoSize = true;
+            _panelActions.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelActions.FlowDirection = FlowDirection.LeftToRight;
+            _panelActions.Margin = new Padding(0, 0, 0, 6);
+
+            _btnStart = new Button();
+            _btnStart.Name = "btnStart";
+            _btnStart.Text = "开始解压";
+            _btnStart.AutoSize = true;
+            _btnStart.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnStart.Padding = new Padding(22, 8, 22, 8);
+            _btnStart.Font = new Font(Font.FontFamily, 11F, FontStyle.Bold);
+            _btnStart.Enabled = false;                 // 没有输入就不给按（空状态下按钮亮着只会误导）
+            _btnStart.AccessibleName = "开始解压";
+            _btnStart.Click += BtnStart_Click;
+
+            _btnCancel = new Button();
+            _btnCancel.Name = "btnCancel";
+            _btnCancel.Text = "取消";
+            _btnCancel.AutoSize = true;
+            _btnCancel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnCancel.Padding = new Padding(14, 8, 14, 8);
+            _btnCancel.Enabled = false;
+            _btnCancel.AccessibleName = "取消本次运行";
+            _btnCancel.Click += BtnCancel_Click;
+
+            _panelActions.Controls.Add(_btnStart);
+            _panelActions.Controls.Add(_btnCancel);
+            _root.Controls.Add(_panelActions, 0, 3);
+
+            // ---- 4) 进度 ----
+            _panelProgress = new Panel();
+            _panelProgress.AutoSize = true;
+            _panelProgress.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelProgress.Dock = DockStyle.Fill;
+            _panelProgress.Margin = new Padding(0, 0, 0, 4);
+
+            _progressBar = new ProgressBar();
+            _progressBar.Name = "progressBar";
+            _progressBar.Dock = DockStyle.Top;
+            _progressBar.Height = 18;
+            _progressBar.Minimum = 0;
+            _progressBar.Maximum = 100;
+            _progressBar.Style = ProgressBarStyle.Continuous;
+            _progressBar.AccessibleName = "进度";
+
+            _lblProgress = new Label();
+            _lblProgress.Name = "lblProgress";
+            _lblProgress.AutoSize = true;
+            _lblProgress.Dock = DockStyle.Bottom;
+            _lblProgress.Padding = new Padding(0, 2, 0, 2);
+            _lblProgress.Text = "空闲。加入压缩包或文件夹后点「开始解压」。";
+
+            _panelProgress.Controls.Add(_lblProgress);
+            _panelProgress.Controls.Add(_progressBar);
+            _root.Controls.Add(_panelProgress, 0, 4);
+
+            // ---- 5) 一行状态 + 计数行 ----
+            _panelStatus = new Panel();
+            _panelStatus.AutoSize = true;
+            _panelStatus.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelStatus.Dock = DockStyle.Fill;
+            _panelStatus.Margin = new Padding(0, 0, 0, 4);
+
+            _panelCounters = new FlowLayoutPanel();
+            _panelCounters.AutoSize = true;
+            _panelCounters.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelCounters.FlowDirection = FlowDirection.LeftToRight;
+            _panelCounters.Dock = DockStyle.Bottom;
+
+            _lblCounters = new Label();
+            _lblCounters.Name = "lblCounters";
+            _lblCounters.AutoSize = true;
+            _lblCounters.Margin = new Padding(0, 4, 12, 0);
+            _lblCounters.Text = "";
+
+            _btnDetails = new Button();
+            _btnDetails.Name = "btnDetails";
+            _btnDetails.Text = "查看详情 ▸";
+            _btnDetails.AutoSize = true;
+            _btnDetails.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnDetails.AccessibleName = "展开或折叠详情与日志";
+            _btnDetails.Click += BtnDetails_Click;
+
+            _panelCounters.Controls.Add(_lblCounters);
+            _panelCounters.Controls.Add(_btnDetails);
+
+            _lblStatus = new Label();
+            _lblStatus.Name = "lblStatus";
+            _lblStatus.AutoSize = true;
+            _lblStatus.MaximumSize = new Size(880, 0);
+            _lblStatus.Dock = DockStyle.Top;
+            _lblStatus.Padding = new Padding(0, 2, 0, 2);
+            _lblStatus.Text = "状态：等待开始。";
+
+            _panelStatus.Controls.Add(_lblStatus);
+            _panelStatus.Controls.Add(_panelCounters);
+            _root.Controls.Add(_panelStatus, 0, 5);
+
+            // ---- 6) 密码：**停靠式非模态**面板（J6）----
+            _panelPasswordAsk = new Panel();
+            _panelPasswordAsk.Name = "panelPasswordAsk";
+            _panelPasswordAsk.AutoSize = true;
+            _panelPasswordAsk.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelPasswordAsk.Dock = DockStyle.Fill;
+            _panelPasswordAsk.BackColor = Color.FromArgb(255, 248, 220);
+            _panelPasswordAsk.Padding = new Padding(10);
+            _panelPasswordAsk.Margin = new Padding(0, 0, 0, 6);
+            _panelPasswordAsk.Visible = false;
+
+            TableLayoutPanel pwInner = new TableLayoutPanel();
+            pwInner.Dock = DockStyle.Fill;
+            pwInner.AutoSize = true;
+            pwInner.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            pwInner.ColumnCount = 1;
+            pwInner.RowCount = 3;
+
+            _lblPasswordAsk = new Label();
+            _lblPasswordAsk.Name = "lblPasswordAsk";
+            _lblPasswordAsk.AutoSize = true;
+            _lblPasswordAsk.MaximumSize = new Size(860, 0);
+            _lblPasswordAsk.Text = "🔒 当前压缩包需要密码 — 还有 0 个待处理。";
+
+            FlowLayoutPanel pwRow = new FlowLayoutPanel();
+            pwRow.AutoSize = true;
+            pwRow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            pwRow.FlowDirection = FlowDirection.LeftToRight;
+
+            _txtPasswordAsk = new TextBox();
+            _txtPasswordAsk.Name = "txtPasswordAsk";
+            _txtPasswordAsk.UseSystemPasswordChar = true;
+            _txtPasswordAsk.Width = 240;
+            _txtPasswordAsk.AccessibleName = "为当前压缩包输入的密码";
+
+            _btnPwThisOnly = new Button();
+            _btnPwThisOnly.Name = "btnPwThisOnly";
+            _btnPwThisOnly.Text = "仅此压缩包";
+            _btnPwThisOnly.AutoSize = true;
+            _btnPwThisOnly.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnPwThisOnly.Click += BtnPwThisOnly_Click;
+
+            _btnPwRememberAll = new Button();
+            _btnPwRememberAll.Name = "btnPwRememberAll";
+            _btnPwRememberAll.Text = "本次运行全部记住";
+            _btnPwRememberAll.AutoSize = true;
+            _btnPwRememberAll.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnPwRememberAll.Click += BtnPwRememberAll_Click;
+
+            _btnPwSkip = new Button();
+            _btnPwSkip.Name = "btnPwSkip";
+            _btnPwSkip.Text = "跳过此压缩包";
+            _btnPwSkip.AutoSize = true;
+            _btnPwSkip.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnPwSkip.Click += BtnPwSkip_Click;
+
+            pwRow.Controls.Add(_txtPasswordAsk);
+            pwRow.Controls.Add(_btnPwThisOnly);
+            pwRow.Controls.Add(_btnPwRememberAll);
+            pwRow.Controls.Add(_btnPwSkip);
+
+            Label lblPwNote = new Label();
+            lblPwNote.AutoSize = true;
+            lblPwNote.MaximumSize = new Size(860, 0);
+            lblPwNote.Text = "本面板「不会」挡住正在运行的批次（不是模态框）：填好后选「仅此压缩包」或" +
+                "「本次运行全部记住」，跳过的包会记为「跳过（需要密码）」，「不是失败」。";
+
+            pwInner.Controls.Add(_lblPasswordAsk, 0, 0);
+            pwInner.Controls.Add(pwRow, 0, 1);
+            pwInner.Controls.Add(lblPwNote, 0, 2);
+            _panelPasswordAsk.Controls.Add(pwInner);
+            _root.Controls.Add(_panelPasswordAsk, 0, 6);
+
+            // ---- 7) 详情：逐项列表 + 逐项动作 + 自绘日志尾部 ----
+            _panelDetails = new Panel();
+            _panelDetails.Name = "panelDetails";
+            _panelDetails.Dock = DockStyle.Fill;
+            _panelDetails.Visible = false;
+
+            TableLayoutPanel detailsInner = new TableLayoutPanel();
+            detailsInner.Dock = DockStyle.Fill;
+            detailsInner.ColumnCount = 1;
+            detailsInner.RowCount = 5;
+            detailsInner.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            detailsInner.RowStyles.Add(new RowStyle(SizeType.Percent, 45F));
+            detailsInner.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            detailsInner.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            detailsInner.RowStyles.Add(new RowStyle(SizeType.Percent, 55F));
+
+            _panelLogTools = new FlowLayoutPanel();
+            _panelLogTools.AutoSize = true;
+            _panelLogTools.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelLogTools.FlowDirection = FlowDirection.LeftToRight;
+
+            _btnOpenLog = new Button();
+            _btnOpenLog.Name = "btnOpenLog";
+            _btnOpenLog.Text = "打开日志文件";
+            _btnOpenLog.AutoSize = true;
+            _btnOpenLog.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnOpenLog.Enabled = false;
+            _btnOpenLog.AccessibleName = "打开完整日志文件";
+            _btnOpenLog.Click += BtnOpenLog_Click;
+
+            // J4：暂停自动滚动 —— 用户往上翻的时候日志一直往下跳，本身就是个 bug。
+            _chkAutoScroll = new CheckBox();
+            _chkAutoScroll.Name = "chkAutoScroll";
+            _chkAutoScroll.Text = "自动滚动";
+            _chkAutoScroll.AutoSize = true;
+            _chkAutoScroll.Checked = true;
+            _chkAutoScroll.Margin = new Padding(12, 6, 0, 0);
+            _chkAutoScroll.CheckedChanged += ChkAutoScroll_CheckedChanged;
+
+            _panelLogTools.Controls.Add(_btnOpenLog);
+            _panelLogTools.Controls.Add(_chkAutoScroll);
+
+            _lstItems = new ListView();
+            _lstItems.Name = "lstItems";
+            _lstItems.View = View.Details;
+            _lstItems.FullRowSelect = true;
+            _lstItems.MultiSelect = false;
+            _lstItems.HideSelection = false;
+            _lstItems.Dock = DockStyle.Fill;
+            _lstItems.AccessibleName = "逐项结果";
+            _lstItems.Columns.Add("压缩包", 400);
+            _lstItems.Columns.Add("结局", 130);
+            _lstItems.Columns.Add("文件/失败", 90);
+            _lstItems.Columns.Add("说明", 420);
+            _lstItems.SelectedIndexChanged += LstItems_SelectedIndexChanged;
+            _lstItems.DoubleClick += BtnOpenOutput_Click;
+
+            _itemMenu = new ContextMenuStrip();
+            _itemMenu.Items.Add("强制按压缩包尝试", null, BtnForceArchive_Click);
+            _itemMenu.Items.Add("输入密码…", null, BtnEnterPassword_Click);
+            _itemMenu.Items.Add("重试", null, BtnRetry_Click);
+            _itemMenu.Items.Add("打开输出目录", null, BtnOpenOutput_Click);
+            _lstItems.ContextMenuStrip = _itemMenu;
+
+            _panelItemActions = new FlowLayoutPanel();
+            _panelItemActions.AutoSize = true;
+            _panelItemActions.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _panelItemActions.FlowDirection = FlowDirection.LeftToRight;
+            _panelItemActions.Margin = new Padding(0, 4, 0, 4);
+
+            _btnForceArchive = MakeItemAction("btnForceArchive", "强制按压缩包尝试", BtnForceArchive_Click);
+            _btnEnterPassword = MakeItemAction("btnEnterPassword", "输入密码", BtnEnterPassword_Click);
+            _btnRetry = MakeItemAction("btnRetry", "重试", BtnRetry_Click);
+            _btnOpenOutput = MakeItemAction("btnOpenOutput", "打开输出目录", BtnOpenOutput_Click);
+            _panelItemActions.Controls.Add(_btnForceArchive);
+            _panelItemActions.Controls.Add(_btnEnterPassword);
+            _panelItemActions.Controls.Add(_btnRetry);
+            _panelItemActions.Controls.Add(_btnOpenOutput);
+
+            _lblLogHint = new Label();
+            _lblLogHint.Name = "lblLogHint";
+            _lblLogHint.AutoSize = true;
+            _lblLogHint.MaximumSize = new Size(880, 0);
+            _lblLogHint.ForeColor = Color.FromArgb(70, 70, 70);
+            _lblLogHint.Text = "运行日志（只显示最后 " + LogTailLines +
+                " 行；完整日志流式写入文件，点「打开日志文件」查看）";
+
+            _logView = new LogTailView();
+            _logView.Name = "logView";
+            _logView.Dock = DockStyle.Fill;
+            _logView.AccessibleName = "运行日志尾部";
+            _logView.AutoScroll = true;
+
+            detailsInner.Controls.Add(_panelLogTools, 0, 0);
+            detailsInner.Controls.Add(_lstItems, 0, 1);
+            detailsInner.Controls.Add(_panelItemActions, 0, 2);
+            detailsInner.Controls.Add(_lblLogHint, 0, 3);
+            detailsInner.Controls.Add(_logView, 0, 4);
+            _panelDetails.Controls.Add(detailsInner);
+            _root.Controls.Add(_panelDetails, 0, 7);
+
+            Controls.Add(_root);
+
+            // J9/J10：拖到窗口任何地方（不只是拖放区）都收。
+            DragEnter += DropZone_DragEnter;
+            DragOver += DropZone_DragEnter;
+            DragDrop += DropZone_DragDrop;
+
+            FormClosing += MainForm_FormClosing;
+
+            _uiTimer = new System.Windows.Forms.Timer();
+            _uiTimer.Interval = UiCoalesceMs;
+            _uiTimer.Tick += UiTimer_Tick;
+
+            SetDetailsVisible(false);
+            RefreshInputSummary();
+
+            ResumeLayout(true);
+        }
+
+        private CheckBox MakeOption(string name, string text, bool isChecked, string tip)
+        {
+            CheckBox box = new CheckBox();
+            box.Name = name;
+            box.Text = text;
+            box.Checked = isChecked;
+            box.AutoSize = true;
+            box.Margin = new Padding(0, 0, 16, 0);
+            box.AccessibleName = tip;
+
+            _tooltip.SetToolTip(box, tip);
+            return box;
+        }
+
+        // 一个共享的 ToolTip（每个控件都 new 一个会在窗体销毁时留下没人释放的组件）。
+        private readonly ToolTip _tooltip = new ToolTip();
+
+        private Button MakeItemAction(string name, string text, EventHandler handler)
+        {
+            Button button = new Button();
+            button.Name = name;
+            button.Text = text;
+            button.AutoSize = true;
+            button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            button.Enabled = false;
+            button.Click += handler;
+            return button;
+        }
+
+        // J2：检测已提权并显示**常驻非模态横幅**。绝不用模态框 —— 那会在启动时挡住一切，
+        // 而这里要传达的恰恰是「别用拖放，用按钮」，横幅正好不挡按钮。
+        private void DetectElevation()
+        {
+            try
+            {
+                System.Security.Principal.WindowsIdentity identity =
+                    System.Security.Principal.WindowsIdentity.GetCurrent();
+                System.Security.Principal.WindowsPrincipal principal =
+                    new System.Security.Principal.WindowsPrincipal(identity);
+                if (principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+                {
+                    _lblElevation.Visible = true;
+                    AppendLog("警告：本进程以管理员身份运行 —— Windows UIPI 会静默拦截资源管理器拖放，" +
+                              "只能用「选择…」按钮。建议以普通权限重新打开。");
+                }
+            }
+            catch (Exception)
+            {
+                // 查不出来就当没提权：这只是一条提示，绝不因为它挡住界面启动。
+            }
+        }
+
+        private void ApplySettings()
+        {
+            if (_settings.HasGeometry && _settings.WindowWidth > 200 && _settings.WindowHeight > 200)
+            {
+                Size size = new Size(_settings.WindowWidth, _settings.WindowHeight);
+                // 存下来的位置可能已经不在任何屏幕上（换了显示器 / 拔了外接屏）：只接受可见的位置。
+                Rectangle wanted = new Rectangle(new Point(_settings.WindowX, _settings.WindowY), size);
+                if (Screen.AllScreens != null && IsOnAnyScreen(wanted))
+                {
+                    StartPosition = FormStartPosition.Manual;
+                    Bounds = wanted;
+                }
+                else
+                {
+                    StartPosition = FormStartPosition.CenterScreen;
+                    // 用 Size（外框尺寸）而不是 ClientSize：存下来的就是 Bounds（外框），
+                    // 两个量纲混用会让窗口每次启动缩掉一圈边框。
+                    Size = size;
+                }
+
+                if (_settings.Maximized) { WindowState = FormWindowState.Maximized; }
+            }
+        }
+
+        private static bool IsOnAnyScreen(Rectangle bounds)
+        {
+            try
+            {
+                foreach (Screen screen in Screen.AllScreens)
+                {
+                    if (screen.WorkingArea.IntersectsWith(bounds)) { return true; }
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        // ==================================================================
+        // 输入（拖放 / 选择 / 后台枚举；J9、J10）
+        // ==================================================================
+
+        private void DropZone_DragEnter(object sender, DragEventArgs e)
+        {
+            // 只接受文件拖放（拖进来的文本/网址没有任何意义）。
+            e.Effect = e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop)
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
+        }
+
+        private void DropZone_DragDrop(object sender, DragEventArgs e)
+        {
+            try
+            {
+                if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop)) { return; }
+                string[] paths = e.Data.GetData(DataFormats.FileDrop) as string[];
+                AddInputs(paths);
+            }
+            catch (Exception ex)
+            {
+                // 拖进来的东西再古怪也不能掀翻界面（规格 §6.3：不崩溃、不静默丢弃）。
+                Warn("无法接收拖入的内容（" + ex.GetType().Name + "：" + ex.Message + "）");
+            }
+        }
+
+        private void BtnPickFolder_Click(object sender, EventArgs e)
+        {
+            FolderBrowserDialog dialog = new FolderBrowserDialog();
+            dialog.Description = "选择包含压缩包的文件夹（会递归展开其中的文件，逐个判断是不是压缩包）";
+            dialog.ShowNewFolderButton = false;
+            if (!string.IsNullOrEmpty(_settings.LastInputFolder)) { dialog.SelectedPath = _settings.LastInputFolder; }
+
+            try
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) { return; }
+                _settings.LastInputFolder = dialog.SelectedPath;
+                AddInputs(new string[] { dialog.SelectedPath });
+            }
+            catch (Exception ex)
+            {
+                Warn("打开文件夹选择框失败（" + ex.GetType().Name + "：" + ex.Message + "）");
+            }
+        }
+
+        private void BtnPickFiles_Click(object sender, EventArgs e)
+        {
+            OpenFileDialog dialog = new OpenFileDialog();
+            dialog.Title = "选择压缩包（可多选）";
+            dialog.Multiselect = true;
+            dialog.Filter = "压缩包|*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz;*.bz2;*.xz;*.cab;*.iso;*.001;*.lnk|所有文件|*.*";
+            if (!string.IsNullOrEmpty(_settings.LastInputFolder)) { dialog.InitialDirectory = _settings.LastInputFolder; }
+
+            try
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) { return; }
+                if (dialog.FileNames != null && dialog.FileNames.Length > 0)
+                {
+                    try { _settings.LastInputFolder = Path.GetDirectoryName(dialog.FileNames[0]); }
+                    catch (Exception) { }
+                }
+                AddInputs(dialog.FileNames);
+            }
+            catch (Exception ex)
+            {
+                Warn("打开文件选择框失败（" + ex.GetType().Name + "：" + ex.Message + "）");
+            }
+        }
+
+        // 收下一批路径。目录走**后台**枚举（J9：巨型文件夹不能在 UI 线程上枚举，否则「无响应」），
+        // .lnk 解析并显式展示（J8），其余按文件收下。一律按规范化路径去重。
+        private void AddInputs(string[] paths)
+        {
+            if (paths == null || paths.Length == 0) { return; }
+
+            if (_running || _scanRemaining > 0)
+            {
+                // J10：运行中拖进来的项进「待处理（下一批）」，并**明说**这件事 —— 静默忽略或污染
+                // 正在跑的批次都是不可接受的行为。
+                _nextBatchOnly = true;
+                Warn("已加入「待处理（下一批）」：本次运行不会带上新加入的项。");
+            }
+
+            List<string> folders = new List<string>();
+
+            foreach (string raw in paths)
+            {
+                if (string.IsNullOrEmpty(raw)) { continue; }
+
+                string full;
+                try { full = Path.GetFullPath(raw); }
+                catch (Exception ex)
+                {
+                    AddInputRow(raw, "警告", "-", "路径无效（" + ex.GetType().Name + "）：" + raw);
+                    continue;
+                }
+
+                // source = 用户拖/选进来的那个路径（列表第一列**原样**展示它）；
+                // resolved = 真正要处理的路径（.lnk 解析之后）。两者不同时，note 里写出解析结果。
+                string source = full;
+                string resolved = full;
+                string note = "";
+                bool isShortcut = string.Equals(Path.GetExtension(full), ".lnk", StringComparison.OrdinalIgnoreCase);
+
+                if (isShortcut)
+                {
+                    // J8：拖进来的是 .lnk 路径而不是它的目标。解析并**显式展示**，否则用户只会看到
+                    //「不是有效压缩包」而不知道原因。解析失败只是逐项告警，绝不崩溃。
+                    string target;
+                    string problem;
+                    if (TryResolveShortcut(full, out target, out problem))
+                    {
+                        resolved = target;
+                        note = "→ " + target;
+                    }
+                    else
+                    {
+                        note = "⚠ 快捷方式解析失败：" + problem;
+                    }
+                }
+
+                if (Directory.Exists(resolved))
+                {
+                    if (_seen.Contains(resolved))
+                    {
+                        AddInputRow(source, "文件夹", "重复", note + "（已经加过了，按规范化路径去重）");
+                        continue;
+                    }
+                    _seen.Add(resolved);
+                    folders.Add(resolved);
+                    _inputRowOf[resolved] = AddInputRow(source, "文件夹", "正在统计…", note);
+                    continue;
+                }
+
+                if (!File.Exists(resolved))
+                {
+                    // 不存在 / 解析不出来的目标：**绝不静默丢弃**。照样交给 Core，让它如实报
+                    //「目标不存在或不可读」并在逐项结果里出现（用户才知道自己拖错了什么）。
+                    AddInputRow(source, isShortcut ? "快捷方式" : "文件", "-",
+                        note.Length > 0 ? note : "⚠ 不存在或不可读：" + resolved);
+                    AddCandidate(resolved);
+                    continue;
+                }
+
+                if (AddCandidate(resolved))
+                {
+                    AddInputRow(source, isShortcut ? "快捷方式" : "文件", "1", note);
+                }
+                else
+                {
+                    AddInputRow(source, "文件", "重复", note + "（已经加过了，按规范化路径去重）");
+                }
+            }
+
+            if (folders.Count > 0) { StartEnumeration(folders); }
+            RefreshInputSummary();
+        }
+
+        // 收下一个候选文件（去重）。返回 false = 已经有了。
+        private bool AddCandidate(string full)
+        {
+            if (_seen.Contains(full)) { return false; }
+            _seen.Add(full);
+            _inputs.Add(full);
+            return true;
+        }
+
+        private int AddInputRow(string source, string kind, string count, string note)
+        {
+            ListViewItem item = new ListViewItem(source);
+            item.SubItems.Add(kind);
+            item.SubItems.Add(count);
+            item.SubItems.Add(note);
+            _lstInputs.Items.Add(item);
+            return _lstInputs.Items.Count - 1;
+        }
+
+        private void RefreshInputSummary()
+        {
+            int folders = 0;
+            foreach (KeyValuePair<string, int> pair in _inputRowOf) { folders++; }
+
+            string text = "待处理：" + _inputs.Count + " 个文件（来自 " + folders + " 个文件夹）";
+            if (_scanRemaining > 0) { text += " · 正在统计：" + _scanFound + " 个"; }
+            if (_nextBatchOnly) { text += " · 新加入的项进入「下一批」"; }
+            _lblInputs.Text = text;
+
+            bool hasInputs = _inputs.Count > 0 || _scanRemaining > 0;
+            _lblEmptyState.Visible = _inputs.Count == 0 && _scanRemaining == 0;
+            if (!_running) { _btnStart.Enabled = hasInputs && !_nextBatchOnly; }
+        }
+
+        // 后台枚举（J9：显示「正在统计…」、可取消、按规范化路径去重、文件夹折叠为一行显示文件数）。
+        //
+        // 【为什么**不**按后缀过滤】在枚举层按扩展名筛掉「不像压缩包」的文件，正好会把本工具要认出来的
+        // 伪装后缀（.jpg 其实是 zip）一起扔掉 —— 那是规格 §6.3 禁止的静默丢弃。格式判定是 Core 的
+        // Sniffer 的职责，这里只负责把「用户指到的所有文件」原样交给它，并在界面上如实展示数量。
+        private void StartEnumeration(List<string> folders)
+        {
+            _scanCts = new CancellationTokenSource();
+            CancellationToken token = _scanCts.Token;
+            _scanRemaining++;
+            _scanFound = 0;
+
+            Thread worker = new Thread(delegate()
+            {
+                List<string> found = new List<string>();
+                List<string> notes = new List<string>();
+                Dictionary<string, int> perFolder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (string folder in folders)
+                {
+                    if (token.IsCancellationRequested) { break; }
+                    int before = found.Count;
+                    EnumerateFilesSafe(folder, token, found, notes);
+                    perFolder[folder] = found.Count - before;
+                }
+
+                if (token.IsCancellationRequested) { notes.Add("扫描被取消：已经找到的那部分仍然有效（不是零）"); }
+
+                UiPost(delegate
+                {
+                    _scanFound = found.Count;
+                    FinishEnumeration(folders, perFolder, found, notes);
+                });
+            });
+            worker.IsBackground = true;
+            worker.Name = "rerar-gui-scan";
+            worker.Start();
+
+            if (!_running)
+            {
+                _lblProgress.Text = FormatScanningText(0);
+                _progressBar.Style = ProgressBarStyle.Marquee;
+            }
+            _uiTimer.Start();
+        }
+
+        // 手工递归（不用 Directory.GetFiles(AllDirectories)）：一，某个子目录读不了时不能把已经找到的
+        // 全丢掉（GetFiles 会整体抛异常）；二，必须**跳过重解析点**，否则一个 junction 指回上层就是
+        // 无限循环（研究 V17/V24 的那一族问题在枚举层也要挡）。
+        private static void EnumerateFilesSafe(string root, CancellationToken token, List<string> into, List<string> notes)
+        {
+            Stack<string> pending = new Stack<string>();
+            pending.Push(root);
+
+            int visited = 0;
+            while (pending.Count > 0)
+            {
+                if (token.IsCancellationRequested) { return; }
+                if (++visited > 100000) { notes.Add(root + "：目录数超过 10 万个，已停止枚举"); return; }
+
+                string dir = pending.Pop();
+                string[] files;
+                string[] subs;
+
+                try
+                {
+                    files = Directory.GetFiles(dir);
+                    subs = Directory.GetDirectories(dir);
+                }
+                catch (Exception ex)
+                {
+                    notes.Add(dir + "：无法读取（" + ex.GetType().Name + "）");
+                    continue;
+                }
+
+                foreach (string file in files)
+                {
+                    if (token.IsCancellationRequested) { return; }
+                    into.Add(file);
+                }
+
+                foreach (string sub in subs)
+                {
+                    try
+                    {
+                        FileAttributes attributes = File.GetAttributes(sub);
+                        if ((attributes & FileAttributes.ReparsePoint) != 0)
+                        {
+                            notes.Add(sub + "：是重解析点（软链/联接），已跳过以免循环");
+                            continue;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // 取不到属性就照常下探：枚举层不必为此丢东西。
+                    }
+                    pending.Push(sub);
+                }
+            }
+        }
+
+        private void FinishEnumeration(List<string> folders, Dictionary<string, int> perFolder,
+                                       List<string> found, List<string> notes)
+        {
+            if (_scanRemaining > 0) { _scanRemaining--; }
+
+            int added = 0;
+            foreach (string file in found)
+            {
+                if (AddCandidate(file)) { added++; }
+            }
+
+            foreach (string folder in folders)
+            {
+                int row;
+                int count;
+                if (!perFolder.TryGetValue(folder, out count)) { count = 0; }
+                if (_inputRowOf.TryGetValue(folder, out row) && row < _lstInputs.Items.Count)
+                {
+                    _lstInputs.Items[row].SubItems[2].Text = count + " 个文件";
+                }
+            }
+
+            foreach (string note in notes) { AppendLog("扫描提示：" + note); }
+            if (notes.Count > 0) { Warn("扫描有 " + notes.Count + " 条提示（软链已跳过、个别目录读不了）；详见日志。"); }
+
+            AppendLog("扫描完成：" + folders.Count + " 个文件夹共 " + found.Count + " 个文件（新增 " + added + " 个）");
+            if (_scanRemaining == 0 && !_running)
+            {
+                _progressBar.Style = ProgressBarStyle.Continuous;
+                _progressBar.Value = 0;
+                _lblProgress.Text = _inputs.Count == 0
+                    ? "空闲。加入压缩包或文件夹后点「开始解压」。"
+                    : FormatScanningText(_inputs.Count);
+            }
+            RefreshInputSummary();
+        }
+
+        // ==================================================================
+        // 开始运行（先弹预检摘要确认 —— J12）
+        // ==================================================================
+
+        private void BtnStart_Click(object sender, EventArgs e)
+        {
+            if (_running || _scanRemaining > 0) { return; }
+            if (_inputs.Count == 0) { Warn("还没有可处理的文件：先拖入压缩包/文件夹，或用上面的按钮选择。"); return; }
+
+            // 删除开启时：先弹**自定义**二次确认（A5）。它报出确切数量、不默认聚焦确定、Esc 只能返回。
+            if (_chkDelete.Checked)
+            {
+                using (ConfirmDeleteForm confirm = new ConfirmDeleteForm(_inputs.Count))
+                {
+                    if (confirm.ShowDialog(this) != DialogResult.OK)
+                    {
+                        // 用户没确认 ⇒ **什么都不做**（绝不偷偷把删除开关关掉然后照跑：那也是替用户做主）。
+                        _lblStatus.Text = "状态：已取消（删除开关仍然勾选着，但没有开始）。";
+                        return;
+                    }
+                }
+            }
+
+            List<string> paths = new List<string>(_inputs);
+            _nextBatchOnly = false;
+
+            RunOptions options = BuildOptions();
+            StartRun(paths, options, paths.Count);
+        }
+
+        private RunOptions BuildOptions()
+        {
+            RunOptions options = new RunOptions();
+            // 输入处理开关：这三个复选框在 v1.0 里都是 Core 的**固定行为**的一层显式确认
+            //（Core 没有「关掉伪装后缀识别」的开关，也不该有）。所以它们只用于预检摘要里向用户
+            // 说明「这次会怎么处理」；真正的杠杆只有删除、密码、字典、层数与逐项强制。
+            options.DeleteOriginals = _chkDelete.Checked;       // I3：默认关，只有勾上才是 true
+            options.MaxDepth = (int)_numDepth.Value;
+            options.Password = _txtPassword.Text.Length > 0 ? _txtPassword.Text : null;
+            if (_chkRememberRun.Checked && options.Password != null) { _runWidePassword = options.Password; }
+
+            if (!string.IsNullOrEmpty(_dictPath))
+            {
+                try { options.DictLines = new List<string>(File.ReadAllLines(_dictPath)); }
+                catch (Exception ex)
+                {
+                    Warn("读不出字典文件「" + _dictPath + "」（" + ex.GetType().Name + "）：本次不使用字典。");
+                }
+            }
+
+            foreach (string forced in _forcedPaths) { options.ForceTreatAsArchive.Add(forced); }
+
+            options.Cancellation = _runCts == null ? CancellationToken.None : _runCts.Token;
+            return options;
+        }
+
+        // 起一次运行。paths 是这一批要处理的文件；retryLabel 用于文案（首次 / 重试）。
+        private void StartRun(List<string> paths, RunOptions options, int discovered)
+        {
+            if (_running || paths == null || paths.Count == 0) { return; }
+
+            _runCts = new CancellationTokenSource();
+            options.Cancellation = _runCts.Token;
+            _options = options;
+            _running = true;
+            _counters.Started = 0;
+            _counters.Finished = 0;
+            _currentMember = "";
+            _discoveredAtStart = discovered;
+            _lastSignalTicks = DateTime.Now.Ticks;
+            _cancelRequestedAt = DateTime.MinValue;
+            _watch = Stopwatch.StartNew();
+            lock (_pendingGate) { _pendingResults.Clear(); }
+            _results = new List<ArchiveResult>();
+            _unprocessedCount = 0;
+
+            _log = new LogSink(BuildLogPath());
+            if (!string.IsNullOrEmpty(options.Password)) { _log.RegisterSecret(options.Password); }
+            if (!string.IsNullOrEmpty(_runWidePassword)) { _log.RegisterSecret(_runWidePassword); }
+            foreach (KeyValuePair<string, string> pair in _perItemPassword) { _log.RegisterSecret(pair.Value); }
+            _btnOpenLog.Enabled = true;
+            if (!_log.FileOk) { Warn(_log.FileProblem); }     // 写不了文件要**看得见**（绝不静默）
+            _lblLogHint.Text = "运行日志（只显示最后 " + LogTailLines + " 行；完整日志：" + _log.FilePath + "）";
+
+            AppendLog("==== 本次运行开始：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
+                      "，目标 " + paths.Count + " 项 ====");
+            if (options.DeleteOriginals) { AppendLog("注意：已开启「解压成功后删除原包」（只处置解压成功且校验通过的原包）。"); }
+
+            // J4：清空上一批的尾部（日志文件是新的一份）。
+            _logDirty = true;
+            _itemsDirty = true;
+
+            _btnStart.Enabled = false;
+            _btnCancel.Enabled = true;
+            _chkDelete.Enabled = false;
+            _numDepth.Enabled = false;
+            _txtPassword.Enabled = false;
+            _btnLoadDict.Enabled = false;
+            SetItemActionsEnabled(false);
+
+            // 新一批：逐项列表清空，**增量追加的游标也必须归零**（见 RefreshItems）——
+            // 不归零的话，新批的前几条会被当成「已经过账」而漏掉，或者与上一批的行混在一起。
+            // 代价说清楚：重试轮的列表只显示这一轮的结果，整场的完整记录在日志文件里。
+            _lstItems.Items.Clear();
+            _rows = new List<ArchiveResult>();
+            _itemsBuilt = 0;
+            _unprocessedCount = 0;
+
+            _progressBar.Style = ProgressBarStyle.Continuous;
+            _progressBar.Value = 0;
+            _lblCounters.Text = FormatCountersLine(_results, 0);
+            _uiTimer.Start();
+
+            SetKeepAwake(true);
+
+            Thread worker = new Thread(delegate() { RunWorker(paths, options); });
+            worker.IsBackground = true;
+            worker.Name = "rerar-gui-run";
+            worker.Start();
+        }
+
+        private string BuildLogPath()
+        {
+            string root;
+            try
+            {
+                root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    Path.Combine("Rerar", "logs"));
+            }
+            catch (Exception)
+            {
+                root = Path.GetTempPath();
+            }
+
+            string name = "run-" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".log";
+            string candidate = Path.Combine(root, name);
+
+            // 目录建不出来（权限/漫游配置）就退回临时目录：日志是辅助，绝不能因此跑不起来。
+            try
+            {
+                string dir = Path.GetDirectoryName(candidate);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+                return candidate;
+            }
+            catch (Exception)
+            {
+                return Path.Combine(Path.GetTempPath(), name);
+            }
+        }
+
+        // 工作线程：定位引擎 → 跑 Extractor → 补未处理剩余项 → 把摘要编组回 UI。
+        // 这里**不做任何判定**：成功/失败/跳过全部由 Core 给出。
+        private void RunWorker(List<string> paths, RunOptions options)
+        {
+            RunSummary summary = null;
+            string fatal = null;
+
+            try
+            {
+                EngineInfo engine = EngineLocator.Resolve();
+                string engineText = "解压引擎：7-Zip " + EngineLocator.FormatVersion(engine.Version) +
+                    (engine.IsEmbedded ? "（内置便携版，已释放到本机）" : "（本机安装）") + "：" + engine.Path;
+                options.SevenZipPath = engine.Path;
+                UiPost(delegate { _lblEngineInfo.Text = engineText; });
+                AppendLog(engineText);
+
+                Extractor extractor = new Extractor(options, new DriveSpaceProvider(), new Sink(this));
+                summary = extractor.Run(paths);
+            }
+            catch (Exception ex)
+            {
+                // Extractor 自己会把单个归档的异常收成 FAIL；能跑到这里的是运行级的意外。
+                fatal = ex.GetType().Name + "：" + ex.Message;
+            }
+
+            if (summary == null)
+            {
+                summary = new RunSummary();
+                summary.FatalReason = "无法开始解压：" + (fatal == null ? "原因未知" : fatal);
+            }
+            else
+            {
+                // 未处理剩余项的合成与 CLI **共用同一份实现**（含「不重复计数」这条规则）。
+                Program.AddUnprocessedRemainder(summary);
+            }
+
+            RunSummary final = summary;
+            UiPost(delegate { FinishRun(final); });
+        }
+
+        // ------------------------------------------------------------------
+        // 进度回调（**工作线程**上被调用：只改字段 + 编组，绝不碰控件、绝不抛）
+        // ------------------------------------------------------------------
+
+        private sealed class Sink : IProgressSink
+        {
+            private readonly MainForm _form;
+
+            public Sink(MainForm form) { _form = form; }
+
+            public void ArchiveStarted(string archivePath, int depth)
+            {
+                // 这个方法在**工作线程**上跑：只写字段（Interlocked/简单赋值）与线程安全的 LogSink，
+                // 控件一律由 UiPost 碰。
+                try
+                {
+                    Interlocked.Increment(ref _form._counters.Started);
+                    _form._currentMember = archivePath == null ? "" : Path.GetFileName(archivePath);
+                    _form._lastSignalTicks = DateTime.Now.Ticks;
+                    // 逐归档写日志：这是「完整日志」的主要内容（Core 只发开始/结束/进度三种回调，
+                    // 它自己的 IProgressSink.Message 目前没有调用点 —— 界面自己把逐项事件记下来，
+                    // 用户三小时后复盘时才有东西可看）。
+                    _form.AppendLog("[开始] " + (archivePath == null ? "" : archivePath) + "（第 " + depth + " 层）");
+                }
+                catch (Exception) { }
+            }
+
+            public void ArchiveFinished(ArchiveResult result)
+            {
+                try
+                {
+                    if (result == null) { return; }
+                    lock (_form._pendingGate) { _form._pendingResults.Add(result); }
+                    Interlocked.Increment(ref _form._counters.Finished);
+                    _form._lastSignalTicks = DateTime.Now.Ticks;
+                    _form._itemsDirty = true;
+
+                    // 结局文案取自 Reporter（与报告/导出**同一张表**），绝不在这里另写一份。
+                    string line = "[结束] " + result.Path + " → " + Reporter.StatusText(result.Status) +
+                        "（文件 " + result.Files + "，失败 " + result.Failed + "）";
+                    if (result.Layers > 0) { line += "，层数 " + result.Layers; }
+                    if (!string.IsNullOrEmpty(result.OutputDir)) { line += "，产物 " + result.OutputDir; }
+                    if (!string.IsNullOrEmpty(result.Message)) { line += "；" + result.Message; }
+                    _form.AppendLog(line);
+                }
+                catch (Exception) { }
+            }
+
+            public void Progress(string archivePath, int percent, string member)
+            {
+                try
+                {
+                    // percent 只用于「有心跳」这件事本身：实测（研究 V27）`7z x` 的这个回调在真实
+                    // 解压上一次都不会触发，所以界面**不**把包内百分比当进度来源（那是谎话），
+                    // 只把它当作「子进程还活着」的信号，用来区分「大文件处理中」和「卡死」。
+                    _form._currentMember = member == null ? "" : member;
+                    _form._lastSignalTicks = DateTime.Now.Ticks;
+                }
+                catch (Exception) { }
+            }
+
+            public void Message(string text)
+            {
+                // 一行日志：Sink 自己写（LogSink 内部有锁，线程安全，且**永不抛**）。
+                try { _form.AppendLog(text); }
+                catch (Exception) { }
+            }
+        }
+
+        // 进度字段用 int 字段 + Interlocked（Interlocked 需要 ref 到字段，故直接放在 MainForm 上，
+        // Sink 通过 _form 访问）。
+
+        // ------------------------------------------------------------------
+        // UI 线程编组（唯一入口）
+        // ------------------------------------------------------------------
+
+        // 把一段动作编组到 UI 线程。**绝不抛异常**：窗体一旦被销毁（用户关掉了窗口），
+        // 工作线程的后续回调必须被静默丢弃 —— 让一个已销毁的窗体把异常抛回 Extractor 的回调里，
+        // 会顺着调用栈掀翻整批解压（Task 3 的裁定：回调异常在 Run 调用点浮出来）。
+        private void UiPost(MethodInvoker action)
+        {
+            if (action == null) { return; }
+
+            try
+            {
+                if (IsDisposed || Disposing) { return; }
+
+                // 判据是**线程身份**，不是 Control.InvokeRequired：没有句柄时 InvokeRequired 返回
+                // false，用它做判据就会把界面动作直接跑在**工作线程**上（那正是「控件必须编组」
+                // 要防的事）。线程身份判据在有没有句柄两种情形下都对。
+                if (Thread.CurrentThread.ManagedThreadId == _uiThreadId)
+                {
+                    action();
+                    return;
+                }
+
+                // 还没有句柄 ⇒ 还没有消息循环 ⇒ 无处投递。丢弃这一次显示是安全的：最终结果由
+                // FinishRun 从 RunSummary 整体重建（不是靠逐条回调累出来的），不会丢任何事实。
+                if (!IsHandleCreated) { return; }
+                BeginInvoke(action);
+            }
+            catch (Exception)
+            {
+                // 窗体在竞态中被销毁（InvalidOperationException / ObjectDisposedException）：
+                // 丢弃这一次显示。日志文件仍在写，解压本身照常。
+            }
+        }
+
+        private void AppendLog(string line)
+        {
+            if (line == null) { return; }
+            LogSink sink = _log;
+            if (sink == null)
+            {
+                // 还没有日志文件（例如启动阶段的提权提示）：只记进界面尾部（内存里有界缓冲）。
+                _startupLog.Add(line);
+                _logDirty = true;
+                return;
+            }
+            sink.Write(line);
+            _logDirty = true;
+        }
+
+        private readonly List<string> _startupLog = new List<string>();
+
+        // ==================================================================
+        // UI 心跳：**唯一定期刷新点**（J4 的合并窗口）
+        //   * 无论 Core 回调多密集，界面每秒最多被碰 1000/UiCoalesceMs 次（默认 5 次）；
+        //   * 进度、日志尾部、逐项列表都在这里刷新，别处一律只置脏标记。
+        // ==================================================================
+
+        private void UiTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_running && _watch != null) { _lastElapsed = _watch.Elapsed; }
+                DrainPendingResults();
+
+                if (_logDirty)
+                {
+                    _logDirty = false;
+                    LogSink sink = _log;
+                    if (sink != null) { _logView.SetLines(sink.Snapshot()); sink.Flush(); }
+                    else { _logView.SetLines(_startupLog.ToArray()); }
+                }
+
+                if (_itemsDirty)
+                {
+                    _itemsDirty = false;
+                    RefreshItems();
+                }
+
+                if (_running) { UpdateRunningLabels(); }
+            }
+            catch (Exception ex)
+            {
+                // 心跳里的意外绝不能让窗口崩掉（也不该中断运行）：记一条就够。
+                try { AppendLog("界面刷新异常（" + ex.GetType().Name + "：" + ex.Message + "）"); }
+                catch (Exception) { }
+            }
+        }
+
+        private void DrainPendingResults()
+        {
+            List<ArchiveResult> drained = null;
+            lock (_pendingGate)
+            {
+                if (_pendingResults.Count == 0) { return; }
+                drained = new List<ArchiveResult>(_pendingResults);
+                _pendingResults.Clear();
+            }
+
+            foreach (ArchiveResult result in drained)
+            {
+                _results.Add(result);
+                // 需要密码：弹出**停靠式、非模态**面板（J6），并把「还有 N 个待处理」说清楚。
+                if (result.Status == ArchiveStatus.SkippedNeedsPassword)
+                {
+                    ShowPasswordAsk(result.Path);
+                }
+            }
+        }
+
+        private void UpdateRunningLabels()
+        {
+            int started = _counters.Started;
+            // 分母是**已发现的工作量**：嵌套解出来的新包会让它增长，所以显示「已发现 M」而不是百分比。
+            int discovered = _discoveredAtStart;
+            if (started > discovered) { discovered = started; }
+
+            string text = FormatProgressText(started, discovered, _lastElapsed);
+            string eta = FormatEta(_lastElapsed, _counters.Finished, discovered - started);
+            if (eta.Length > 0) { text += " · " + eta; }
+            if (_cancelRequestedAt != DateTime.MinValue)
+            {
+                TimeSpan waited = DateTime.Now - _cancelRequestedAt;
+                text += " · 正在取消，最长等待 10 秒（已等 " + (int)waited.TotalSeconds + " 秒）";
+            }
+            _lblProgress.Text = text;
+
+            // 进度条按「已发现的工作量」推进（**不是**百分比——它是同一件事的另一种说法，
+            // 但值是真实的已完成/已发现之比，且分母会跟着发现增长）。
+            if (discovered > 0)
+            {
+                int value = (int)((long)started * 100L / discovered);
+                if (value < 0) { value = 0; }
+                if (value > 100) { value = 100; }
+                _progressBar.Value = value;
+            }
+
+            // J3：30 秒没有任何信号就明说「正在处理大文件，已用 …」，免得与假死无法区分。
+            long silentTicks = DateTime.Now.Ticks - _lastSignalTicks;
+            if (silentTicks > TimeSpan.TicksPerSecond * HeartbeatSeconds)
+            {
+                _lblStatus.Text = "状态：正在处理大文件，已用 " + FormatElapsed(_lastElapsed) +
+                    "（" + (int)TimeSpan.FromTicks(silentTicks).TotalSeconds + " 秒没有新进度，仍在运行）";
+            }
+            else if (_currentMember.Length > 0)
+            {
+                _lblStatus.Text = "状态：" + FormatExtractedLine(_results) + " · ⏳ 正在解压 " + _currentMember;
+            }
+
+            _lblCounters.Text = FormatCountersLine(_results, _unprocessedCount);
+        }
+
+        // ==================================================================
+        // 结束（UI 线程）
+        // ==================================================================
+
+        private void FinishRun(RunSummary summary)
+        {
+            _running = false;
+            _uiTimer.Stop();
+            if (_watch != null) { _lastElapsed = _watch.Elapsed; }
+            _watch = null;
+            DrainPendingResults();
+
+            _results = summary.Results == null ? new List<ArchiveResult>() : summary.Results;
+            _unprocessedCount = summary.NotAttempted == null ? 0 : summary.NotAttempted.Count;
+
+            SetKeepAwake(false);
+            AppendLog("==== 本次运行结束，已用 " + FormatElapsed(_lastElapsed) + " ====");
+            if (!string.IsNullOrEmpty(summary.FatalReason)) { AppendLog("致命错误（整批中止）：" + summary.FatalReason); }
+            if (summary.Cancelled) { AppendLog("本次运行已被取消：未完成的项已如实列出，原包一律保留。"); }
+            if (summary.JournalWriteFailures > 0)
+            {
+                AppendLog("警告：崩溃恢复日志有 " + summary.JournalWriteFailures + " 次写入失败：" +
+                          (summary.JournalProblem == null ? "" : summary.JournalProblem));
+            }
+
+            LogSink sink = _log;
+            if (sink != null) { sink.Flush(); _logView.SetLines(sink.Snapshot()); }
+
+            RefreshItems();
+            _itemsDirty = false;
+            _logDirty = false;
+
+            // 运行中拖进来的项标着「下一批」；这一批已经结束了，它们就从**现在**起算这一批
+            //（不清掉这个标记的话，RefreshInputSummary 会把「开始解压」一直禁用着 —— 用户会
+            // 拖入新文件却发现按不动按钮）。
+            _nextBatchOnly = false;
+            RefreshInputSummary();
+            _btnCancel.Enabled = false;
+            _chkDelete.Enabled = true;
+            _numDepth.Enabled = true;
+            _txtPassword.Enabled = true;
+            _btnLoadDict.Enabled = true;
+            _progressBar.Style = ProgressBarStyle.Continuous;
+            _lblCounters.Text = FormatCountersLine(_results, _unprocessedCount);
+            _lblStatus.Text = FormatExtractedLine(_results);
+            if (!string.IsNullOrEmpty(summary.FatalReason))
+            {
+                _lblProgress.Text = "整批因致命错误中止（已用 " + FormatElapsed(_lastElapsed) + "）：" + summary.FatalReason;
+            }
+            else if (summary.Cancelled)
+            {
+                _lblProgress.Text = "已取消（已用 " + FormatElapsed(_lastElapsed) + "）：未处理的项如实列为「未处理（已取消）」，原包保留。";
+            }
+            else
+            {
+                _lblProgress.Text = "本次运行已结束 · 已用 " + FormatElapsed(_lastElapsed);
+            }
+
+            // J14：完成通知 —— 托盘气泡 + 任务栏闪烁 + **非模态**结果区（不抢焦点，绝不 modal）。
+            if (HasActionResult()) { SetDetailsVisible(true); }
+            NotifyCompletion(summary);
+
+            if (_retryQueue.Count > 0 && !_exitWhenDone)
+            {
+                List<string> retry = new List<string>(_retryQueue);
+                _retryQueue.Clear();
+                AppendLog("按逐项动作重试 " + retry.Count + " 项。");
+                StartRetry(retry);
+                return;
+            }
+
+            if (_exitWhenDone)
+            {
+                _allowClose = true;
+                Close();
+            }
+        }
+
+        private bool HasActionResult()
+        {
+            foreach (ArchiveResult r in _results)
+            {
+                if (r == null) { continue; }
+                if (r.Status != ArchiveStatus.Completed) { return true; }
+            }
+            return false;
+        }
+
+        private void NotifyCompletion(RunSummary summary)
+        {
+            string text = FormatExtractedLine(_results) + "；" +
+                FormatCountersLine(_results, _unprocessedCount);
+
+            try
+            {
+                if (!Visible || WindowState == FormWindowState.Minimized || !ContainsFocus)
+                {
+                    EnsureTray();
+                    _tray.BalloonTipTitle = "Rerar 解压完成";
+                    _tray.BalloonTipText = text;
+                    _tray.Visible = true;
+                    _tray.ShowBalloonTip(6000);
+                }
+            }
+            catch (Exception) { }
+
+            try
+            {
+                if (!ContainsFocus && IsHandleCreated)
+                {
+                    FLASHWINFO info = new FLASHWINFO();
+                    info.cbSize = (uint)Marshal.SizeOf(typeof(FLASHWINFO));
+                    info.hwnd = Handle;
+                    info.dwFlags = FlashwAll | FlashwTimerNoForeground;
+                    info.uCount = 4;
+                    info.dwTimeout = 0;
+                    FlashWindowEx(ref info);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        // 逐项重试：为新的一批建一个新的 Extractor（Extractor 一个实例只跑一次 Run）。
+        private void StartRetry(List<string> paths)
+        {
+            RunOptions options = new RunOptions();
+            options.DeleteOriginals = _chkDelete.Checked;
+            options.MaxDepth = (int)_numDepth.Value;
+            options.Password = _runWidePassword.Length > 0 ? _runWidePassword : null;
+            foreach (string forced in _forcedPaths) { options.ForceTreatAsArchive.Add(forced); }
+            if (!string.IsNullOrEmpty(_dictPath))
+            {
+                try { options.DictLines = new List<string>(File.ReadAllLines(_dictPath)); }
+                catch (Exception) { }
+            }
+
+            // 逐个「仅此压缩包」记住的密码：按密码分组，每组一次 Run（避免为一项就起一轮）。
+            Dictionary<string, List<string>> groups = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (string path in paths)
+            {
+                string password;
+                string key = _perItemPassword.TryGetValue(path, out password) ? password : "";
+                List<string> bucket;
+                if (!groups.TryGetValue(key, out bucket)) { bucket = new List<string>(); groups[key] = bucket; }
+                bucket.Add(path);
+            }
+
+            string first = null;
+            foreach (KeyValuePair<string, List<string>> group in groups)
+            {
+                if (first == null) { first = group.Key; }
+            }
+
+            // 简化且诚实：一次 Run 只能带一个「全局密码」。所以把**第一个**分组之外的分组留在队列里，
+            // 本轮的下一轮再跑（消息里会说清）。绝大多数情形只有一个分组。
+            List<string> untried = new List<string>();
+            string chosenKey = first == null ? "" : first;
+            List<string> firstPaths = new List<string>();
+            foreach (KeyValuePair<string, List<string>> group in groups)
+            {
+                if (string.Equals(group.Key, chosenKey, StringComparison.Ordinal))
+                {
+                    firstPaths.AddRange(group.Value);
+                }
+                else
+                {
+                    untried.AddRange(group.Value);
+                }
+            }
+
+            options.Password = chosenKey.Length > 0 ? chosenKey : options.Password;
+            if (untried.Count > 0)
+            {
+                _retryQueue.AddRange(untried);
+                AppendLog("另有 " + untried.Count + " 项带不同的「仅此压缩包」密码，会在下一轮重试。");
+            }
+
+            StartRun(firstPaths, options, firstPaths.Count);
+        }
+
+        // ==================================================================
+        // 逐项列表与逐项动作（§6.1）
+        // ==================================================================
+
+        // 逐项列表刷新。**增量追加**，绝不每次整体重建：
+        // 一批几百上千个归档时，每 200ms 重建整张表（O(n) 的项构造）会让界面明显发卡 ——
+        // 这正是 J4 要防的同一类问题（只是对象从日志换成了列表）。
+        // 结果在尾部增长（同一批内顺序稳定；未处理剩余项也是追加），所以只需补上新行；
+        // 只有列表比结果**长**（新一批开始 / _results 被整体替换）时才整体重建。
+        private void RefreshItems()
+        {
+            int selected = _lstItems.SelectedIndices.Count > 0 ? _lstItems.SelectedIndices[0] : -1;
+
+            if (_itemsBuilt > _results.Count)
+            {
+                _lstItems.BeginUpdate();
+                try
+                {
+                    _lstItems.Items.Clear();
+                    _rows.Clear();
+                }
+                finally
+                {
+                    _lstItems.EndUpdate();
+                }
+                _itemsBuilt = 0;
+            }
+
+            if (_itemsBuilt < _results.Count)
+            {
+                _lstItems.BeginUpdate();
+                try
+                {
+                    for (int i = _itemsBuilt; i < _results.Count; i++)
+                    {
+                        _itemsBuilt++;                       // 游标按 _results 的下标走，null 也要往前走
+                        ArchiveResult r = _results[i];
+                        if (r == null) { continue; }         // 与 Reporter 同约定：null 元素不凭空多出一行
+
+                        _rows.Add(r);                        // _rows 与 ListView 的行**一一对应**（下标 = 选中项）
+                        ListViewItem item = new ListViewItem(Shorten(r.Path, 80));
+                        item.SubItems.Add(Reporter.StatusText(r.Status));   // 与报告/导出**同一套**中文结局文案
+                        item.SubItems.Add(r.Files + " / " + r.Failed);
+                        item.SubItems.Add(Shorten(r.Message, 200));
+                        item.Tag = r;
+                        _lstItems.Items.Add(item);
+                    }
+                }
+                finally
+                {
+                    _lstItems.EndUpdate();
+                }
+            }
+
+            if (selected >= 0 && selected < _lstItems.Items.Count) { _lstItems.Items[selected].Selected = true; }
+            UpdateItemActions();
+        }
+
+        private static string Shorten(string text, int max)
+        {
+            if (string.IsNullOrEmpty(text)) { return ""; }
+            string single = text.Replace("\r", " ").Replace("\n", " ");
+            if (single.Length <= max) { return single; }
+            return single.Substring(0, max) + "…";
+        }
+
+        private ArchiveResult SelectedResult()
+        {
+            if (_lstItems.SelectedIndices.Count == 0) { return null; }
+            int index = _lstItems.SelectedIndices[0];
+            if (index < 0 || index >= _rows.Count) { return null; }
+            return _rows[index];
+        }
+
+        private void LstItems_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            UpdateItemActions();
+        }
+
+        // §6.1 的逐项动作按**结局**启用：只有「还没成功」的项才有可做的事，且成功项没有可强制的余地。
+        private void UpdateItemActions()
+        {
+            ArchiveResult r = SelectedResult();
+            bool idle = !_running;
+            bool actionable = r != null && r.Status != ArchiveStatus.Completed;
+
+            _btnForceArchive.Enabled = idle && actionable;
+            _btnEnterPassword.Enabled = idle && actionable;
+            _btnRetry.Enabled = idle && actionable;
+            bool hasOutput = r != null && !string.IsNullOrEmpty(r.OutputDir) && Directory.Exists(r.OutputDir);
+            _btnOpenOutput.Enabled = hasOutput || (r != null && !string.IsNullOrEmpty(r.OutputDir));
+        }
+
+        private void SetItemActionsEnabled(bool enabled)
+        {
+            if (!enabled)
+            {
+                _btnForceArchive.Enabled = false;
+                _btnEnterPassword.Enabled = false;
+                _btnRetry.Enabled = false;
+                _btnOpenOutput.Enabled = false;
+            }
+            else
+            {
+                UpdateItemActions();
+            }
+        }
+
+        // §6.1 的「强制按压缩包尝试」：映射到 RunOptions.ForceTreatAsArchive（**只**放开格式门控，
+        // Core 的 I1/I2/I3/I4 与预检上限照旧全部适用 —— 这一点由 Core 的用例钉住）。
+        private void BtnForceArchive_Click(object sender, EventArgs e)
+        {
+            ArchiveResult r = SelectedResult();
+            if (r == null || string.IsNullOrEmpty(r.Path)) { return; }
+
+            _forcedPaths.Add(r.Path);
+            AppendLog("逐项动作：对「" + r.Path + "」强制按压缩包尝试（只跳过格式识别门控，其余安全判定照旧）");
+            EnqueueRetry(r.Path, "强制按压缩包尝试");
+        }
+
+        private void BtnEnterPassword_Click(object sender, EventArgs e)
+        {
+            ArchiveResult r = SelectedResult();
+            if (r == null || string.IsNullOrEmpty(r.Path)) { return; }
+            ShowPasswordAsk(r.Path);
+        }
+
+        private void BtnRetry_Click(object sender, EventArgs e)
+        {
+            ArchiveResult r = SelectedResult();
+            if (r == null || string.IsNullOrEmpty(r.Path)) { return; }
+            EnqueueRetry(r.Path, "重试");
+        }
+
+        private void BtnOpenOutput_Click(object sender, EventArgs e)
+        {
+            ArchiveResult r = SelectedResult();
+            if (r == null || string.IsNullOrEmpty(r.OutputDir)) { return; }
+
+            try
+            {
+                if (Directory.Exists(r.OutputDir)) { Process.Start(r.OutputDir); }
+                else { Warn("输出目录已经不存在了：" + r.OutputDir); }
+            }
+            catch (Exception ex)
+            {
+                Warn("无法打开输出目录（" + ex.GetType().Name + "：" + ex.Message + "）：" + r.OutputDir);
+            }
+        }
+
+        private void EnqueueRetry(string path, string what)
+        {
+            if (!_retryQueue.Contains(path)) { _retryQueue.Add(path); }
+            _lblStatus.Text = "状态：已把「" + Path.GetFileName(path) + "」加入重试队列（" + what +
+                              "）；当前批次结束后重试，删除开关沿用当前设置。";
+        }
+
+        // ==================================================================
+        // 密码：停靠式非模态面板（J6）
+        // ==================================================================
+
+        private void ShowPasswordAsk(string path)
+        {
+            if (string.IsNullOrEmpty(path)) { return; }
+
+            _pendingPasswordPath = path;
+            int remaining = _inputs.Count - _counters.Finished;
+            if (remaining < 0) { remaining = 0; }
+            _lblPasswordAsk.Text = "🔒 当前压缩包需要密码 — 还有 " + remaining + " 个待处理。\r\n" +
+                "压缩包：" + path;
+            _panelPasswordAsk.Visible = true;
+            _txtPasswordAsk.Text = "";
+            // 刻意**不**抢焦点（不 Select/Focus）：用户在别处打字时被抢走焦点同样是 bug；
+            // 面板只是停靠在那里，用户想用时点它即可。
+        }
+
+        private void BtnPwThisOnly_Click(object sender, EventArgs e)
+        {
+            string path = _pendingPasswordPath;
+            string password = _txtPasswordAsk.Text;
+            if (string.IsNullOrEmpty(path) || password.Length == 0) { return; }
+
+            _perItemPassword[path] = password;
+            if (_log != null) { _log.RegisterSecret(password); }
+            _panelPasswordAsk.Visible = false;
+            _pendingPasswordPath = null;
+            AppendLog("用户为「" + path + "」提供了密码（仅此压缩包；密码值不记录）。");
+            EnqueueRetry(path, "输入密码（仅此压缩包）");
+            TryStartIdleRetry();
+        }
+
+        private void BtnPwRememberAll_Click(object sender, EventArgs e)
+        {
+            string password = _txtPasswordAsk.Text;
+            if (password.Length == 0) { return; }
+
+            _runWidePassword = password;
+            if (_log != null) { _log.RegisterSecret(password); }
+
+            // 「本次运行全部记住」：写进**正在用的** RunOptions.Password。Core 的密码阶梯第 1 层是
+            // 每个归档现读的（Extractor.FindPassword），所以后续归档会立刻用上它 —— 这正是这个动作
+            // 该有的语义，而且它走的仍是 Core 原本那条路（没有旁路）。
+            if (_options != null) { _options.Password = password; }
+            _txtPassword.Text = password;
+            _chkRememberRun.Checked = true;
+
+            string path = _pendingPasswordPath;
+            _panelPasswordAsk.Visible = false;
+            _pendingPasswordPath = null;
+            AppendLog("用户选择「本次运行全部记住」（密码值不记录）：后续归档会把它作为首选候选。");
+            if (!string.IsNullOrEmpty(path)) { EnqueueRetry(path, "输入密码（本次运行全部记住）"); }
+            TryStartIdleRetry();
+        }
+
+        private void BtnPwSkip_Click(object sender, EventArgs e)
+        {
+            string path = _pendingPasswordPath;
+            _panelPasswordAsk.Visible = false;
+            _pendingPasswordPath = null;
+            // 跳过的包**如实保留**为「跳过（需要密码）」—— 绝不改成失败，也绝不重试。
+            AppendLog("用户跳过「" + path + "」：它的结局仍是「跳过（需要密码）」，不是失败。");
+        }
+
+        private void TryStartIdleRetry()
+        {
+            if (_running || _retryQueue.Count == 0) { return; }
+            List<string> retry = new List<string>(_retryQueue);
+            _retryQueue.Clear();
+            StartRetry(retry);
+        }
+
+        // ==================================================================
+        // 取消（两段式；J/§6.10）
+        // ==================================================================
+
+        private void BtnCancel_Click(object sender, EventArgs e)
+        {
+            if (!_running) { return; }
+            RequestCancel();
+        }
+
+        // 两段式：先**请求**取消（Core 的 CancellationToken 会让 SevenZipRunner 通过 Job Object
+        // 打断正在跑的子进程，退出码 1223 被 Core 判成「已取消」而不是失败）；界面如实显示倒计时。
+        // 绝不 Process.Kill() 了事 —— 那是 Core 的职责，而且它走的是 Job Object 那条正路。
+        private void RequestCancel()
+        {
+            if (!_running) { return; }
+
+            try
+            {
+                _cancelRequestedAt = DateTime.Now;
+                _btnCancel.Enabled = false;
+                _lblStatus.Text = "状态：正在取消，最长等待 10 秒（原包一律保留）…";
+                AppendLog("用户请求取消：已发出取消信号，正在等待正在进行的 7-Zip 调用结束（原包一律保留）。");
+                if (_runCts != null) { _runCts.Cancel(); }
+            }
+            catch (Exception ex)
+            {
+                AppendLog("取消信号发出失败（" + ex.GetType().Name + "：" + ex.Message + "）");
+            }
+        }
+
+        // ==================================================================
+        // 关闭窗口三选一（J7）
+        // ==================================================================
+
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (_allowClose) { SaveSettings(); return; }
+
+            if (_running)
+            {
+                // 长任务的默认是「继续在后台运行」（J7）——把默认按钮放在这里，而不是「取消并退出」。
+                DialogResult choice = MessageBox.Show(this,
+                    "解压仍在进行中（已用 " + FormatElapsed(_lastElapsed) + "）。\r\n\r\n" +
+                    "是：继续在后台运行（窗口最小化到通知区域，任务不会中断）\r\n" +
+                    "否：取消任务并退出（正在进行的解压会被取消，原包一律保留）\r\n" +
+                    "取消：返回，什么都不做",
+                    "Rerar", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button1);
+
+                if (choice == DialogResult.Cancel) { e.Cancel = true; return; }
+
+                if (choice == DialogResult.Yes)
+                {
+                    e.Cancel = true;
+                    MinimizeToTray();
+                    return;
+                }
+
+                // 取消任务并退出：如实告知「取消不是立刻的」，等运行真的收尾之后再关。
+                e.Cancel = true;
+                _exitWhenDone = true;
+                RequestCancel();
+                return;
+            }
+
+            if (_scanRemaining > 0)
+            {
+                DialogResult choice = MessageBox.Show(this,
+                    "还在统计文件夹内容（已发现 " + _scanFound + " 个文件）。要放弃统计并退出吗？",
+                    "Rerar", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+                if (choice == DialogResult.No) { e.Cancel = true; return; }
+                try { if (_scanCts != null) { _scanCts.Cancel(); } }
+                catch (Exception) { }
+            }
+
+            SaveSettings();
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                if (WindowState == FormWindowState.Normal)
+                {
+                    _settings.HasGeometry = true;
+                    _settings.WindowX = Bounds.X;
+                    _settings.WindowY = Bounds.Y;
+                    _settings.WindowWidth = Bounds.Width;
+                    _settings.WindowHeight = Bounds.Height;
+                }
+                _settings.Maximized = WindowState == FormWindowState.Maximized;
+                _settings.Save();
+            }
+            catch (Exception)
+            {
+                // 存设置失败绝不能让关闭窗口变成报错。
+            }
+        }
+
+        private void MinimizeToTray()
+        {
+            EnsureTray();
+            try
+            {
+                _tray.Visible = true;
+                _tray.BalloonTipTitle = "Rerar 仍在后台运行";
+                _tray.BalloonTipText = "解压继续在后台进行。双击托盘图标可以重新打开窗口。";
+                _tray.ShowBalloonTip(4000);
+            }
+            catch (Exception) { }
+
+            Hide();
+            ShowInTaskbar = false;
+        }
+
+        private void EnsureTray()
+        {
+            if (_tray != null) { return; }
+
+            _tray = new NotifyIcon();
+            _tray.Icon = SystemIcons.Application;
+            _tray.Text = "Rerar 递归解压";
+            _tray.Visible = false;
+            _tray.DoubleClick += delegate(object sender, EventArgs e)
+            {
+                try
+                {
+                    ShowInTaskbar = true;
+                    Show();
+                    WindowState = FormWindowState.Normal;
+                    Activate();
+                }
+                catch (Exception) { }
+            };
+        }
+
+        // ==================================================================
+        // 详情 / 日志 / 字典 / 高级项
+        // ==================================================================
+
+        private void BtnDetails_Click(object sender, EventArgs e)
+        {
+            SetDetailsVisible(!_panelDetails.Visible);
+        }
+
+        // 折叠时把详情那一行的高度压到 0：只把 Visible 设成 false 的话，Percent 行仍然占着空间，
+        // 窗口下半部会留下一大片空白（布局用 TableLayoutPanel，就得这样收）。
+        private void SetDetailsVisible(bool visible)
+        {
+            _panelDetails.Visible = visible;
+            _root.RowStyles[7] = new RowStyle(visible ? SizeType.Percent : SizeType.Absolute, visible ? 100F : 0F);
+            _btnDetails.Text = visible ? "收起详情 ▾" : "查看详情 ▸";
+            if (visible) { _logView.Invalidate(); }
+        }
+
+        private void BtnAdvanced_Click(object sender, EventArgs e)
+        {
+            _panelAdvanced.Visible = !_panelAdvanced.Visible;
+            _btnAdvanced.Text = _panelAdvanced.Visible ? "▾ 密码设置（可折叠）" : "▸ 密码设置（可折叠）";
+        }
+
+        private void ChkAutoScroll_CheckedChanged(object sender, EventArgs e)
+        {
+            // J4：暂停自动滚动 —— 用户往上翻的时候日志一直往下跳本身就是个 bug。
+            _logView.AutoScroll = _chkAutoScroll.Checked;
+        }
+
+        private void BtnOpenLog_Click(object sender, EventArgs e)
+        {
+            LogSink sink = _log;
+            if (sink == null || string.IsNullOrEmpty(sink.FilePath)) { return; }
+
+            try
+            {
+                if (File.Exists(sink.FilePath)) { Process.Start(sink.FilePath); }
+                else { Warn("日志文件还没有内容或已被移走：" + sink.FilePath); }
+            }
+            catch (Exception ex)
+            {
+                Warn("无法打开日志文件（" + ex.GetType().Name + "：" + ex.Message + "）：" + sink.FilePath);
+            }
+        }
+
+        private void BtnLoadDict_Click(object sender, EventArgs e)
+        {
+            OpenFileDialog dialog = new OpenFileDialog();
+            dialog.Title = "选择密码字典（每行一个）";
+            dialog.Filter = "文本文件|*.txt;*.dic;*.lst|所有文件|*.*";
+            try
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) { return; }
+                _dictPath = dialog.FileName;
+                _lblDict.Text = "已导入：" + _dictPath;
+            }
+            catch (Exception ex)
+            {
+                Warn("打开字典选择框失败（" + ex.GetType().Name + "：" + ex.Message + "）");
+            }
+        }
+
+        private void Warn(string message)
+        {
+            // 界面上的警告一律**非模态**：一个批量工具绝不能靠弹框来报错（§7：200 个失败不能弹 200 次）。
+            AppendLog("警告：" + message);
+            _lblStatus.Text = "状态：" + message;
+        }
+
+        // ==================================================================
+        // 进程/系统交互
+        // ==================================================================
+
+        private const uint EsContinuous = 0x80000000;
+        private const uint EsSystemRequired = 0x00000001;
+        private const uint FlashwAll = 0x00000003;
+        private const uint FlashwTimerNoForeground = 0x0000000C;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FLASHWINFO
+        {
+            public uint cbSize;
+            public IntPtr hwnd;
+            public uint dwFlags;
+            public uint uCount;
+            public uint dwTimeout;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint SetThreadExecutionState(uint esFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
+        // G5：长任务期间阻止系统睡眠（外接盘掉电 / I/O 报错是真实的故障模式）。结束/取消时清除。
+        private static void SetKeepAwake(bool keepAwake)
+        {
+            try
+            {
+                SetThreadExecutionState(keepAwake ? (EsContinuous | EsSystemRequired) : EsContinuous);
+            }
+            catch (Exception)
+            {
+                // 拿不到执行状态不算错误（某些受策略限制的会话里会失败），绝不能因此中断解压。
+            }
+        }
+
+        // 析构：把日志、托盘图标、计时器都收干净 —— 尤其是日志文件句柄（否则会把文件锁着）。
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { if (_uiTimer != null) { _uiTimer.Stop(); _uiTimer.Dispose(); } }
+                catch (Exception) { }
+                try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } }
+                catch (Exception) { }
+                try { if (_log != null) { _log.Dispose(); } }
+                catch (Exception) { }
+                try { if (_scanCts != null) { _scanCts.Cancel(); } }
+                catch (Exception) { }
+                try { SetKeepAwake(false); }
+                catch (Exception) { }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    // ======================================================================
+    // 拖放区：画一圈虚线边框（J11 的「大号虚线拖放区」）。就这一件事，没有别的行为。
+    // ======================================================================
+    internal sealed class DropZonePanel : Panel
+    {
+        public DropZonePanel()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(250, 250, 252);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (Pen pen = new Pen(Color.FromArgb(150, 150, 160), 1F))
+            {
+                pen.DashStyle = DashStyle.Dash;
+                Rectangle bounds = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
+                e.Graphics.DrawRectangle(pen, bounds);
+            }
+        }
+    }
+
+    // ======================================================================
+    // 删除二次确认（A5）。**不默认聚焦确定**：AcceptButton 为空，回车不会确认；Esc 只能返回。
+    // 之所以自己画一个而不是用 MessageBox：MessageBox 的默认按钮只能四选一，做不到「回车不确认」，
+    // 而「300 个包一路回车就全删了」正是要防的那件事。
+    // ======================================================================
+    internal sealed class ConfirmDeleteForm : Form
+    {
+        // 默认焦点要落到「返回」上（而不是确定）。必须留一个字段：构造函数里控件还没有可见性，
+        // 那时设 ActiveControl 会抛「无法激活不可见或已禁用的控件」（实测），所以放到 OnShown。
+        private readonly Button _back;
+
+        public ConfirmDeleteForm(int count)
+        {
+            SuspendLayout();
+
+            Text = "确认：解压成功后删除原包";
+            Font = new Font(MainForm.PickFontFamily(), 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(560, 240);
+
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.ColumnCount = 1;
+            root.RowCount = 3;
+            root.Padding = new Padding(14);
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            Label text = new Label();
+            text.Name = "lblConfirmText";
+            text.AutoSize = true;
+            text.MaximumSize = new Size(510, 0);
+            text.ForeColor = Color.FromArgb(178, 34, 34);
+            text.Text = MainForm.DeleteConfirmText(count);
+
+            Label warning = new Label();
+            warning.AutoSize = true;
+            warning.MaximumSize = new Size(510, 0);
+            warning.Text = "删除走回收站，但回收站「不是保证」：跨卷/可移动介质/超出配额时可能被永久删除，" +
+                "程序会在结果里如实报告实际处置方式。";
+
+            FlowLayoutPanel buttons = new FlowLayoutPanel();
+            buttons.AutoSize = true;
+            buttons.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            buttons.FlowDirection = FlowDirection.RightToLeft;
+            buttons.Dock = DockStyle.Fill;
+
+            Button back = new Button();
+            back.Name = "btnBack";
+            back.Text = "返回（不删除）";
+            back.AutoSize = true;
+            back.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            back.Padding = new Padding(10, 4, 10, 4);
+            back.TabIndex = 0;                       // 键盘默认落在这里：**不是**确定
+            back.DialogResult = DialogResult.Cancel;
+            back.AccessibleName = "返回，不开始（默认）";
+            _back = back;
+
+            Button confirm = new Button();
+            confirm.Name = "btnConfirm";
+            confirm.Text = "我明白，开始解压并删除";
+            confirm.AutoSize = true;
+            confirm.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            confirm.Padding = new Padding(10, 4, 10, 4);
+            confirm.TabIndex = 1;
+            confirm.DialogResult = DialogResult.OK;
+            confirm.AccessibleName = "确认开始（需要显式点击）";
+
+            buttons.Controls.Add(back);
+            buttons.Controls.Add(confirm);
+
+            // AcceptButton **刻意留空**：回车绝不能确认删除（用户一路回车不该把原包删掉）。
+            // CancelButton 设为「返回」：Esc 的语义只能是放弃。
+            CancelButton = back;
+            AcceptButton = null;
+
+            root.Controls.Add(text, 0, 0);
+            root.Controls.Add(warning, 0, 1);
+            root.Controls.Add(buttons, 0, 2);
+            Controls.Add(root);
+
+            ResumeLayout(true);
+        }
+
+        // 焦点默认落在「返回」上。放在 OnShown 而不是构造函数里：控件在构造期还没有可见性，
+        // 那时设置 ActiveControl 会当场抛异常（实测「无法激活不可见或已禁用的控件」）。
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            try
+            {
+                if (_back != null) { ActiveControl = _back; }
+            }
+            catch (Exception)
+            {
+                // 拿不到焦点也不影响正确性：AcceptButton 为空，回车本来就不能确认。
+            }
+        }
+    }
+
+    // ======================================================================
+    // 界面日志尾部：**自绘虚拟化**环形缓冲视图（J4）。
+    //   * 只绘制可见的那几十行（O(可见行)，与总行数无关）；
+    //   * 总容量是 MainForm.LogTailLines（2000），更老的行被丢掉（完整日志在文件里）；
+    //   * AutoScroll 关掉之后，用户往上翻时行位置保持不动（这就是「暂停自动滚动」）。
+    // ======================================================================
+    internal sealed class LogTailView : Control
+    {
+        private readonly VScrollBar _bar;
+        private string[] _lines = new string[0];
+        private int _first;
+        private int _lineHeight = 16;
+        private bool _syncingBar;
+        private bool _autoScroll = true;
+
+        public LogTailView()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
+                     ControlStyles.Selectable, true);
+            BackColor = Color.White;
+            ForeColor = Color.FromArgb(30, 30, 30);
+            TabStop = true;
+
+            _bar = new VScrollBar();
+            _bar.Dock = DockStyle.Right;
+            _bar.Visible = true;
+            _bar.ValueChanged += Bar_ValueChanged;
+            Controls.Add(_bar);
+        }
+
+        public bool AutoScroll
+        {
+            get { return _autoScroll; }
+            set
+            {
+                _autoScroll = value;
+                if (value) { ScrollTo(int.MaxValue); }
+            }
+        }
+
+        public int LineCount { get { return _lines.Length; } }
+        public int FirstVisibleLine { get { return _first; } }
+
+        private int VisibleLines
+        {
+            get { return Math.Max(1, (ClientSize.Height - 2) / _lineHeight); }
+        }
+
+        // 只在 **UI 线程**调用（MainForm 的心跳里）。
+        //
+        // 【关键】自动滚动关掉时**绝不能**再跳到尾部：用户往上翻着看历史，而每 200ms 的刷新把
+        // 视口拽回底部 ——「日志一直在往下跳」本身就是个 bug（审计 J4 专门点出这件事）。
+        // 关掉时只把位置夹回合法范围（内容变长不该改变用户正在看的那一行）。
+        public void SetLines(string[] lines)
+        {
+            _lines = lines == null ? new string[0] : lines;
+            _lineHeight = Math.Max(12, Font.Height);
+
+            if (_autoScroll)
+            {
+                ScrollTo(int.MaxValue);
+                return;
+            }
+
+            int max = Math.Max(0, _lines.Length - VisibleLines);
+            if (_first > max) { _first = max; }
+            if (_first < 0) { _first = 0; }
+            SyncBar();
+            Invalidate();
+        }
+
+        private void ScrollTo(int firstLine)
+        {
+            int max = Math.Max(0, _lines.Length - VisibleLines);
+            int wanted = firstLine == int.MaxValue ? max : firstLine;
+            if (wanted < 0) { wanted = 0; }
+            if (wanted > max) { wanted = max; }
+            _first = wanted;
+            SyncBar();
+            Invalidate();
+        }
+
+        private void SyncBar()
+        {
+            _syncingBar = true;
+            try
+            {
+                int max = Math.Max(0, _lines.Length - VisibleLines);
+                _bar.Minimum = 0;
+                _bar.Maximum = max <= 0 ? 0 : max + VisibleLines - 1;
+                _bar.LargeChange = Math.Max(1, VisibleLines);
+                _bar.SmallChange = 1;
+                _bar.Value = Math.Min(_first, Math.Max(_bar.Minimum, _bar.Maximum - _bar.LargeChange + 1));
+                _bar.Enabled = max > 0;
+            }
+            catch (Exception)
+            {
+            }
+            finally
+            {
+                _syncingBar = false;
+            }
+        }
+
+        private void Bar_ValueChanged(object sender, EventArgs e)
+        {
+            if (_syncingBar) { return; }
+            _autoScroll = false;
+            ScrollTo(_bar.Value);
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            _lineHeight = Math.Max(12, Font.Height);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            SyncBar();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            int lines = SystemInformation.MouseWheelScrollLines;
+            if (lines <= 0) { lines = 3; }
+            int delta = (e.Delta / 120) * lines;
+            _autoScroll = false;
+            ScrollTo(_first - delta);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            switch (keyData)
+            {
+                case Keys.Up:
+                case Keys.Down:
+                case Keys.PageUp:
+                case Keys.PageDown:
+                case Keys.Home:
+                case Keys.End:
+                    return true;
+            }
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            int page = Math.Max(1, VisibleLines - 1);
+            switch (e.KeyCode)
+            {
+                case Keys.Up: _autoScroll = false; ScrollTo(_first - 1); e.Handled = true; break;
+                case Keys.Down: ScrollTo(_first + 1); e.Handled = true; break;
+                case Keys.PageUp: _autoScroll = false; ScrollTo(_first - page); e.Handled = true; break;
+                case Keys.PageDown: ScrollTo(_first + page); e.Handled = true; break;
+                case Keys.Home: _autoScroll = false; ScrollTo(0); e.Handled = true; break;
+                case Keys.End: _autoScroll = true; ScrollTo(int.MaxValue); e.Handled = true; break;
+            }
+        }
+
+        // **只画可见行**：无论尾部里有多少行，一次重绘的代价都由窗口高度决定。
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            int textRight = ClientSize.Width - (_bar.Visible ? _bar.Width : 0) - 4;
+
+            using (SolidBrush back = new SolidBrush(BackColor))
+            {
+                e.Graphics.FillRectangle(back, new Rectangle(0, 0, Math.Max(0, textRight + 2), ClientSize.Height));
+            }
+
+            if (_lines.Length == 0)
+            {
+                using (SolidBrush empty = new SolidBrush(Color.FromArgb(120, 120, 120)))
+                {
+                    e.Graphics.DrawString("（还没有日志）", Font, empty, new PointF(4, 2));
+                }
+                return;
+            }
+
+            using (SolidBrush fore = new SolidBrush(ForeColor))
+            using (StringFormat format = new StringFormat(StringFormatFlags.NoWrap))
+            {
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                int visible = VisibleLines;
+                for (int i = 0; i < visible; i++)
+                {
+                    int index = _first + i;
+                    if (index >= _lines.Length) { break; }
+
+                    string line = _lines[index];
+                    if (line == null) { continue; }
+                    e.Graphics.DrawString(line, Font, fore,
+                        new RectangleF(4, i * _lineHeight, Math.Max(10, textRight - 6), _lineHeight), format);
+                }
+            }
+        }
+    }
+
+    // ======================================================================
+    // 日志尾部环形缓冲（纯数据，**不碰任何控件**）：容量固定，满了就丢最老的。
+    // 单测直接构造它钉住「有界」这件事（界面侧由 LogSink 加锁使用）。
+    // ======================================================================
+    internal sealed class LogTailBuffer
+    {
+        private readonly string[] _lines;
+        private int _next;
+        private int _count;
+        private long _total;
+
+        public LogTailBuffer(int capacity)
+        {
+            if (capacity < 1) { capacity = 1; }
+            _lines = new string[capacity];
+        }
+
+        public int Capacity { get { return _lines.Length; } }
+        public int Count { get { return _count; } }
+        public long TotalWritten { get { return _total; } }
+
+        public void Add(string line)
+        {
+            _lines[_next] = line;
+            _next = (_next + 1) % _lines.Length;
+            if (_count < _lines.Length) { _count++; }
+            _total++;
+        }
+
+        // 从最老到最新。
+        public string[] Snapshot()
+        {
+            string[] result = new string[_count];
+            for (int i = 0; i < _count; i++)
+            {
+                int index = (_next - _count + i + _lines.Length * 2) % _lines.Length;
+                result[i] = _lines[index];
+            }
+            return result;
+        }
+    }
+
+    // ======================================================================
+    // 日志三份存储里的两份（J4）：完整日志**流式**写文件 + 界面尾部环形缓冲。
+    //
+    // 【密码卫生】写进来的每一行都要过 Redact：任何一个登记过的密码都被换成 ***。
+    // Core 本身从不把密码写进判词（Task 10 只记「候选序号 + 来源」），这里是**界面层的兜底**：
+    // 界面上任何一条自己拼的文本一旦把密码拼进去，也不会落到日志文件里。
+    // 【进程永不因日志崩掉】任何 I/O 失败都只记一条问题，绝不抛。
+    // ======================================================================
+    internal sealed class LogSink : IDisposable
+    {
+        private readonly object _gate = new object();
+        private readonly LogTailBuffer _tail;
+        private readonly List<string> _secrets = new List<string>();
+        private StreamWriter _file;
+        private bool _problemReported;
+
+        public LogSink(string filePath)
+        {
+            FilePath = filePath;
+            FileProblem = "";
+            _tail = new LogTailBuffer(MainForm.LogTailLines);
+
+            try
+            {
+                string dir = Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+
+                // UTF-8 **带 BOM**：与报告同一理由（记事本/Excel 双击打开中文不乱码）。
+                _file = new StreamWriter(filePath, false, new UTF8Encoding(true));
+                _file.AutoFlush = false;      // 由界面心跳每 200ms Flush 一次（见 MainForm.UiTimer_Tick）
+            }
+            catch (Exception ex)
+            {
+                _file = null;
+                FileProblem = "无法写入日志文件（" + ex.GetType().Name + "：" + ex.Message +
+                              "）：本次运行的完整日志只有界面里的尾部";
+            }
+        }
+
+        public string FilePath { get; private set; }
+        public string FileProblem { get; private set; }
+        public bool FileOk { get { return _file != null; } }
+
+        // 登记一个绝不能出现在日志里的密码值。
+        public void RegisterSecret(string secret)
+        {
+            if (string.IsNullOrEmpty(secret)) { return; }
+            lock (_gate)
+            {
+                if (!_secrets.Contains(secret)) { _secrets.Add(secret); }
+            }
+        }
+
+        private string Redact(string line)
+        {
+            string result = line;
+            for (int i = 0; i < _secrets.Count; i++)
+            {
+                string secret = _secrets[i];
+                if (secret.Length == 0) { continue; }
+                // 单字符密码会把日志里所有同字符都变成 ***（很吵），这是**刻意**选的那一侧：
+                // 宁可日志难看，也不让一个密码出现在盘上。
+                result = result.Replace(secret, "***");
+            }
+            return result;
+        }
+
+        public void Write(string line)
+        {
+            if (line == null) { return; }
+
+            lock (_gate)
+            {
+                string safe;
+                try { safe = Redact(line); }
+                catch (Exception) { safe = "（这一行日志无法脱敏，已丢弃）"; }
+
+                _tail.Add(safe);
+
+                if (_file == null) { return; }
+
+                try
+                {
+                    _file.Write(safe);
+                    _file.Write("\r\n");
+                }
+                catch (Exception ex)
+                {
+                    // 写失败只报一次，然后停止写文件；界面尾部仍然可用（日志缺席绝不影响解压）。
+                    try { _file.Dispose(); }
+                    catch (Exception) { }
+                    _file = null;
+                    FileProblem = "日志文件写入失败（" + ex.GetType().Name + "：" + ex.Message +
+                                  "）：已停止写文件，界面里的尾部仍然可用";
+                    ReportProblem();
+                }
+            }
+        }
+
+        // 落盘失败要**看得见**（Task 11 对崩溃恢复日志的裁定在此同样适用：静默缺席等于让用户
+        // 以为自己有完整日志）。写进尾部一行，界面里就会出现。
+        private void ReportProblem()
+        {
+            if (_problemReported || string.IsNullOrEmpty(FileProblem)) { return; }
+            _problemReported = true;
+            _tail.Add("⚠ " + FileProblem);
+        }
+
+        public string[] Snapshot()
+        {
+            lock (_gate) { return _tail.Snapshot(); }
+        }
+
+        // 界面心跳每 200ms 调一次：崩溃时最多丢 200ms 的日志（而不是整份）。
+        public void Flush()
+        {
+            lock (_gate)
+            {
+                if (_file == null) { return; }
+                try { _file.Flush(); }
+                catch (Exception ex)
+                {
+                    try { _file.Dispose(); }
+                    catch (Exception) { }
+                    _file = null;
+                    FileProblem = "日志落盘失败（" + ex.GetType().Name + "：" + ex.Message + "）：已停止写文件";
+                    ReportProblem();
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_file == null) { return; }
+                try { _file.Flush(); _file.Dispose(); }
+                catch (Exception) { }
+                _file = null;
+            }
+        }
+    }
+
+    // ======================================================================
+    // 界面设置：窗口几何 + 上次用过的目录（%APPDATA%）。**原子写**（临时文件 + 替换），
+    // 加载时校验目录仍然存在（存下来的路径可能早被删了/在拔掉的移动盘上）。
+    // 任何 I/O 失败都不抛 —— 设置存不上绝不能让窗口起不来或关不掉。
+    // ======================================================================
+    internal sealed class AppSettings
+    {
+        private const string Header = "# Rerar 界面设置（窗口几何 + 上次用过的目录）。程序自动写，可安全删除。";
+
+        private readonly string _path;
+
+        public bool HasGeometry;
+        public int WindowX;
+        public int WindowY;
+        public int WindowWidth;
+        public int WindowHeight;
+        public bool Maximized;
+        public string LastInputFolder = "";
+
+        public AppSettings(string path)
+        {
+            _path = path;
+        }
+
+        public string FilePath { get { return _path; } }
+
+        // 生产默认落点：%APPDATA%\Rerar\settings.ini。
+        // 进程级覆盖 RERAR_SETTINGS_PATH 供测试把落点挪到临时目录（与 RERAR_JOURNAL_ROOT 同一机制）。
+        public static string DefaultFilePath
+        {
+            get
+            {
+                string overridden = Environment.GetEnvironmentVariable("RERAR_SETTINGS_PATH");
+                if (!string.IsNullOrEmpty(overridden)) { return overridden; }
+
+                string appData;
+                try { appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); }
+                catch (Exception) { appData = ""; }
+                if (string.IsNullOrEmpty(appData)) { appData = Path.GetTempPath(); }
+
+                return Path.Combine(Path.Combine(appData, "Rerar"), "settings.ini");
+            }
+        }
+
+        public bool Load()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_path) || !File.Exists(_path)) { return false; }
+
+                Dictionary<string, string> map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string raw in File.ReadAllLines(_path, Encoding.UTF8))
+                {
+                    if (raw == null) { continue; }
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') { continue; }
+
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) { continue; }
+                    map[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+
+                HasGeometry = ReadBool(map, "geometry");
+                WindowX = ReadInt(map, "x");
+                WindowY = ReadInt(map, "y");
+                WindowWidth = ReadInt(map, "width");
+                WindowHeight = ReadInt(map, "height");
+                Maximized = ReadBool(map, "maximized");
+
+                // 存下来的目录可能已经不在了（删了、在拔掉的移动盘上、权限变了）：
+                // 丢弃它，绝不把一个不存在的初始目录塞给用户。
+                string folder = ReadString(map, "lastInputFolder");
+                LastInputFolder = folder.Length > 0 && Directory.Exists(folder) ? folder : "";
+
+                return true;
+            }
+            catch (Exception)
+            {
+                // 坏文件按「没有设置」处理（而不是抛出去把窗口构造打断）。
+                return false;
+            }
+        }
+
+        public void Save()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_path)) { return; }
+
+                string dir = Path.GetDirectoryName(_path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) { Directory.CreateDirectory(dir); }
+
+                StringBuilder sb = new StringBuilder();
+                sb.Append(Header).Append("\r\n");
+                sb.Append("geometry=").Append(HasGeometry ? "1" : "0").Append("\r\n");
+                sb.Append("x=").Append(Int(WindowX)).Append("\r\n");
+                sb.Append("y=").Append(Int(WindowY)).Append("\r\n");
+                sb.Append("width=").Append(Int(WindowWidth)).Append("\r\n");
+                sb.Append("height=").Append(Int(WindowHeight)).Append("\r\n");
+                sb.Append("maximized=").Append(Maximized ? "1" : "0").Append("\r\n");
+                sb.Append("lastInputFolder=").Append(LastInputFolder == null ? "" : LastInputFolder).Append("\r\n");
+
+                // **原子替换**：先写同目录的临时文件，再 File.Replace / Move 改名。断电或被杀时，
+                // 用户拿到的要么是旧的完整设置，要么是新的完整设置 —— 绝不是一个半截文件。
+                string temporary = _path + ".tmp";
+                File.WriteAllText(temporary, sb.ToString(), new UTF8Encoding(true));
+                if (File.Exists(_path)) { File.Replace(temporary, _path, null); }
+                else { File.Move(temporary, _path); }
+            }
+            catch (Exception)
+            {
+                // 设置写不进去（权限/盘满）绝不影响解压与关闭。
+            }
+        }
+
+        private static string Int(int value)
+        {
+            return value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string ReadString(Dictionary<string, string> map, string key)
+        {
+            string value;
+            return map.TryGetValue(key, out value) && value != null ? value : "";
+        }
+
+        private static int ReadInt(Dictionary<string, string> map, string key)
+        {
+            int parsed;
+            string raw = ReadString(map, key);
+            if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed)) { return parsed; }
+            return 0;
+        }
+
+        private static bool ReadBool(Dictionary<string, string> map, string key)
+        {
+            string raw = ReadString(map, key);
+            return raw == "1" || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+}

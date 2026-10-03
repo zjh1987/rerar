@@ -174,15 +174,21 @@ Write-Host ("内嵌 7-Zip：" + $payloadDir + "（版本 " + ("{0}.{1:00}" -f $p
 #     没有 Microsoft.VisualBasic.dll，必须显式 /r:，否则 CS0234。
 #   * System.IO.Compression.dll（仅测试目标）—— Task 5 的 wheel 回归夹具必须用 zip 写库
 #     逐条写**文件**、不写父目录条目 —— 7-Zip 打目录树会补写目录条目，造不出真实 wheel 的形状。
+#   * System.Windows.Forms.dll + System.Drawing.dll（仅应用目标，Task 14 的界面）—— 见下面
+#     $appRefs 处的说明：**绝不能**放进 $bclRefs。
 # 命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
 # （相对计划唯一的偏离：统一的 UTF-8 代码页开关，理由见文件头）。
 #
-# $extraSwitches：只给**某一个目标**的额外开关。Task 13 的 /resource: 就走这里 —— **只给应用目标**。
+# $extraSwitches：只给**某一个目标**的额外开关。Task 13 的 /resource: 与 Task 14 的
+# /win32manifest: 都走这里 —— **只给应用目标**。
 # 为什么不放进 $cscArgs 的公共部分（那是本任务最容易踩错的一步）：两个目标共享这一段，把
 # /resource: 放进去就等于把 ~2.4 MB 的 7z.exe + 7z.dll 也塞进 dist\tests.exe —— 测试 exe 白白
 # 胖一倍多，而任何人也看不出它为什么胖。测试目标不需要那份载荷：EngineLocator 在测试里从同目录的
 # Rerar.exe 读同一份资源（见 src\Core\EngineLocator.cs 的 OpenResource），
 # 于是 Engine.PayloadEmbeddedInAppTargetOnly 那条用例能把这条约束钉死。
+# /win32manifest: 同理只给应用目标：清单说的是**这个 exe** 的执行级别与 DPI 感知，
+# 测试运行器没有界面，带上它只会让「清单到底编进了哪个产物」变得不可判定
+#（用例 Gui.ManifestIsEmbeddedInAppTargetOnly 直接扫两个产物的字节，把这半边也钉住）。
 function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources, [string[]]$extraRefs, [string[]]$extraSwitches) {
     $cscArgs = @(
         '/nologo'
@@ -212,8 +218,23 @@ function Invoke-CscTarget([string]$target, [string]$outName, [string[]]$sources,
 # 而 src\Core\*.cs 两个目标都编，所以这条引用必须同时给两个目标。
 $bclRefs = @('/reference:Microsoft.VisualBasic.dll')
 
-# 目标 1：应用（GUI / CLI 双入口）。$appResourceSwitches 只在这一行出现 —— 见 Invoke-CscTarget。
-$code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs', $generatedSource) $bclRefs $appResourceSwitches
+# Task 14：应用清单（asInvoker / PerMonitorV2 / longPathAware）。源文件缺席就**直接构建失败**：
+# 一个没有清单的 exe 在高 DPI 上模糊，而且「绝不提权」这条契约会变成一句没人验证的话。
+$manifestRelative = 'src\App\app.manifest'
+if (-not (Test-Path -LiteralPath (Join-Path $root $manifestRelative))) {
+    Fail ("缺少应用清单 " + (Join-Path $root $manifestRelative) + "：/win32manifest: 需要它")
+}
+
+# 应用目标独有的引用（Task 14）：WinForms 需要这两个程序集。**只加在这里**，绝不放 $bclRefs ——
+# 测试目标不引 WinForms（它测的是 dist\Rerar.exe 里那个真实的 Form，见 src\Tests\GuiProbe.cs），
+# 而 /win32manifest: 也只跟着应用目标走。
+$appRefs = $bclRefs + @('/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll')
+
+# 应用目标独有的开关：Task 13 的内嵌载荷资源 + Task 14 的应用清单。
+$appSwitches = $appResourceSwitches + @('/win32manifest:' + $manifestRelative)
+
+# 目标 1：应用（GUI / CLI 双入口）。$appRefs / $appSwitches 只在这一行出现 —— 见 Invoke-CscTarget。
+$code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs', $generatedSource) $appRefs $appSwitches
 if ($code -ne 0) {
     Write-Host ("FAIL: 应用目标 csc 退出码 " + $code)
     if ($code -gt 0) { exit $code }
@@ -239,7 +260,9 @@ Write-Host ("OK: " + $exe + "（" + $appBytes + " 字节，其中内嵌载荷 " 
 
 # 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
 # 测试目标比应用目标多一条引用：System.IO.Compression（zip 写库，见 Invoke-CscTarget 上的说明）。
-# 第 5 个参数（额外开关）刻意**不传**：/resource: 只属于应用目标。
+# 第 5 个参数（额外开关）刻意**不传**：/resource: 与 /win32manifest: 都只属于应用目标。
+# 也刻意**不引** System.Windows.Forms / System.Drawing：测试要断言的那个 Form 由
+# src\Tests\GuiProbe.cs 从 dist\Rerar.exe 载入（理由见那里的文件头）。
 $code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs', $generatedSource) ($bclRefs + @('/reference:System.IO.Compression.dll'))
 if ($code -ne 0) {
     Write-Host ("FAIL: 测试目标 csc 退出码 " + $code)

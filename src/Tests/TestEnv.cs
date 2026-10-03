@@ -21,6 +21,9 @@ using Rerar.Core;
 
 internal static class TestEnv
 {
+    // Task 14：界面设置落点的进程级覆盖（名字与 MainForm 里的常量一致）。
+    private const string SettingsPathVariable = "RERAR_SETTINGS_PATH";
+
     private static readonly string _root = Path.Combine(Path.GetTempPath(), "rerar-tests");
     private static string _sevenZip;
 
@@ -164,6 +167,12 @@ internal static class TestEnv
         // Task 13：把内嵌 7-Zip 的释放根也重定向到临时目录（理由与上面一致，且是同一份真实
         // 应用数据根）。用进程级环境变量而不是静态字段：CLI 用例的子进程会继承它（见 EngineRoot）。
         Environment.SetEnvironmentVariable(EngineRootVariable, EngineRoot);
+
+        // Task 14：界面设置（窗口几何 + 上次用的目录）的落点在**用户的应用数据**目录
+        //（%APPDATA%\Rerar\settings.ini）。与 Journal.Root / EngineRoot 同一条理由：测试绝不碰
+        // 真实的用户数据 —— 界面用例会构造真的 MainForm，构造时它会读设置，关闭时会写设置。
+        // 机制也一样（进程级环境变量），未设置时生产行为完全不变。
+        Environment.SetEnvironmentVariable(SettingsPathVariable, Path.Combine(_root, "tmp", "settings.ini"));
 
         // 进程外的残留也一并收拾：上一次运行若在 subst 夹具用例中途被杀，映射会留在机器上
         //（Cleanup 删得掉目录，删不掉映射）。放在这里而不是只放在夹具里，是因为它属于
@@ -2312,6 +2321,24 @@ internal static class TestEnv
     public static string TestsExePath
     {
         get { return Assembly.GetExecutingAssembly().Location; }
+    }
+
+    // Task 14：应用清单的源文件（src\App\app.manifest）。
+    //
+    // 【为什么读**源文件**而不是从 exe 里挖资源】清单的内容要求（PerMonitorV2 / asInvoker /
+    // longPathAware）是对这份源文件的断言；「它有没有真的被 /win32manifest: 编进产物」是另一件事，
+    // 由 Gui.ManifestIsEmbeddedInAppTargetOnly 直接扫产物字节来钉（两条各管一半，不重叠）。
+    //
+    // 与其余 fixture 一致：路径现算，绝不静态缓存（H.Run 每用例前 Cleanup()）。
+    // 仓库根 = tests.exe 所在目录（dist\）的上一级 —— 与 build.ps1 的 $root 同一算法。
+    public static string ManifestPath
+    {
+        get
+        {
+            string dist = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            string root = Path.GetDirectoryName(dist);
+            return Path.Combine(root, Path.Combine("src", Path.Combine("App", "app.manifest")));
+        }
     }
 
     // --json-out 的目标文件：Tmp 之下（每用例被 Cleanup 清空）。
