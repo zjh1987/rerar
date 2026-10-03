@@ -361,7 +361,7 @@ Assert-True ($head[0] -eq 0x37 -and $head[1] -eq 0x7A -and $head[2] -eq 0xBC -an
 $listing = Invoke-SevenZip @('l', '-ba', $volumes[0].FullName)
 Assert-True ($listing.Code -eq 0) ("F06: 自检失败：完整的卷集却打不开（退出码 " + $listing.Code + "）")
 Assert-True ($listing.Out -match 'payload\.bin') 'F06: 自检失败：卷集里看不到 payload.bin'
-Note 'F06' '分卷正常集' ("真 7-Zip `a -v16k` 切出 " + $volumes.Count + " 卷 vol.7z.001…；自检：.001 是 7z 签名、整集可列出 payload.bin")
+Note 'F06' '分卷正常集' ("真 7-Zip a -v16k 切出 " + $volumes.Count + " 卷 vol.7z.001…；自检：.001 是 7z 签名、整集可列出 payload.bin")
 
 # ==================================================================
 # 7) 分卷缺中间卷（规格 §9.1 行 7）
@@ -386,7 +386,7 @@ $listing = Invoke-SevenZip @('l', '-ba', (Join-Path $f07 'vol.7z.001'))
 Assert-True ($listing.Code -ne 0) 'F07: 自检失败：缺了中间卷 7-Zip 竟然还能列出内容 —— 那这个 fixture 证明不了「缺卷」'
 $remaining = @(Get-ChildItem -LiteralPath $f07 -File | Where-Object { $_.Name -like 'vol.7z.*' })
 Assert-True ($remaining.Count -ge 2) ("F07: 自检失败：删完只剩 " + $remaining.Count + " 卷，7-Zip 会把它当独立文件而不是缺卷集")
-Note 'F07' '分卷缺中间卷' ("同一形状删掉 vol.7z.002，还剩 " + $remaining.Count + " 卷；自检：`7z l vol.7z.001` 退出码 " + $listing.Code + "（真的打不开）")
+Note 'F07' '分卷缺中间卷' ("同一形状删掉 vol.7z.002，还剩 " + $remaining.Count + " 卷；自检：7z l vol.7z.001 退出码 " + $listing.Code + "（真的打不开）")
 
 # ==================================================================
 # 8) OOXML 陷阱：真 .docx 形状（[Content_Types].xml）（规格 §9.1 行 8）
@@ -655,7 +655,7 @@ $conflictBytes = New-ZipBytes @((New-ZipEntry 'Readme.txt' 'lower'), (New-ZipEnt
 $names = @(Get-ZipEntryNames (Join-Path $f16 'conflict.zip'))
 Assert-True ($names.Count -eq 2) ("F16: 自检失败：条目数不是 2，而是 " + $names.Count)
 Assert-True (($names -ccontains 'Readme.txt') -and ($names -ccontains 'README.TXT')) 'F16: 自检失败：两个只差大小写的条目没有同时进包（大小写敏感比较）'
-Note 'F16' '路径冲突' 'net zip 写库造的 .zip，含 Readme.txt 与 README.TXT；自检：读回的两个名字大小写敏感地都在'
+Note 'F16' '路径冲突' '（.NET zip 写库）造的 .zip，含 Readme.txt 与 README.TXT；自检：读回的两个名字大小写敏感地都在'
 
 # ==================================================================
 # 17) 非空目标目录（规格 §9.1 行 17）

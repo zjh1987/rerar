@@ -20,7 +20,7 @@
 #   * 不提权、不改注册表、不改回收站设置。唯一会碰回收站的动作是「删除开关」那两行 ——
 #     删的是刚复制出来的 fixture 副本（回收站核实失败时它会被永久删除，这是产品行为，不是本脚本的）。
 #
-# 【零越界写入不变量怎么做的】每行调用 CLI 前后，对**四个根**做递归快照比对（见 Get-GuardSnapshot）：
+# 【零越界写入不变量怎么做的】每行调用 CLI 前后，对**五个根**做递归快照比对（见 Get-GuardSnapshot）：
 #   1) 该行的目录树，但**排除** work\（work 就是这次运行的输出根，工具本来就该往里写）；
 #   2) 仓库根的直接子项（列表 + 类型）—— 抓「在仓库根凭空造了一个目录/文件」；
 #   3) tests\ 整棵树，但排除 _fixtures\ —— 抓「写进了测试脚本目录」；
@@ -28,6 +28,11 @@
 #   5) dist\ 整棵树 —— 抓「往产物目录里写东西」。
 # 另外单独断言 %LOCALAPPDATA%\Rerar 的存在性全程不变。
 # 每一行比对出来的差异都进 A03 那一行的明细；有任何差异就是 FAIL。
+#
+# 【怎么证明这套快照比对不是空转（自审要求）】设 RERAR_ACCEPTANCE_NEGATIVE_CONTROL=1 再跑一次：
+# F02 那一行会在「跑完 CLI、还没取快照」的窗口里故意在**四个不同的守门根**各造一个文件、再删掉
+# canary。此时 F02 / A02 / A03 必须全部 FAIL（实测确实全部 FAIL，四个越界点逐个在明细里报了出来）。
+# 默认关，正常验收运行绝不会制造任何越界。
 #
 # PS 5.1（本机就是 5.1，没有任何 PS7 专有参数）；只用 .NET 自带的 BCL，无 NuGet、无第三方库。
 
@@ -434,6 +439,7 @@ function Check-CommonInvariants {
 
     # --- 零数据丢失：运行前就存在的每个输入文件，运行后必须还在且一模一样 ---
     if ($InputsMustBeIntact) {
+        $script:DataLossChecked++
         $missing = New-Object System.Collections.Generic.List[string]
         foreach ($key in $Row.Before.Keys) {
             if ($Row.Before[$key] -eq 'dir') { continue }
@@ -920,6 +926,7 @@ if (-not $row.Missing) {
     $one = Get-JsonResult $row.Json $target
     Check $checks ($null -ne $one -and $one.status -ne 'Completed') '开了删除开关的损坏包竟然报 Completed'
     Check $checks (Test-Path -LiteralPath $target) '开了 --delete 之后，失败归档的原包被删掉了（原脚本缺陷 ① 复现）'
+    Check-CommonInvariants $row $checks $true $false
 }
 Complete-Row $row 'A05① 失败仍删包' $checks '--delete + 损坏包：原包仍在（I3：只有「完成且校验通过」才允许删除）' | Out-Null
 
@@ -936,6 +943,7 @@ if (-not $row.Missing) {
     Check $checks ($row.Cli.ElapsedMs -le 45000) ('加密包用了 ' + $row.Cli.ElapsedMs + ' ms 才返回，超过 45 s 的限定时间')
     Check $checks ($null -ne $one -and $one.status -eq 'SkippedNeedsPassword') ('结局 ' + (Get-StatusOf $row.Json $target) + '，期望 SkippedNeedsPassword')
     Check $checks (Test-Path -LiteralPath $target) '加密包的原包不见了'
+    Check-CommonInvariants $row $checks $true $false
 }
 Complete-Row $row 'A05② 密码提示挂起' $checks ('无人工干预下 ' + $row.Cli.ElapsedMs + ' ms 返回「需密码」；原包保留；没有任何挂起') | Out-Null
 
@@ -1003,7 +1011,9 @@ if (-not $row.Missing) {
     $gone = $members.Count - $stillThere.Count
     Check $checks ($gone -eq 0 -or $gone -eq $members.Count) ('分卷集只被处置了一部分（留下孤儿分卷）：' + $gone + '/' + $members.Count + ' 个成员消失')
     Check $checks ($null -ne $one -and ([string]$one.message).Contains('分卷集')) ('判词没有说明分卷集是「全部不处置」：' + $one.message)
-    Check-CommonInvariants $row $checks ($gone -eq $members.Count) $false
+    # 输入完好性只在「一个成员都没被处置」时才适用：$gone -eq 0 是正常情形（分卷集按设计全部保留），
+    # 那时每个成员都必须逐字节原样。全被处置的情形下原包本来就该不见，不该拿这条去判。
+    Check-CommonInvariants $row $checks ($gone -eq 0) $false
 }
 Complete-Row $row 'A05④ 分卷残留' $checks '--delete + 分卷集：按「全部不处置」处理，成员 0 个孤儿（要么全在、要么全不在）' | Out-Null
 
@@ -1129,11 +1139,10 @@ Complete-Row $row 'A07 引擎缺失/过旧' $checks '引擎确实拿不到时：
 # A02 零数据丢失不变量（汇总所有失败场景）
 # ==================================================================
 # 放在最后：它汇总的是**全部**行（含 A04/A05*/A07）的逐行断言结果，所以必须在它们之后结算。
-$script:DataLossChecked = 0
-foreach ($result in $script:Results) { if ($result.Id -match '^F\d\d$') { $script:DataLossChecked++ } }
+# 计数器由 Check-CommonInvariants 在「输入必须原样」那条通道里 ++，所以这里不再按行号数一遍。
 $checks = New-Checks
 Check $checks ($script:DataLossViolations.Count -eq 0) ('有失败场景动了原包：' + ($script:DataLossViolations -join '；'))
-Check $checks ($script:DataLossChecked -ge 15) ('只检查了 ' + $script:DataLossChecked + ' 行的原包保留，覆盖不足（期望 ≥15 行逐行断言）')
+Check $checks ($script:DataLossChecked -ge 20) ('只有 ' + $script:DataLossChecked + ' 行走过「输入必须逐字节原样」这条断言，覆盖不足（期望 ≥20 行）')
 Complete-Row ([pscustomobject]@{ Id = 'A02'; Missing = $null }) 'A02 零数据丢失不变量' $checks `
     ($script:DataLossChecked.ToString() + ' 行逐行断言：运行前存在的每个原包与输入文件在运行后仍逐字节存在（含 F02/F03/F04/F07/F08/F09/F10/F12/F13/F14/F15/F16 全部失败场景）') | Out-Null
 
@@ -1142,7 +1151,7 @@ Complete-Row ([pscustomobject]@{ Id = 'A02'; Missing = $null }) 'A02 零数据�
 # ==================================================================
 $checks = New-Checks
 Check $checks ($script:EscapeDiffs.Count -eq 0) ('有越界写入：' + ($script:EscapeDiffs -join '；'))
-Check $checks ($script:GuardComparisons -ge 20) ('只做了 ' + $script:GuardComparisons + ' 次快照比对，覆盖不足（期望 ≥20 次）')
+Check $checks ($script:GuardComparisons -ge 24) ('只做了 ' + $script:GuardComparisons + ' 次快照比对，覆盖不足（期望 ≥24 次）')
 $localAppDataAfter = Test-Path -LiteralPath $script:LocalAppDataRerar
 Check $checks ($localAppDataAfter -eq $script:LocalAppDataBefore) ('真实应用数据根 %LOCALAPPDATA%\Rerar 的存在性变了（' + $script:LocalAppDataBefore + ' -> ' + $localAppDataAfter + '）：本次验收绝不该碰它')
 Complete-Row ([pscustomobject]@{ Id = 'A03'; Missing = $null }) 'A03 零越界写入不变量' $checks `
