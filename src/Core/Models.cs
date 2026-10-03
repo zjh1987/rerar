@@ -9,6 +9,9 @@
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
+using System.Collections.Generic;
+using System.Threading;
+
 namespace Rerar.Core
 {
     // 单个源归档的最终结局。
@@ -36,5 +39,58 @@ namespace Rerar.Core
         public int Failed;           // 归档本身已完成，但内部有 N 个文件失败
         public string OutputDir;     // 解压去向（没有则为 ""）
         public string Message;       // 原因 / 诊断文本（没有则为 ""）
+    }
+
+    // 冻结后的一个候选归档（Task 10 的「本轮候选清单」元素；PlanPlanner/JobPlanner 的产物形状）。
+    //
+    // 为什么要有 Parent 这条反向引用：`ArchiveResult.Layers` 是「该归档**达到**的嵌套层数」，
+    // 而层数只有把下一轮的结果汇总回来才知道（规格 §9.1 用例 1 的「报 2 层」）。反向引用让
+    // 汇总沿链一次做完，不必维护一张额外的层级表。
+    //
+    // VolumeMembers 只用于**删除策略**：规格 §9.2 第 5 条 ④ 要求分卷集「所有成员一并处置，
+    // 或明确全部不处置」—— Task 10 选后者（理由见 Extractor.DeleteEligibleOriginal）。它也是
+    // 「绝不删除本次运行之外的任何文件」这条约束的边界：只有清单里的路径才可能被处置。
+    public class ArchiveTask
+    {
+        public string Path;                 // 候选归档的绝对路径（分卷集时 = 权威成员）
+        public int Depth;                   // 递归层数：顶层 = 1
+        public ArchiveTask Parent;          // 上一层归档（Layers 汇总用）；顶层为 null
+        public List<string> VolumeMembers;  // 分卷集成员（空 = 非分卷集）
+    }
+
+    // 一次运行的选项。Task 12 的 CLI 与 Task 14 的界面都通过它配置，默认值一律取「安全」那一侧。
+    public class RunOptions
+    {
+        // 7-Zip 可执行文件绝对路径（必填；Task 13 的 EngineLocator 提供）。
+        public string SevenZipPath;
+
+        // 输出根。""（默认）⇒ 原地输出到**归档所在目录**（规格 §6.11 的唯一权威定义）；
+        // 非空时为该根目录（测试与 CLI 需要把产物收在一处时用）。嵌套层的输出根不取这个值，
+        // 而是固定放在上一层输出目录之内（§6.11 抑制 MAX_PATH 增长）。
+        public string OutputRoot;
+
+        // I3：删除默认**关**。打开后也只删「完成且校验通过」的归档，且走回收站/隔离文件夹。
+        public bool DeleteOriginals;
+
+        // 规格 §10.1：默认 10 层，可调。触顶必须显式列出未处理项（NotAttemptedDepthLimit）。
+        public int MaxDepth = 10;
+
+        // 密码阶梯第 1 层：用户手动输入的密码（可空）。
+        public string Password;
+
+        // 密码阶梯第 3 层：导入的字典（逐行；内置常用字典由 Extractor 追加在其后）。
+        public List<string> DictLines;
+
+        // 低水位：预检要求「可用空间 ≥ 归档总字节 + 本值」，运行中轮询要求「可用空间 ≥ 本值」。
+        // 默认 64 MB —— 小到不影响正常解压，大到能在写满之前就中止（Review Focus #1）。
+        public long MinFreeBytes = 64L * 1024 * 1024;
+
+        // 运行中磁盘轮询间隔（秒）。默认 2 秒（brief Step 3）；传 0 表示「尽量快」（1 ms），
+        // 供测试把「低水位」变成确定性事件。轮询走独立 Timer，**不依赖 7-Zip 的进度回调**
+        //（实测该回调在真实 `x` 上一次都不会触发，见 docs/research 的 V27）。
+        public int DiskPollSeconds = 2;
+
+        // 用户取消（两段式取消的入口）。默认不可取消；取消一律走「保留原包 + 暂存标未完成」。
+        public CancellationToken Cancellation;
     }
 }

@@ -1366,4 +1366,327 @@ internal static class TestEnv
             "请安装 7-Zip（https://www.7-zip.org/）或把 7z.exe 所在目录加入 PATH。已查找：" +
             string.Join("；", tried.ToArray()));
     }
+
+    // ==================================================================
+    // Task 10：Preflight + Extractor 的 fixture 与驱动。
+    //
+    // 为什么这几个 zip 用 .NET 的 zip 写库逐条写文件，而不是用 7-Zip 现做：
+    // 不变式 I5 逼着本项目的 SevenZipRunner 给**每一个** 7z 参数表都带 -p，而 7z 的 a 命令
+    // 拿到空 -p 会真的弹密码提示（本轮实测 `a -p` → 打印 "Enter password"、退出码 255、
+    // 包根本没生成），给真密码则**真的加密**。于是「不带密码的普通归档」用 7-Zip 造不出来 ——
+    // 而递归解压的主用例恰恰就是普通无密码归档（NestedZip / DeepNestedZip / PlainZip / Docx）。
+    // 实测对照：`-ttar` / `-tbzip2` 会忽略 -p（包不加密、能造），但它们的清单形状满足不了
+    // 「条目数 + 总字节」这条基线（bz2 连条目名都没有），所以这里走 zip 写库。
+    //
+    // 唯一的例外是 BigSevenZip：它是真 .7z，因此按 I5 的约束它必然是加密的（头部明文、密码
+    // SECRET，自检见 BuildBigSevenZip）。它只服务磁盘空间预检用例，而空间预检排在密码阶梯
+    // **之前** —— 用例本身就钉住了这个顺序（否则会得到 SkippedNeedsPassword 而不是 Failed）。
+    //
+    // 与其它 fixture 一致：全部惰性重建，绝不做静态缓存（H.Run 每用例前 Cleanup()）。
+    // ==================================================================
+
+    // 外层 zip 里含 inner.zip，inner.zip 里含 hello.txt（规格 §9.1 用例 1 的形状）。
+    public static string NestedZip
+    {
+        get { return Fixture("nested.zip", BuildNestedZip); }
+    }
+
+    // 三层嵌套：outer.zip → mid.zip → inner.zip → hello.txt。
+    // 深度上限用例（MaxDepth=1）用它，保证「触顶未处理」的那一项必然存在。
+    public static string DeepNestedZip
+    {
+        get { return Fixture("deep-nested.zip", BuildDeepNestedZip); }
+    }
+
+    // 普通 zip（三个普通文件，无加密）：非空目标目录改名用例的输入。
+    public static string PlainZip
+    {
+        get { return Fixture("plain.zip", BuildExtractPlainZip); }
+    }
+
+    // 真 OOXML 形状的 .docx（[Content_Types].xml + _rels/.rels + word/document.xml）：I4 门控用例。
+    public static string Docx
+    {
+        get { return Fixture("docx.docx", BuildExtractDocx); }
+    }
+
+    // 大 .7z（约 2 MB 不可压缩内容，AES 加密、头部明文、密码 SECRET）：磁盘空间预检用例。
+    // 约 2 MB 是刻意的：够大到「1024 字节可用空间」的预检必然拒绝，又不至于让整套测试变慢。
+    public static string BigSevenZip
+    {
+        get { return Fixture("big.7z", BuildBigSevenZip); }
+    }
+
+    // ------------------------------------------------------------------
+    // zip 写库：逐条写**文件**，不写父目录条目（与真实 wheel 夹具同一套做法）。
+    // ------------------------------------------------------------------
+
+    private static void WriteZipFile(string targetPath, Action<ZipArchive> fill)
+    {
+        string parent = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+
+        using (FileStream stream = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
+        using (ZipArchive zip = new ZipArchive(stream, ZipArchiveMode.Create))
+        {
+            fill(zip);
+        }
+    }
+
+    private static byte[] ZipBytes(Action<ZipArchive> fill)
+    {
+        using (MemoryStream memory = new MemoryStream())
+        {
+            using (ZipArchive zip = new ZipArchive(memory, ZipArchiveMode.Create, true)) { fill(zip); }
+            return memory.ToArray();
+        }
+    }
+
+    private static void AddZipText(ZipArchive zip, string entryName, string content)
+    {
+        AddZipBytes(zip, entryName, new UTF8Encoding(false).GetBytes(content));
+    }
+
+    private static void AddZipBytes(ZipArchive zip, string entryName, byte[] bytes)
+    {
+        ZipArchiveEntry entry = zip.CreateEntry(entryName, CompressionLevel.Optimal);
+        using (Stream stream = entry.Open()) { stream.Write(bytes, 0, bytes.Length); }
+    }
+
+    private static void BuildNestedZip(string targetPath)
+    {
+        byte[] inner = ZipBytes(delegate(ZipArchive z)
+        {
+            AddZipText(z, "hello.txt", "Rerar NestedZip fixture: hello from inner.zip\r\n");
+        });
+
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            AddZipBytes(z, "inner.zip", inner);
+            AddZipText(z, "readme.txt", "Rerar NestedZip fixture: outer layer\r\n");
+        });
+    }
+
+    private static void BuildDeepNestedZip(string targetPath)
+    {
+        byte[] inner = ZipBytes(delegate(ZipArchive z)
+        {
+            AddZipText(z, "hello.txt", "Rerar DeepNestedZip fixture: innermost\r\n");
+        });
+        byte[] mid = ZipBytes(delegate(ZipArchive z)
+        {
+            AddZipBytes(z, "inner.zip", inner);
+        });
+
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            AddZipBytes(z, "mid.zip", mid);
+        });
+    }
+
+    private static void BuildExtractPlainZip(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            AddZipText(z, "a.txt", "alpha");
+            AddZipText(z, "b.txt", "bravo");
+            AddZipText(z, "docs/readme.md", "# readme");
+        });
+    }
+
+    private static void BuildExtractDocx(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            AddZipText(z, "[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
+            AddZipText(z, "_rels/.rels", "<?xml version=\"1.0\"?><Relationships/>");
+            AddZipText(z, "word/document.xml", "<?xml version=\"1.0\"?><document/>");
+        });
+    }
+
+    // 大 7z：2 MB 固定种子伪随机内容（7-Zip 压不动它）+ `-pSECRET`（I5 逼出来的）。
+    // 三条自检缺一不可，否则用例会在一个「其实不是加密包」或「其实不加密」的夹具上假通过：
+    //   1) `l -slt -p` 必须**成功**（头部明文 ⇒ 清单可读 ⇒ 空间预检才有 TotalBytes 可比）；
+    //   2) 该清单必须带 `Encrypted = +`（成员确实加密）；
+    //   3) `t -p` 必须失败、`t -pSECRET` 必须成功（密码确实是 SECRET）。
+    private static void BuildBigSevenZip(string targetPath)
+    {
+        string seed = SeedBinary("big-7z-payload.bin", 2 * 1024 * 1024);
+        string[] args = new string[] { "a", "-t7z", "-mx1", targetPath, seed, "-pSECRET", "-y" };
+        RunResult built = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(built.ExitCode)) { FixtureFailed("构造 BigSevenZip fixture", args, built); }
+
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode))
+        {
+            FixtureFailed("校验 BigSevenZip fixture（头部必须明文、清单必须可读）", listArgs, listed);
+        }
+        // 直接找 `Encrypted = +` 这一整行：HasNonEmptyValue 是「键 + 非空值」的判据，
+        // 而这里的值恰好是 "+"，用它会把正确的清单误判成失败（Task 4 的软链自检才用它）。
+        if (listed.StdOut == null || listed.StdOut.IndexOf("Encrypted = +", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException(
+                "BigSevenZip fixture 构造失败：清单里没有 `Encrypted = +`（成员没被加密）；stdout=[" + Head(listed.StdOut) + "]");
+        }
+
+        string[] wrongArgs = new string[] { "t", targetPath, "-p", "-y" };
+        RunResult wrong = RunSevenZip(wrongArgs);
+        if (SevenZipRunner.IsSuccess(wrong.ExitCode))
+        {
+            FixtureFailed("校验 BigSevenZip fixture（空密码竟然解开了）", wrongArgs, wrong);
+        }
+        string[] rightArgs = new string[] { "t", targetPath, "-pSECRET", "-y" };
+        RunResult right = RunSevenZip(rightArgs);
+        if (!SevenZipRunner.IsSuccess(right.ExitCode)) { FixtureFailed("校验 BigSevenZip fixture（SECRET 打不开）", rightArgs, right); }
+    }
+
+    // ------------------------------------------------------------------
+    // Task 10 驱动：把 Extractor 用固定选项跑一遍，返回 RunSummary。
+    // 输出根固定为 OutRoot（每个用例前被 Cleanup 清空），于是
+    // 「暂存 → 校验 → 提交」全部落在临时目录里，用例之间互不干扰。
+    // ------------------------------------------------------------------
+
+    public static string OutOf(string archive, params string[] parts)
+    {
+        string path = Path.Combine(OutRoot, PathSanitizer.Sanitize(Path.GetFileName(archive)));
+        if (parts != null)
+        {
+            foreach (string part in parts) { path = Path.Combine(path, part); }
+        }
+        return path;
+    }
+
+    public static RunSummary RunExtract(string archive)
+    {
+        return RunExtractCore(archive, null, 10, null, false, 2);
+    }
+
+    public static RunSummary RunExtractWithPassword(string archive, string password)
+    {
+        return RunExtractCore(archive, password, 10, null, false, 2);
+    }
+
+    public static RunSummary RunExtractWithDepth(int depth, string archive)
+    {
+        return RunExtractCore(archive, null, depth, null, false, 2);
+    }
+
+    // 固定可用空间（brief 的 freeBytes 形参）：预检必然按该值判定。
+    public static RunSummary RunExtractWithFakeDisk(long freeBytes, string archive)
+    {
+        return RunExtractCore(archive, null, 10, new long[] { freeBytes }, false, 2);
+    }
+
+    // 可用空间按时序变化（第 1 次调用 = 预检，之后 = 运行中轮询）+ 轮询间隔可调：
+    // 用来钉住「解压中途盘满 → 干净中止」这条路径（Review Focus #1）。
+    public static RunSummary RunExtractWithDroppingDisk(string archive, string password, long beforeBytes, long afterBytes, int pollSeconds)
+    {
+        return RunExtractCore(archive, password, 10, new long[] { beforeBytes, afterBytes }, false, pollSeconds);
+    }
+
+    // 删除开关打开（I3 的默认值是 false，这里显式打开）。名字偏长是为了让用例读起来就是
+    // 「这次开了删除」——「失败/跳过也不许删」的用例全靠它反向钉住。
+    public static RunSummary RunExtractWithDelete(string archive)
+    {
+        return RunExtractCore(archive, null, 10, null, true, 2);
+    }
+
+    public static RunSummary RunExtractWithExistingTarget(string archive)
+    {
+        // 在目标名上先放一个**非空**目录：Uniquify 必须改名为 "<名字> (2)"（规格 §6.11）。
+        string occupied = Path.Combine(OutRoot, PathSanitizer.Sanitize(Path.GetFileName(archive)));
+        Directory.CreateDirectory(occupied);
+        File.WriteAllText(Path.Combine(occupied, "blocker.txt"), "occupied", new UTF8Encoding(false));
+        return RunExtractCore(archive, null, 10, null, false, 2);
+    }
+
+    // 规格 §6.11 的**默认**布局：不指定输出根 ⇒ 产物落在归档所在目录（原地）。
+    // 其余用例都显式指定 OutRoot，所以这条是唯一钉住「原地」这个默认行为的地方。
+    public static RunSummary RunExtractInPlace(string archive)
+    {
+        RunOptions options = new RunOptions();
+        options.SevenZipPath = SevenZip;
+        options.OutputRoot = "";                 // 空 = 原地（这是 RunOptions 的默认值）
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
+
+    // 用户取消（两段式取消的入口）：预置一个**已取消**的令牌。
+    public static RunSummary RunExtractCancelled(string archive)
+    {
+        CancellationTokenSource source = new CancellationTokenSource();
+        source.Cancel();
+
+        RunOptions options = new RunOptions();
+        options.SevenZipPath = SevenZip;
+        options.OutputRoot = OutRoot;
+        options.Cancellation = source.Token;
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
+
+    private static RunSummary RunExtractCore(string archive, string password, int depth, long[] freeSequence, bool deleteOriginals, int pollSeconds)
+    {
+        RunOptions options = new RunOptions();
+        options.SevenZipPath = SevenZip;
+        options.OutputRoot = OutRoot;
+        options.Password = password;
+        options.MaxDepth = depth;
+        options.DeleteOriginals = deleteOriginals;
+        options.DiskPollSeconds = pollSeconds;
+
+        IDiskSpaceProvider disk = freeSequence == null
+            ? (IDiskSpaceProvider)new DriveSpaceProvider()
+            : new SequenceDisk(freeSequence);
+
+        Extractor extractor = new Extractor(options, disk, null);
+        return extractor.Run(new string[] { archive });
+    }
+
+    // 按时序返回可用空间：第 N 次调用返回 values[min(N, len-1)]。预检是第 1 次调用，
+    // 之后的运行中轮询一直拿最后一个值 —— 于是「预检够、运行中不够」可以精确构造。
+    private sealed class SequenceDisk : IDiskSpaceProvider
+    {
+        private readonly long[] _values;
+        private int _calls;
+
+        public SequenceDisk(long[] values)
+        {
+            _values = (values == null || values.Length == 0) ? new long[] { 0 } : values;
+        }
+
+        public long FreeBytes(string path)
+        {
+            int index = _calls < _values.Length ? _calls : _values.Length - 1;
+            _calls++;
+            return _values[index];
+        }
+    }
+
+    // 暂存树里有没有 reparse point（软链/联接）。**绝不进入** reparse point 目录：
+    // 否则一个指回父目录的链接就能让本方法死循环，或枚举到输出根之外去。
+    public static bool AnyReparsePointUnder(string root)
+    {
+        if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) { return false; }
+
+        Stack<string> pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            string dir = pending.Pop();
+            string[] entries;
+            try { entries = Directory.GetFileSystemEntries(dir); }
+            catch (Exception) { continue; }
+
+            foreach (string entry in entries)
+            {
+                FileAttributes attributes;
+                try { attributes = File.GetAttributes(entry); }
+                catch (Exception) { continue; }
+
+                if ((attributes & FileAttributes.ReparsePoint) != 0) { return true; }
+                if ((attributes & FileAttributes.Directory) != 0) { pending.Push(entry); }
+            }
+        }
+        return false;
+    }
 }
