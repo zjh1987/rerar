@@ -9,7 +9,9 @@
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 
 namespace Rerar.Core
@@ -92,5 +94,44 @@ namespace Rerar.Core
 
         // 用户取消（两段式取消的入口）。默认不可取消；取消一律走「保留原包 + 暂存标未完成」。
         public CancellationToken Cancellation;
+
+        // 「强制按压缩包尝试」的**逐项**覆盖（规格 §6.1 的逐项动作，对应 §6.3 的「永不静默丢弃」）。
+        // 这里列出的路径跳过**格式门控**（Sniffer 判为无法识别 / 网页 / 0 字节 / 下载未完成的那几档），
+        // 直接交给 7-Zip 试一次 —— 用户已经明确要求「不管你怎么判，试一次」。
+        //
+        // 覆盖范围**只有**格式门控。以下全部照旧适用，一条都不放过：
+        //   * I1：仍然必须由「索引比对」判成功，绝不因为「用户要求了」就报成功；
+        //   * I2：仍然先落同卷空暂存目录、校验通过后改名提交；
+        //   * I3：失败/跳过一律不删原包；删除仍然默认关；
+        //   * I4：容器文档门控（docx/apk/jar…）不受影响 —— 那是「不递归」的判定，不是格式识别；
+        //   * Preflight 的安全上限（压缩炸弹 / 海量条目）不受影响，见 Preflight.CheckExpansion。
+        //
+        // 形状：路径清单（用 List 而不是 HashSet：Task 12 的 CLI / Task 14 的界面按 JSON 数组传，
+        // 顺序与重复都无害）。空（默认）= 不覆盖任何项；匹配一律先归一成绝对路径、大小写不敏感。
+        public List<string> ForceTreatAsArchive = new List<string>();
+
+        // 该路径是否被用户要求「强制按压缩包尝试」。归一失败就退回原样字符串比较 ——
+        // 绝不能因为路径写法不同（相对/绝对、大小写）而静默丢掉用户的请求。
+        public bool IsForcedTreatAsArchive(string path)
+        {
+            if (string.IsNullOrEmpty(path) || ForceTreatAsArchive == null) { return false; }
+
+            for (int i = 0; i < ForceTreatAsArchive.Count; i++)
+            {
+                string raw = ForceTreatAsArchive[i];
+                if (string.IsNullOrEmpty(raw)) { continue; }
+                if (string.Equals(raw, path, StringComparison.OrdinalIgnoreCase)) { return true; }
+
+                string a;
+                string b;
+                try { a = Path.GetFullPath(raw); }
+                catch (Exception) { a = raw; }
+                try { b = Path.GetFullPath(path); }
+                catch (Exception) { b = path; }
+
+                if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
     }
 }

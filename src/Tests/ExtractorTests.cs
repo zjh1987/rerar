@@ -10,6 +10,11 @@
 //   * I4：门控拒绝（容器文档）的归档绝不递归、绝不删除原包。
 //   * I5：候选密码一律用 `t`（或头部加密时的 `l`）验证，绝不用 `x`；只在验证成功后缓存。
 //   * Review Focus #1：预检 + 运行中轮询可用空间，低水位时干净中止（原包保留、绝不提交半成品）。
+//   * 预检安全上限（§9.1 用例 10「zip 炸弹 → 预检拒绝，不写盘」；§6.9 的真实风险）：解压比 /
+//     单包总字节 / 条目数三条上限，在任何写入之前生效；拒绝判词必须写明是安全上限、只跳过该项、
+//     整批继续、原包保留；「上限算不出来」时保守拒绝，绝不降级成直接解压。
+//   * 「强制按压缩包尝试」（§6.1 的逐项动作 + §6.3「永不静默丢弃」）：RunOptions.ForceTreatAsArchive
+//     只覆盖格式门控，I1/I2/I3/I4 与上述安全上限一律照旧。
 //
 // 全部用例都是「端到端跑一遍 Extractor」或「直接喂纯函数」两种形状之一，没有 mock 掉被测逻辑。
 //
@@ -326,6 +331,153 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(Preflight.NeedsPassword(Index(0, 0, true, true)));
             AssertFalse(Preflight.NeedsPassword(Index(3, 9, true, false)));   // 损坏：失败但不是加密
             AssertFalse(Preflight.NeedsPassword(Index(3, 9, false, false)));  // 清单读得出来
+        });
+
+        // ==================================================================
+        // 修复轮 #1：压缩炸弹 / 解压比预检上限（规格 §9.1 用例 10 与 §9.2；审计 F2）
+        //
+        // 三条要求，缺一条这个上限就等于没实现：
+        //   * 靠**索引**算（解压后总字节、条目数），不靠猜测；
+        //   * 在**任何写入之前**生效 —— 高压缩比先打满的是磁盘，海量条目先打满的是文件系统
+        //     （MFT / 配额 / 杀软逐文件扫描），两者都不能等到写起来才发现；
+        //   * 拒绝判词必须让人看出这是**安全上限**而不是「文件坏了」，处置是**跳过这一项、
+        //     整批继续**（不是致命档），原包一律保留。
+        // ==================================================================
+
+        // 端到端：真·高压缩比包（16 MiB 全零 → 几十 KB）。一个字节都不写盘、原包保留，
+        // 并且**同一批的下一个归档照常解出** —— 证明处置是「跳过这一项」而不是「中止整批」。
+        H.Run("Extract.BombRejectedByCapsWithNothingWritten", delegate {
+            string bomb = TestEnv.BombZip;
+            string plain = TestEnv.PlainZip;
+
+            RunSummary s = TestEnv.RunExtractMany(bomb, plain);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.Contains("安全上限"));
+            // 判词必须点名是**哪一条**上限、并且让用户能区分「安全上限」与「文件坏了」。
+            AssertTrue(s.Results[0].Message.Contains("解压比"));
+            AssertTrue(s.Results[0].Message.Contains("不是文件损坏"));
+            AssertTrue(s.FatalReason == null);                       // 不是致命档：整批继续
+            AssertTrue(File.Exists(bomb));                          // 原包保留
+            AssertFalse(Directory.Exists(TestEnv.OutOf(bomb)));      // 没写盘：连输出目录都没有
+
+            AssertEq(s.Results[1].Status, ArchiveStatus.Completed);  // 下一个归档照常处理
+            AssertTrue(File.Exists(TestEnv.OutOf(plain, "a.txt")));
+
+            // 输出根下只允许留下 plain 的那一个产物目录（没有暂存残留、没有炸弹的半个目录）。
+            string[] produced = Directory.GetDirectories(TestEnv.OutRoot);
+            AssertEq(produced.Length, 1);
+        });
+
+        // 条目数上限的判定与边界（纯函数；真归档那一条见下一条用例）。
+        // 边界一并钉住：**正好**上限必须放行 —— 否则「上限」可以靠「全都拒」通过。
+        H.Run("Extract.CapsRejectOverCountIndex", delegate {
+            ArchiveIndex over = Index(Preflight.MaxEntriesPerArchive + 1, 1024, false, false);
+            PreflightReport report = Preflight.CheckExpansion(over, 1024);
+            AssertFalse(report.Ok);
+            AssertTrue(report.Reason.Contains("条目"));
+
+            ArchiveIndex atCap = Index(Preflight.MaxEntriesPerArchive, Preflight.MaxEntriesPerArchive, false, false);
+            AssertTrue(Preflight.CheckExpansion(atCap, Preflight.MaxEntriesPerArchive).Ok);
+        });
+
+        // 条目数上限的**端到端**那一半：真归档（10 万 + 1 条零长度条目）。
+        // 它同时是「总字节 == 0 但 FileCount > 0 仍然可度量」的活样本（零字节不触发体积上限），
+        // 所以这条只可能被**条目数**上限拦住 —— 判词必须点名「条目」，且一个字节都不写盘。
+        H.Run("Extract.EntryFloodArchiveRejectedWithNothingWritten", delegate {
+            string flood = TestEnv.EntryFloodZip;
+            RunSummary s = TestEnv.RunExtract(flood);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.Contains("安全上限"));
+            AssertTrue(s.Results[0].Message.Contains("条目"));
+            AssertTrue(s.FatalReason == null);                     // 不是致命档
+            AssertFalse(Directory.Exists(TestEnv.OutOf(flood)));    // 不写盘
+            AssertTrue(File.Exists(flood));                        // 原包保留
+        });
+
+        // 解压比与单包总字节两条上限各自单独触发（不能被对方掩盖）。
+        H.Run("Extract.CapsRejectHighRatioAndHugeIndex", delegate {
+            ArchiveIndex ratio = Index(1, 1024L * 1024 * 1024, false, false);      // 1 GiB / 1 KiB
+            PreflightReport r1 = Preflight.CheckExpansion(ratio, 1024);
+            AssertFalse(r1.Ok);
+            AssertTrue(r1.Reason.Contains("解压比"));
+
+            // 分母取「包自身大小」，所以这条只可能被总字节上限拦住（比值约 1 倍）。
+            ArchiveIndex huge = Index(1, Preflight.MaxTotalUncompressedBytes + 1, false, false);
+            PreflightReport r2 = Preflight.CheckExpansion(huge, Preflight.MaxTotalUncompressedBytes);
+            AssertFalse(r2.Ok);
+            AssertTrue(r2.Reason.Contains("总字节"));
+        });
+
+        // **算不出上限就不放行**（这是头部加密那条 caveat 的落地形状，见 Preflight 的注释）：
+        // 清单不可用、或索引里没有可度量的条目时，保守默认是**拒绝**，绝不降级成「那就直接解压吧」。
+        H.Run("Extract.CapsRejectUnmeasurableIndex", delegate {
+            AssertFalse(Preflight.CheckExpansion(null, 1024).Ok);
+            AssertFalse(Preflight.CheckExpansion(Index(0, 0, false, false), 1024).Ok);   // 单流/空包：无成员可量
+            AssertFalse(Preflight.CheckExpansion(Index(3, 9, true, false), 1024).Ok);    // 清单读取失败
+
+            AssertTrue(Preflight.CheckExpansion(Index(3, 9, false, false), 1024).Ok);    // 普通包照常放行
+        });
+
+        // 普通归档绝不能被上限拒：否则「上限」可以靠「把一切都拒掉」假通过。
+        H.Run("Extract.NormalArchiveNotRejectedByCaps", delegate {
+            RunSummary s = TestEnv.RunExtract(TestEnv.PlainZip);
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertFalse(s.Results[0].Message.Contains("安全上限"));
+            AssertTrue(File.Exists(TestEnv.OutOf(TestEnv.PlainZip, "a.txt")));
+        });
+
+        // ==================================================================
+        // 修复轮 #2：「强制按压缩包尝试」的逐项覆盖（规格 §6.1 的逐项动作 + §6.3 的「永不静默丢弃」）
+        //
+        // 覆盖范围只有**格式门控**：I1（索引比对）、I2（暂存→校验→提交）、I3（失败绝不删）、
+        // I4（容器文档门控）与 #1 的安全上限全部照旧适用。所以：强制一份 Sniffer 不认识但
+        // 7-Zip 认识的真归档 ⇒ 正常解出；强制一份非归档 ⇒ 如实失败、绝不报成功、原包保留。
+        // ==================================================================
+
+        H.Run("Extract.ForcedUnknownFormatIsAttempted", delegate {
+            string wim = TestEnv.UnknownFormatWim;
+
+            // 先证明它**默认会被格式门控跳过**（否则这条用例根本没测到「强制」这件事）。
+            RunSummary skipped = TestEnv.RunExtract(wim);
+            AssertEq(skipped.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(skipped.Results[0].Message.Contains("无法识别"));
+            AssertFalse(Directory.Exists(TestEnv.OutOf(wim)));
+
+            RunSummary forced = TestEnv.RunExtractForced(wim);
+            AssertEq(forced.Results[0].Status, ArchiveStatus.Completed);      // 真的被解出来了
+            AssertTrue(forced.Results[0].Message.Contains("强制"));
+            AssertTrue(forced.Results[0].Files > 0);
+            AssertTrue(File.Exists(TestEnv.OutOf(wim, "hello.txt")));         // 产物在盘上（I1 校验通过）
+            AssertTrue(File.Exists(wim));                                    // I3：原包保留
+        });
+
+        // 强制**不是**「跳过校验」：非归档被强制后 7-Zip 读不出清单 ⇒ 必须 Failed（I1），
+        // 绝不能因为「用户要求了」就判成功；也绝不写盘、绝不删原包。
+        H.Run("Extract.ForcedNonArchiveStillFailsVerification", delegate {
+            string junk = TestEnv.UnknownGarbage;
+            RunSummary forced = TestEnv.RunExtractForced(junk);
+            AssertEq(forced.Results[0].Status, ArchiveStatus.Failed);
+            AssertTrue(forced.Results[0].Message.Contains("强制"));
+            AssertFalse(Directory.Exists(TestEnv.OutOf(junk)));
+            AssertTrue(File.Exists(junk));
+        });
+
+        // 强制**不**绕过 #1 的安全上限：「下载未完成的 .part」也在同一道格式门控里，
+        // 强制它 ⇒ 仍然被安全上限拒绝、一个字节都不写盘、原包保留。
+        H.Run("Extract.ForcedAttemptStillAppliesCaps", delegate {
+            string part = CopyToTmp(TestEnv.BombZip, "forced-bomb.part");
+
+            RunSummary skipped = TestEnv.RunExtract(part);
+            AssertEq(skipped.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(skipped.Results[0].Message.Contains("下载"));
+
+            RunSummary forced = TestEnv.RunExtractForced(part);
+            AssertEq(forced.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(forced.Results[0].Message.Contains("安全上限"));
+            AssertFalse(Directory.Exists(TestEnv.OutOf(part)));
+            AssertTrue(File.Exists(part));
         });
     }
 

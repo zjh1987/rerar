@@ -3,8 +3,13 @@
 // 本类是整条流水线的汇聚点，也是安全不变式唯一真正落地的地方。管线顺序（Task 5 的裁定：
 // 规格 §4.2 把 Gater 排在 Indexer 之前是**不可能的**，门控需要清单）：
 //
-//   Sniffer → 分卷族 → 索引(Read) → Gater → 预检(空间/长路径/重名) → 密码 → 暂存 → 解压 →
+//   Sniffer → 分卷族 → 索引(Read) → Gater → 预检(安全上限/空间/长路径/重名) → 密码 → 暂存 → 解压 →
 //   校验 → 提交 → （仅当开启删除且「完成且校验通过」）回收站/隔离
+//
+// 两个逐项开关（都只放开「要不要试」这一层，绝不放开任何安全判定）：
+//   * RunOptions.ForceTreatAsArchive：「强制按压缩包尝试」（规格 §6.1 的逐项动作）跳过**格式门控**；
+//   * 预检安全上限（Preflight.CheckExpansion，压缩炸弹 / 海量条目）**没有**开关，一律生效 ——
+//     包括被强制的项（用例 Extract.ForcedAttemptStillAppliesCaps 钉住这一点）。
 //
 // 每个归档**只 Read 一次索引**，它同时服务门控（内容身份）与完整性基线（条目数/总字节）。
 // 唯一的例外是头部加密：那次 Read 什么清单都拿不到，找到密码后必须再读一次才有基线。
@@ -278,22 +283,35 @@ namespace Rerar.Core
             _lowWaterDuringExtraction = false;
 
             // --- 1) Sniffer（规格 §6.3：三档判定，永不静默丢弃）---
+            // 「强制按压缩包尝试」（规格 §6.1 的逐项动作）只覆盖**格式门控**：用户已经明确要求
+            //「不管你怎么判，试一次」，那就试一次 —— 但 I1（索引比对）、I2（暂存→校验→提交）、
+            // I3（失败绝不删）、I4（容器文档门控）与预检安全上限全部照旧适用（见 RunOptions 的注释）。
+            bool forced = _options.IsForcedTreatAsArchive(sourcePath);
             SniffKind kind = Sniff(sourcePath);
-            if (kind == SniffKind.InProgressDownload)
+            if (!IsArchiveKind(kind))
             {
-                return Reject(result, ArchiveStatus.SkippedUnreadable, "下载未完成（后缀表明文件还在下载中）：已跳过，原文件保留");
-            }
-            if (kind == SniffKind.Html)
-            {
-                return Reject(result, ArchiveStatus.SkippedUnreadable, "这是网页而不是压缩包（下载很可能已失败）：已跳过，原文件保留");
-            }
-            if (kind == SniffKind.Empty)
-            {
-                return Reject(result, ArchiveStatus.SkippedUnreadable, "0 字节文件：视为缺卷，已跳过，原文件保留");
-            }
-            if (kind == SniffKind.Unknown)
-            {
-                return Reject(result, ArchiveStatus.SkippedUnreadable, "无法识别的格式：已跳过（界面上可对该项选择「强制按压缩包尝试」），原文件保留");
+                if (!forced)
+                {
+                    if (kind == SniffKind.InProgressDownload)
+                    {
+                        return Reject(result, ArchiveStatus.SkippedUnreadable, "下载未完成（后缀表明文件还在下载中）：已跳过，原文件保留");
+                    }
+                    if (kind == SniffKind.Html)
+                    {
+                        return Reject(result, ArchiveStatus.SkippedUnreadable, "这是网页而不是压缩包（下载很可能已失败）：已跳过，原文件保留");
+                    }
+                    if (kind == SniffKind.Empty)
+                    {
+                        return Reject(result, ArchiveStatus.SkippedUnreadable, "0 字节文件：视为缺卷，已跳过，原文件保留");
+                    }
+                    return Reject(result, ArchiveStatus.SkippedUnreadable, "无法识别的格式：已跳过（界面上可对该项选择「强制按压缩包尝试」），原文件保留");
+                }
+
+                // 强制路径必须自己说明白：否则用户看到的是一条「明明被识别成网页却照样解压」的记录，
+                // 无从知道这是自己点过的动作。判词到此为止 —— **不写「原文件保留」**：这一项万一真的
+                // 解压成功，删除开关打开时它是允许被处置的（删不删由状态与 I3 决定，另有判词）。
+                result.Message = AppendMessage(result.Message,
+                    "已按用户要求「强制按压缩包尝试」（跳过格式识别门控：" + DescribeKind(kind) + "）");
             }
             // DamagedHeader（头部被改写、尾部仍有 zip 标记）继续往下走：7-Zip 有时仍读得出内容；
             // 读不出来会在下面得到「清单读取失败」的明确结局，绝不在这里猜。
@@ -358,6 +376,19 @@ namespace Rerar.Core
                     "条目名冲突（大小写不敏感的重名，Windows 上是同一个路径，例如 Readme.txt 与 README.TXT）：" +
                     "拒绝写入以免静默覆盖（冲突项「" + conflict + "」）；原包保留");
             }
+            // 安全上限（压缩炸弹 / 海量条目）：必须在**任何写入之前**判定，也必须排在空间预检
+            // **之前** —— 空间不足是规格 §7 的**致命**档（中止整批），而炸弹是**单个归档**的问题，
+            // 正确处置是跳过它、继续处理下一个（多目标用例钉住了这一点）。
+            //
+            // 分母是「包自身的物理字节」：分卷集按**所有成员求和**（那是这个包真实占的盘）；
+            // 任何查询失败一律按 0 处理 —— 分母为 0 时 CheckExpansion 会退回 64 KiB 的下限，
+            // 方向是**更保守**（比值更大、更容易拒绝），绝不会因为读不到大小就放行。
+            PreflightReport caps = Preflight.CheckExpansion(index, ArchivePhysicalBytes(task, archiveArg));
+            if (!caps.Ok)
+            {
+                return Reject(result, ArchiveStatus.SkippedUnreadable, caps.Reason);
+            }
+
             PreflightReport space = Preflight.CheckFreeSpace(_disk, destRoot, index.TotalBytes, _options.MinFreeBytes);
             if (!space.Ok)
             {
@@ -1326,6 +1357,46 @@ namespace Rerar.Core
             }
         }
 
+        // 归档自身的物理字节数（预检解压比的分母，见 Preflight.CheckExpansion）。
+        // 分卷集 = **所有成员之和**（那才是这个包真实占的盘，用第一个成员的大小会把比值人为放大）；
+        // 否则 = 交给 7-Zip 的那个文件。任何一项查不到大小就按 0 计入：分母偏小只会让比值偏大、
+        // 更容易被拒 —— 安全方向。绝不因为「读不到大小」而跳过上限。
+        private static long ArchivePhysicalBytes(ArchiveTask task, string archiveArg)
+        {
+            if (task.VolumeMembers != null && task.VolumeMembers.Count > 0)
+            {
+                long total = 0;
+                foreach (string member in task.VolumeMembers)
+                {
+                    long one = LengthOrZero(member);
+                    if (total > long.MaxValue - one) { return long.MaxValue; }   // 饱和，绝不回绕成小数
+                    total += one;
+                }
+                return total;
+            }
+            return LengthOrZero(archiveArg);
+        }
+
+        private static long LengthOrZero(string path)
+        {
+            if (string.IsNullOrEmpty(path)) { return 0; }
+            try { return new FileInfo(path).Length; }
+            catch (Exception) { return 0; }
+        }
+
+        // Sniffer 结论的中文说法：只用在「强制尝试」的判词里，用户需要知道自己 override 了哪一档。
+        private static string DescribeKind(SniffKind kind)
+        {
+            switch (kind)
+            {
+                case SniffKind.Unknown: return "无法识别";
+                case SniffKind.Html: return "这是网页";
+                case SniffKind.Empty: return "0 字节";
+                case SniffKind.InProgressDownload: return "下载未完成";
+                default: return kind.ToString();
+            }
+        }
+
         // ------------------------------------------------------------------
         // 结果与运行级状态
         // ------------------------------------------------------------------
@@ -1343,10 +1414,14 @@ namespace Rerar.Core
             return result;
         }
 
+        // 拒绝这一项：置状态 + 判词。用 AppendMessage 而不是覆盖 —— 「强制按压缩包尝试」在格式门控
+        // 处已经写下了一条判词，之后任何一档拒绝（清单读不出、门控、预检、暂存）都必须把它保留下来，
+        // 否则用户看到的记录会与自己点过的动作对不上。对非强制的项，进入这里时 Message 一定是空的
+        //（每条提前返回路径都紧跟着 return），所以 AppendMessage 与直接赋值完全等价。
         private static ArchiveResult Reject(ArchiveResult result, ArchiveStatus status, string message)
         {
             result.Status = status;
-            result.Message = message;
+            result.Message = AppendMessage(result.Message, message);
             return result;
         }
 
@@ -1365,8 +1440,10 @@ namespace Rerar.Core
             }
 
             result.Status = ArchiveStatus.SkippedNeedsPassword;
-            result.Message = "需要密码：" + _lastLadderTries +
-                " 个候选都未通过验证（候选一律用 `7z t` 或 `l` 验证，绝不用 x 试密码）；原包保留";
+            // 用 AppendMessage 而不是直接赋值：强制按压缩包尝试的项在这里也必须保留那条
+            //「这是你要求强制的」判词，否则用户会看到一条与自己的动作对不上的记录。
+            result.Message = AppendMessage(result.Message, "需要密码：" + _lastLadderTries +
+                " 个候选都未通过验证（候选一律用 `7z t` 或 `l` 验证，绝不用 x 试密码）；原包保留");
             return result;
         }
 

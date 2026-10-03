@@ -1417,6 +1417,32 @@ internal static class TestEnv
         get { return Fixture("big.7z", BuildBigSevenZip); }
     }
 
+    // 高压缩比「zip 炸弹」形状（规格 §9.1 用例 10；审计 F2）：16 MiB 全零被 deflate 压到几十 KB。
+    // 用例要的是「**任何写入之前**就被预检拒绝」——所以它既不会真的写出 16 MiB，也不会拖慢套件。
+    public static string BombZip
+    {
+        get { return Fixture("bomb-zeros.zip", BuildBombZip); }
+    }
+
+    // Sniffer **不认识**、7-Zip 却能解的**真归档**（.wim）：格式门控「强制按压缩包尝试」的输入。
+    public static string UnknownFormatWim
+    {
+        get { return Fixture("unknown-format.wim", BuildUnknownFormatWim); }
+    }
+
+    // Sniffer 不认识的**非归档**（一段全零字节）：强制后必须如实失败，绝不能被读成成功。
+    public static string UnknownGarbage
+    {
+        get { return Fixture("unknown-garbage.bin", BuildUnknownGarbage); }
+    }
+
+    // 条目数上限用的**真归档**：10 万 + 1 条零长度条目（数量就是它存在的全部意义）。
+    // 只服务一条用例，所以构造成本（约 10 万次 CreateEntry）每轮只付一次。
+    public static string EntryFloodZip
+    {
+        get { return Fixture("entry-flood.zip", BuildEntryFloodZip); }
+    }
+
     // ------------------------------------------------------------------
     // zip 写库：逐条写**文件**，不写父目录条目（与真实 wheel 夹具同一套做法）。
     // ------------------------------------------------------------------
@@ -1541,6 +1567,115 @@ internal static class TestEnv
         if (!SevenZipRunner.IsSuccess(right.ExitCode)) { FixtureFailed("校验 BigSevenZip fixture（SECRET 打不开）", rightArgs, right); }
     }
 
+    // ==================================================================
+    // Task 10 修复轮（预检安全上限 + 「强制按压缩包尝试」）的夹具
+    // ==================================================================
+
+    // 高压缩比包：16 MiB 全零（deflate 对全零文件能压到几十 KB）。
+    // 用 .NET 的 zip 写库造（理由同本节的其它 zip）：7-Zip 的 `a` 在 I5 约束下必然带 `-p`，
+    // 而带密码的 zip 是**加密**的 —— 这个用例要的形状是「可读清单 + 巨大解压后体积」，
+    // 加密会先把流程推到密码阶梯上去。
+    private static void BuildBombZip(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            ZipArchiveEntry entry = z.CreateEntry("zeros.bin", CompressionLevel.Optimal);
+            using (Stream stream = entry.Open())
+            {
+                byte[] chunk = new byte[64 * 1024];
+                for (long written = 0; written < BombPayloadBytes; written += chunk.Length)
+                {
+                    stream.Write(chunk, 0, chunk.Length);
+                }
+            }
+        });
+
+        // 自检：这个夹具必须真的越过解压比上限。否则用例是在一块「其实不高压缩比」的数据上
+        // 假通过 —— 而「高压缩比必须被拒」正是这条安全上限唯一要挡住的方向。
+        long pack = new FileInfo(targetPath).Length;
+        long basis = pack > Preflight.ExpansionRatioBasisFloorBytes ? pack : Preflight.ExpansionRatioBasisFloorBytes;
+        double ratio = (double)BombPayloadBytes / (double)basis;
+        if (ratio <= Preflight.MaxExpansionRatio)
+        {
+            throw new InvalidOperationException(
+                "BombZip fixture 构造失败：包 " + pack + " 字节、解压后 " + BombPayloadBytes +
+                " 字节，解压比只有 " + ((long)ratio) + " 倍，没超过上限 " + Preflight.MaxExpansionRatio + " 倍");
+        }
+    }
+
+    private const int BombPayloadBytes = 16 * 1024 * 1024;
+
+    // Sniffer 不认识的真归档：`.wim`（MSWIM 魔数不在 Sniffer 的签名表里）而 7-Zip 26.01 能造能解。
+    //
+    // 为什么不用残余风险里点名的 `.cab`：7-Zip 只能**解**不能**造**（实测 `7z a -tcab` 报「未实现」），
+    // 而用系统自带的 makecab 会让这套件多一个工具依赖；wim 用**已经必须存在的** 7-Zip 就能造
+    //（实测 26.01 `a -twim` 成功，且 `-p` 被忽略、不弹密码提示 —— 与 tar/bzip2 同形）。
+    private static void BuildUnknownFormatWim(string targetPath)
+    {
+        // 源文件放在自己的短目录里，用 `目录\*` 通配喂给 7-Zip：这样存进包里的成员名就是裸文件名
+        //（绝不能用 fixture-seed 目录，那里面还有别的夹具的种子文件）。
+        string sourceDir = Path.Combine(_root, "unknown-format-src");
+        if (!Directory.Exists(sourceDir)) { Directory.CreateDirectory(sourceDir); }
+        File.WriteAllText(Path.Combine(sourceDir, "hello.txt"),
+            "Rerar forced-as-archive fixture: hello\r\n", new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(sourceDir, "second.dat"),
+            new string('F', 512), new UTF8Encoding(false));
+
+        string[] args = new string[] { "a", "-twim", targetPath, sourceDir + @"\*", "-p", "-y" };
+        RunResult built = RunSevenZip(args);
+        if (!SevenZipRunner.IsSuccess(built.ExitCode)) { FixtureFailed("构造 UnknownFormatWim fixture", args, built); }
+
+        // 自检 1：它必须真的**不被 Sniffer 认识** —— 否则「强制」这条用例根本没走到格式门控。
+        long length = new FileInfo(targetPath).Length;
+        byte[] head = new byte[512];
+        using (FileStream stream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            int read = stream.Read(head, 0, head.Length);
+            if (read != head.Length) { Array.Resize(ref head, read); }
+        }
+        SniffKind kind = Sniffer.Classify(head, length, Path.GetFileName(targetPath), null);
+        if (kind != SniffKind.Unknown)
+        {
+            throw new InvalidOperationException(
+                "UnknownFormatWim fixture 构造失败：Sniffer 把它判成了 " + kind + "（本条用例要的是 Unknown）");
+        }
+
+        // 自检 2：7-Zip 必须读得出它的清单 —— 否则「强制后 Completed」这个期望是错的。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 UnknownFormatWim fixture（清单读不出来）", listArgs, listed); }
+        if (listed.StdOut == null || listed.StdOut.IndexOf("hello.txt", StringComparison.Ordinal) < 0)
+        {
+            throw new InvalidOperationException(
+                "UnknownFormatWim fixture 构造失败：清单里没有 hello.txt；stdout=[" + Head(listed.StdOut) + "]");
+        }
+    }
+
+    // 非归档：一段全零字节。Sniffer 判 Unknown（不是空文件，也没有任何签名/尾部标记），
+    // 7-Zip 读不出清单 ⇒ 强制后必须 Failed（顺带钉住「强制不绕过 I1」）。
+    private static void BuildUnknownGarbage(string targetPath)
+    {
+        File.WriteAllBytes(targetPath, new byte[4096]);
+    }
+
+    // 条目数上限的夹具：条目数 = MaxEntriesPerArchive + 1（**刚好越界一条**，这样它也顺带钉住边界）。
+    // 每条都是零长度文件：伤害不在字节（总共 0 字节，空间预检完全拦不住），而在 MFT/配额 —— 正是这条上限的理由。
+    private static void BuildEntryFloodZip(string targetPath)
+    {
+        WriteZipFile(targetPath, delegate(ZipArchive z)
+        {
+            for (int i = 0; i <= Preflight.MaxEntriesPerArchive; i++)
+            {
+                AddZipBytes(z, "e" + i + ".bin", new byte[0]);
+            }
+        });
+
+        // 自检：清单必须真的读得出来（否则这条用例会退化成「清单坏了」而不是「条目数超限」）。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("构造 EntryFloodZip fixture", listArgs, listed); }
+    }
+
     // ------------------------------------------------------------------
     // Task 10 驱动：把 Extractor 用固定选项跑一遍，返回 RunSummary。
     // 输出根固定为 OutRoot（每个用例前被 Cleanup 清空），于是
@@ -1626,6 +1761,25 @@ internal static class TestEnv
 
     private static RunSummary RunExtractCore(string archive, string password, int depth, long[] freeSequence, bool deleteOriginals, int pollSeconds)
     {
+        return RunExtractCore(archive, password, depth, freeSequence, deleteOriginals, pollSeconds, null);
+    }
+
+    // 「强制按压缩包尝试」的逐项覆盖（规格 §6.1 的逐项动作）：把该路径加进 RunOptions 的清单。
+    // 只覆盖格式门控 —— 校验/暂存/不删/安全上限全部照旧（用例逐个钉住）。
+    public static RunSummary RunExtractForced(string archive)
+    {
+        return RunExtractCore(archive, null, 10, null, false, 2, archive);
+    }
+
+    // 一次 Run 跑多个目标：钉住「预检安全上限只跳过**那一个**归档、整批继续」（不是致命中止）。
+    public static RunSummary RunExtractMany(params string[] archives)
+    {
+        RunOptions options = NewOptions(null, 10, false, 2);
+        return new Extractor(options, new DriveSpaceProvider(), null).Run(archives);
+    }
+
+    private static RunOptions NewOptions(string password, int depth, bool deleteOriginals, int pollSeconds)
+    {
         RunOptions options = new RunOptions();
         options.SevenZipPath = SevenZip;
         options.OutputRoot = OutRoot;
@@ -1633,6 +1787,13 @@ internal static class TestEnv
         options.MaxDepth = depth;
         options.DeleteOriginals = deleteOriginals;
         options.DiskPollSeconds = pollSeconds;
+        return options;
+    }
+
+    private static RunSummary RunExtractCore(string archive, string password, int depth, long[] freeSequence, bool deleteOriginals, int pollSeconds, string force)
+    {
+        RunOptions options = NewOptions(password, depth, deleteOriginals, pollSeconds);
+        if (force != null) { options.ForceTreatAsArchive.Add(force); }
 
         IDiskSpaceProvider disk = freeSequence == null
             ? (IDiskSpaceProvider)new DriveSpaceProvider()

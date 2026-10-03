@@ -17,6 +17,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 
 namespace Rerar.Core
@@ -60,6 +61,102 @@ namespace Rerar.Core
             report.Reason = "磁盘空间不足：目标 " + Shorten(destinationRoot) + " 所在卷可用 " + free +
                 " 字节，需要约 " + required + " 字节（归档 " + need + " 字节 + 低水位 " + reserve + " 字节）";
             return report;
+        }
+
+        // ------------------------------------------------------------------
+        // 安全上限：压缩炸弹 / 海量条目（规格 §9.1 用例 10、§9.2；审计 F2）
+        // ------------------------------------------------------------------
+
+        // 单包最大解压比：解压后总字节 ÷ 包自身物理字节。取 100 倍。
+        // 依据：真实归档里只有高度重复的内容（长文本、日志、CSV、源码、零填充的测试数据）会接近
+        // 这个量级，而 §6.9 点名的炸弹形状是 10^3～10^6 倍。取 100 而不是 10：太紧会把正常的高重复
+        // 内容也拒掉；取 100 而不是 1000：1000 倍足够让一个 50 KB 的包变成 50 GB，而那时磁盘空间预检
+        // 在大容量磁盘上基本不设防（4 TB 盘上「空间很够」）。两侧代价完全不对称 —— 误拒只是少解
+        // 一个包（判词写明是安全上限、原包保留），误放则会写满盘或耗尽文件系统。
+        public const double MaxExpansionRatio = 100.0;
+
+        // 解压比分母的下限：64 KiB。
+        // 为什么需要它：分母取「包自身字节」，小包的分母太小时比值由噪声主导 —— 一个 200 字节的包
+        // 解出一份 40 KB 的说明文件就是 200 倍，那是无害的。这条下限之上的伤害本来就被下面两条
+        // 绝对上限兜住，所以比值只需要在真正有意义的量级上生效。
+        public const long ExpansionRatioBasisFloorBytes = 64L * 1024;
+
+        // 单包解压后总字节上限：128 GiB。
+        // 依据：本工具最主要的输入是媒体包，而媒体本身已经压缩过（解压比 ≈ 1），所以这条**不是**
+        // 用来拦媒体的，而是拦「比值的漏网之鱼」—— 解压比没超上限、绝对体量却不合理的包
+        //（例如 2 GB 的包解出 90 GB）。128 GiB 高于最大的单部 4K 原盘（约 80 GB）、远低于
+        // 「几十 TB」这种明显不属于单个包的体量；更强的保护其实是空间预检（要求可用空间 ≥
+        // 解压后总字节 + 低水位），这一条只是不让一个包把机器拖进长时间的写盘。
+        public const long MaxTotalUncompressedBytes = 128L * 1024 * 1024 * 1024;
+
+        // 单包条目数上限：10 万条（含目录条目）。
+        // 依据：审计 F2 点名的攻击形状是「2 MB → 300 万个条目」——它的伤害不在字节（300 万个 1 字节
+        // 条目总共才 3 MB，空间预检完全拦不住），而在文件系统：每个条目占一条 MFT 记录，加上杀软
+        // 逐文件扫描，会先耗尽 MFT/配额、再把机器拖到事实性卡死。10 万已远超本工具用途下的任何
+        // 真实单包（媒体包几十到几百条；整树打包的源码/素材包通常几千到几万条），同时把 300 万
+        // 条目的形状挡在 30 倍以外。
+        public const int MaxEntriesPerArchive = 100000;
+
+        // 三条上限 + 「算不出上限」时的保守处置。要在**任何写入之前**调用（Extractor 把它排在
+        // 空间预检**之前**：空间不足是**致命**档、会中止整批，而炸弹是**单个归档**的问题，
+        // 正确处置是跳过它、继续处理下一个）。
+        //
+        // 【头部加密的 caveat —— 上限算不出来时怎么办，明确写下来】
+        // 被加密的头部会让清单读不出来，那一刻上限定不出来。本工具的处置是：
+        //   1. Extractor 在「清单因加密而失败」时先走密码阶梯，用 `l -p<候选>` 验证候选密码；
+        //      拿到密码后**重读一次索引**，上限就从那份真索引算 —— 加密包不会绕开上限；
+        //   2. 拿不到密码 ⇒ SkippedNeedsPassword，根本走不到解压，也就不需要上限；
+        //   3. 因此走到本函数的索引只可能是「成功但没有可度量条目」（单流格式 / 空包 / 只有目录）
+        //      或「清单读取失败」这两种。两者一律**拒绝**（保守默认 = 不放行），v1.0 不提供开关。
+        // 绝不允许降级成「算不出上限就照解」—— 那是这条上限会形同虚设的唯一路径。
+        public static PreflightReport CheckExpansion(ArchiveIndex index, long archiveBytes)
+        {
+            if (index == null || index.ListingFailed || index.Entries == null)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：归档清单不可用（读取失败或没有条目表），"
+                    + "解压比与体积上限都算不出来 —— 拿不到上限就不放行；未写盘一个字节；原包保留");
+            }
+            if (index.FileCount == 0)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：清单里没有可度量的文件条目"
+                    + "（单流格式 / 空包 / 只有目录），解压比与体积上限都算不出来 —— 拿不到上限就不放行；"
+                    + "未写盘一个字节；原包保留");
+            }
+            if (index.TotalBytes < 0)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：清单里的总字节数是畸形值（溢出），"
+                    + "解压比与体积上限都算不出来 —— 拿不到上限就不放行；未写盘一个字节；原包保留");
+            }
+
+            // 1) 条目数（含目录条目：每个条目都要占一条 MFT 记录，目录同样要占）。
+            int entries = index.Entries.Count;
+            if (entries > MaxEntriesPerArchive)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：索引里有 " + entries + " 个条目，超过单包上限 "
+                    + MaxEntriesPerArchive + " 个 —— 海量条目会耗尽文件系统（MFT / 配额），"
+                    + "杀软的逐文件扫描还会把机器拖成事实性卡死；未写盘一个字节；原包保留");
+            }
+
+            // 2) 解压后总字节。
+            if (index.TotalBytes > MaxTotalUncompressedBytes)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：索引声明解压后总字节 " + index.TotalBytes
+                    + "，超过单包上限 " + MaxTotalUncompressedBytes + " 字节；未写盘一个字节；原包保留");
+            }
+
+            // 3) 解压比（用 double 比较，避免 archiveBytes * 比例 在靠近 long.MaxValue 时回绕）。
+            long basis = archiveBytes > ExpansionRatioBasisFloorBytes ? archiveBytes : ExpansionRatioBasisFloorBytes;
+            double ratio = (double)index.TotalBytes / (double)basis;
+            if (ratio > MaxExpansionRatio)
+            {
+                return Refuse("预检拒绝（安全上限，不是文件损坏）：解压比约 "
+                    + ratio.ToString("0.#", CultureInfo.InvariantCulture) + " 倍（解压后 " + index.TotalBytes
+                    + " 字节 ÷ 包 " + basis + " 字节），超过上限 "
+                    + MaxExpansionRatio.ToString("0.#", CultureInfo.InvariantCulture)
+                    + " 倍，符合压缩炸弹特征；未写盘一个字节；原包保留");
+            }
+
+            return Ok();
         }
 
         // ------------------------------------------------------------------
@@ -205,6 +302,15 @@ namespace Rerar.Core
             PreflightReport report = new PreflightReport();
             report.Ok = true;
             report.Reason = "";
+            return report;
+        }
+
+        // 拒绝：Reason 一定非空且是给人看的中文判词（本类里所有「拒绝」都走这里，绝不静默）。
+        private static PreflightReport Refuse(string reason)
+        {
+            PreflightReport report = new PreflightReport();
+            report.Ok = false;
+            report.Reason = reason;
             return report;
         }
 
