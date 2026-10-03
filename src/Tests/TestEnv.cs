@@ -60,6 +60,21 @@ internal static class TestEnv
         }
     }
 
+    // Task 13：内嵌 7-Zip 的**释放根**（EngineLocator.EmbeddedRoot 的覆盖值）。
+    //
+    // 为什么必须重定向：生产默认根是 %LOCALAPPDATA%\Rerar\bin，那是**用户的应用数据**。内嵌分支的
+    // 用例会往那里释放 ~2.4 MB 的 7z.exe + 7z.dll，测试绝不能碰真实的应用数据（与 Task 11 的
+    // Journal.Root、Task 12 的 RERAR_JOURNAL_ROOT 同一条理由）。
+    //
+    // 用的机制与 RERAR_JOURNAL_ROOT 一致（进程级环境变量），而不是静态接缝 —— 多一条硬理由：
+    // CLI 用例起的是**子进程**，只有环境变量会被子进程继承，否则那些用例会往真实的
+    // %LOCALAPPDATA%\Rerar\bin 里释放引擎（在没装 7-Zip 的机器上必然发生）。
+    // 未设置时生产行为**完全不变**（见 Engine.EmbeddedRootDefaultsToLocalAppData）。
+    public static string EngineRoot
+    {
+        get { return Path.Combine(Tmp, "engine"); }
+    }
+
     // 本机 7-Zip 的绝对路径。缺失时抛异常并给出明确提示：
     // H.Main 在开跑前就访问它，于是整轮测试以一条 FAIL 结束，而不是逐个用例莫名其妙地失败。
     public static string SevenZip
@@ -145,6 +160,10 @@ internal static class TestEnv
         // Task 11：把崩溃恢复日志的根重定向到临时目录（Tmp 之下）—— 生产默认根在
         // %LOCALAPPDATA%，测试绝不能往那里写（污染用户应用数据 + 用例之间互相串记录）。
         Journal.Root = Path.Combine(_root, "tmp", "journal");
+
+        // Task 13：把内嵌 7-Zip 的释放根也重定向到临时目录（理由与上面一致，且是同一份真实
+        // 应用数据根）。用进程级环境变量而不是静态字段：CLI 用例的子进程会继承它（见 EngineRoot）。
+        Environment.SetEnvironmentVariable(EngineRootVariable, EngineRoot);
 
         // 进程外的残留也一并收拾：上一次运行若在 subst 夹具用例中途被杀，映射会留在机器上
         //（Cleanup 删得掉目录，删不掉映射）。放在这里而不是只放在夹具里，是因为它属于
@@ -2288,6 +2307,13 @@ internal static class TestEnv
         }
     }
 
+    // 本测试运行器自己的路径（dist\tests.exe）。
+    // Task 13 用它钉住「/resource: 只给应用目标」：测试目标绝不能跟着胖 ~2.4 MB。
+    public static string TestsExePath
+    {
+        get { return Assembly.GetExecutingAssembly().Location; }
+    }
+
     // --json-out 的目标文件：Tmp 之下（每用例被 Cleanup 清空）。
     public static string JsonOut
     {
@@ -2491,6 +2517,14 @@ internal static class TestEnv
     // CLI 子进程的崩溃恢复日志根所认的环境变量名（与 src\App\Program.cs 里的常量逐字一致）。
     public const string JournalRootVariable = "RERAR_JOURNAL_ROOT";
 
+    // Task 13：内嵌 7-Zip 释放根所认的环境变量名。**直接引用产品常量**，不复制字符串：
+    // 名字一旦改了却在测试里悄悄失配，测试就再也够不着那个开关，而「测试没生效」看起来和
+    // 「测试通过」一模一样。
+    public const string EngineRootVariable = EngineLocator.EngineRootVariable;
+
+    // Task 13：「只用内置便携版」的开关名（同样直接引用产品常量）。
+    public const string EngineLocalDisabledVariable = EngineLocator.EngineLocalDisabledVariable;
+
     // CLI 子进程的崩溃恢复日志根（= 上面那个变量的值）：Tmp 之下，与进程内的 JournalRoot 分开，
     // 用例据此断言「CLI 真的把日志写在这里」。
     //
@@ -2514,7 +2548,27 @@ internal static class TestEnv
     public static CliResult RunCliWithTimeout(int timeoutMs, params string[] args)
     {
         // 默认：把子进程的日志根指到 Tmp 之下的 CliJournalRoot（见上面的说明）。
-        return RunCliCore(timeoutMs, CliJournalRoot, args);
+        return RunCliCore(timeoutMs, CliJournalRoot, null, args);
+    }
+
+    // Task 13：让子进程**只用内置便携版**跑一次（RERAR_ENGINE_LOCAL=off），并同样把释放根指到
+    // Tmp 之下。这是「无 7-Zip 的干净机器上双击即用」那条承诺的端到端证明：走的是真正随包发出的
+    // dist\Rerar.exe，本机探测被关掉 —— 进程内的 ResolveLocalDisabled() 接缝够不着子进程。
+    public static CliResult RunCliWithLocalEngineDisabled(params string[] args)
+    {
+        return RunCliCore(CliTimeoutMs, CliJournalRoot, new string[] {
+            EngineLocalDisabledVariable, "off",
+            EngineRootVariable, EngineRoot }, args);
+    }
+
+    // Task 13：「一个引擎都用不上」的形状：本机探测关掉 + 释放根不可写 ⇒ 引擎解析必然失败。
+    // 用于钉住「失败是可操作的中文判词 + 退出码 2 + 一个字节都不写」。
+    public static CliResult RunCliWithNoUsableEngine(params string[] args)
+    {
+        string blocker = MakeFile("cli-engine-blocker.txt", "not a directory");
+        return RunCliCore(CliTimeoutMs, CliJournalRoot, new string[] {
+            EngineLocalDisabledVariable, "off",
+            EngineRootVariable, Path.Combine(blocker, "bin") }, args);
     }
 
     // **不设置** RERAR_JOURNAL_ROOT 地跑一次 CLI（用于钉住「没设变量时仍然用生产默认根」）。
@@ -2525,7 +2579,7 @@ internal static class TestEnv
     // 必须给出它期望的退出码，对不上就当场抛异常（用例 FAIL），而不是悄悄把测试写进用户的应用数据。
     public static CliResult RunCliWithoutJournalRootOverride(int expectedExitCode, params string[] args)
     {
-        CliResult result = RunCliCore(CliTimeoutMs, null, args);
+        CliResult result = RunCliCore(CliTimeoutMs, null, null, args);
         if (result.ExitCode != expectedExitCode)
         {
             throw new InvalidOperationException(
@@ -2537,7 +2591,9 @@ internal static class TestEnv
     }
 
     // journalRoot == null ⇒ **移除**该变量（真正走生产默认根）。非 null ⇒ 设为该值。
-    private static CliResult RunCliCore(int timeoutMs, string journalRoot, string[] args)
+    // extraEnvironment：可选的「名字, 值, 名字, 值…」偶数长度数组，逐个写进子进程的环境
+    //（Task 13 的引擎开关走这里；用例只影响自己那一次调用，绝不改本进程的环境）。
+    private static CliResult RunCliCore(int timeoutMs, string journalRoot, string[] extraEnvironment, string[] args)
     {
         string exe = ExePath;
         if (!File.Exists(exe))
@@ -2568,6 +2624,23 @@ internal static class TestEnv
         // 子进程的崩溃恢复日志根：绝不落到真实的 %LOCALAPPDATA%（见 CliJournalRoot 的说明）。
         if (journalRoot == null) { psi.EnvironmentVariables.Remove(JournalRootVariable); }
         else { psi.EnvironmentVariables[JournalRootVariable] = journalRoot; }
+
+        // Task 13：子进程的内嵌 7-Zip 释放根同理 —— 没装 7-Zip 的机器上，CLI 会真的释放内嵌副本，
+        // 那绝不能落在用户真实的 %LOCALAPPDATA%\Rerar\bin 里。
+        psi.EnvironmentVariables[EngineRootVariable] = EngineRoot;
+
+        // 用例额外要求的变量（引擎开关等）。名字/值成对给出，奇数长度是调用方的编程错误。
+        if (extraEnvironment != null)
+        {
+            if (extraEnvironment.Length % 2 != 0)
+            {
+                throw new ArgumentException("extraEnvironment 必须是「名字, 值」成对的偶数长度数组");
+            }
+            for (int i = 0; i < extraEnvironment.Length; i += 2)
+            {
+                psi.EnvironmentVariables[extraEnvironment[i]] = extraEnvironment[i + 1];
+            }
+        }
 
         StringBuilder stdOut = new StringBuilder();
         StringBuilder stdErr = new StringBuilder();

@@ -29,9 +29,10 @@
 // 进程是**可见**的（它们能读到自己进程的命令行），这是「无头驱动面」这个形状本身的代价，
 // 不是本实现的选择 —— 详见 task-12-report.md。
 //
-// 【为什么这里有一个极简的 7-Zip 定位】RunOptions.SevenZipPath 是必填项，而 Task 13 的
-// EngineLocator（注册表 + 版本下限 + 内嵌兜底）尚未落地，Task 12 又要先跑通完整流水线。
-// 所以这里只做「常见安装位置 + PATH」的最小查找，并明确报错；Task 13 落地后应由 EngineLocator 取代。
+// 【解压引擎由 EngineLocator 定位（Task 13）】RunOptions.SevenZipPath 是必填项，而「哪一份 7z.exe」
+// 是规格 §6.2 的问题：本机安装的 7-Zip（≥ 25.00）优先，找不到或低于下限就用内嵌便携版兜底 ——
+// 于是「无 7-Zip 的干净机器上双击即用」这条承诺成立。这里只做两件事：把结果如实印给用户
+//（实际使用的版本与来源路径），以及把它交给流水线。定位失败时以退出码 2 收场并给出中文原因。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -190,15 +191,28 @@ namespace Rerar
                 if (!TryPrepareReportPath(jsonOut, out reportPath, out problem)) { return Fatal(problem); }
             }
 
-            string sevenZip = LocateSevenZip();
-            if (sevenZip == null)
+            // 引擎定位（规格 §6.2）：本机 7-Zip ≥ 25.00 优先，否则释放内嵌便携版兜底。
+            // 失败原因里带着「找过哪些位置、各自为什么不行」，原样交给用户（可操作）。
+            EngineInfo engine;
+            try
             {
-                return Fatal("未找到 7-Zip（7z.exe）：请安装 7-Zip 或把 7z.exe 所在目录加入 PATH。已查找：" +
-                    string.Join("；", SevenZipCandidates().ToArray()));
+                engine = EngineLocator.Resolve();
+            }
+            catch (Exception ex)
+            {
+                // EngineLocator 的判词本身就是可操作的中文；异常类型照旧带上，便于区分
+                //「引擎确实不可用」与「定位过程出了意外」。
+                return Fatal("解压引擎不可用（" + ex.GetType().Name + "）：" + ex.Message);
             }
 
+            // 如实报出**实际使用**的版本与来源路径（规格 §6.2：要能显示给用户）。
+            // 内嵌副本的落点也一并说明：用户/IT 需要知道这颗 exe 往 %LOCALAPPDATA% 下写了什么。
+            Console.WriteLine("解压引擎：7-Zip " + EngineLocator.FormatVersion(engine.Version) +
+                (engine.IsEmbedded ? "（内置便携版，已释放到本机）" : "（本机安装）") +
+                "：" + engine.Path);
+
             RunOptions options = new RunOptions();
-            options.SevenZipPath = sevenZip;
+            options.SevenZipPath = engine.Path;
             options.Password = password;
             options.DictLines = dictLines;
             options.MaxDepth = depth;
@@ -356,57 +370,6 @@ namespace Rerar
                 }
             }
             return true;
-        }
-
-        // ------------------------------------------------------------------
-        // 7-Zip 定位（Task 13 的 EngineLocator 落地前的**临时**最小实现，见文件头）
-        // ------------------------------------------------------------------
-
-        private static string LocateSevenZip()
-        {
-            foreach (string candidate in SevenZipCandidates())
-            {
-                try
-                {
-                    if (File.Exists(candidate)) { return candidate; }
-                }
-                catch (Exception)
-                {
-                    // 畸形候选路径（超长/非法字符）跳过就好，绝不因为一个候选而放弃整轮查找。
-                }
-            }
-            return null;
-        }
-
-        private static List<string> SevenZipCandidates()
-        {
-            List<string> candidates = new List<string>();
-
-            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            if (programFiles.Length > 0) { candidates.Add(Path.Combine(programFiles, @"7-Zip\7z.exe")); }
-
-            string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-            if (programFilesX86.Length > 0) { candidates.Add(Path.Combine(programFilesX86, @"7-Zip\7z.exe")); }
-
-            // 32 位进程看不到 64 位的 Program Files，补一个环境变量候补。
-            string programW6432 = Environment.GetEnvironmentVariable("ProgramW6432");
-            if (!string.IsNullOrEmpty(programW6432)) { candidates.Add(Path.Combine(programW6432, @"7-Zip\7z.exe")); }
-
-            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (localAppData.Length > 0) { candidates.Add(Path.Combine(localAppData, @"Programs\7-Zip\7z.exe")); }
-
-            string path = Environment.GetEnvironmentVariable("PATH");
-            if (!string.IsNullOrEmpty(path))
-            {
-                foreach (string rawDir in path.Split(';'))
-                {
-                    string dir = rawDir.Trim();
-                    if (dir.Length == 0) { continue; }
-                    candidates.Add(Path.Combine(dir, "7z.exe"));
-                }
-            }
-
-            return candidates;
         }
 
         // ------------------------------------------------------------------
