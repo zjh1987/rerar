@@ -78,7 +78,12 @@ namespace Rerar.Core
         //     出现在 Results 与 NotAttempted 两个集合里；
         //   * 消费方**不得把两个集合相加**去数「未处理项」：未处理项的总数就是 NotAttempted.Count，
         //     Results 里那条 NotAttemptedDepthLimit 是同一件事的另一种表述（按状态分类用）；
-        //   * 除深度触顶外的其它未处理原因**没有**对应的 Results 条目（它们没被处理过，谈不上结局）。
+        //   * 除深度触顶外的其它未处理原因**没有**对应的 Results 条目（它们没被处理过，谈不上结局）
+        //     —— 上面这句是**引擎**的事实，不是消费方看到的现象：Task 12 修复轮 #2 起，CLI 在
+        //     **呈现层**（Program.AddFatalUnprocessedRemainder）为这些路径合成一条
+        //     Status = ArchiveStatus.NotAttemptedFatal 的结果，好让 --json-out 里「每个归档恰好
+        //     一条对象」成立（该成员的理由与边界见 Models.cs 的 ArchiveStatus 注释）。
+        //     界面（Task 14）要做到同样的可见性时照此办理。**引擎语义与这里一字未改。**
         //
         // 它们都不是 Failed（没试过，谈不上失败），也绝不静默丢掉。
         public List<string> NotAttempted = new List<string>();

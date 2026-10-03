@@ -197,6 +197,13 @@ internal sealed class CliTests : TestBase
             // 人读面照旧（stdout 的清单没有被 JSON 取代）：权威计数 + 逐行列出未处理路径。
             AssertTrue(r.StdOut.IndexOf("未处理数量：1", StringComparison.Ordinal) >= 0);
             AssertTrue(r.StdOut.IndexOf("未处理：" + TestEnv.NestedZip, StringComparison.Ordinal) >= 0);
+
+            // 【修复轮 #2 Finding 1】表格「结果」列这一格必须是**中文**：之前 Reporter.StatusText
+            // 没有这个成员的 case，于是用户看到的 stdout 里是英文枚举名 NotAttemptedFatal ——
+            // 违反「所有面向用户的文本为中文」。用带分隔符的整格断言（判词里也含「未处理（」，
+            // 只搜子串会假通过），并反向断言英文枚举名没有以整格形式出现。
+            AssertTrue(r.StdOut.IndexOf("| 未处理（整批中止） |", StringComparison.Ordinal) >= 0);
+            AssertFalse(r.StdOut.IndexOf("| NotAttemptedFatal |", StringComparison.Ordinal) >= 0);
         });
 
         // 【修复轮 Finding 2 的控制方裁定】取消 ⇒ 退出码 1，不是 2：2 的定义是「什么都没跑成」，
