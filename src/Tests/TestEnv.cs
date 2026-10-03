@@ -13,6 +13,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -2264,5 +2265,324 @@ internal static class TestEnv
         RunOptions options = NewOptions(null, 10, false, 2);
         options.DictLines = new List<string>(dictLines);
         return new Extractor(options, new DriveSpaceProvider(), null).Run(new string[] { archive });
+    }
+
+    // ==================================================================
+    // Task 12：CLI 契约的驱动夹具（dist\Rerar.exe）。
+    //
+    // 【为什么必须起真进程】tests.exe 只编 src\Core\*.cs + src\Tests\*.cs —— src\App\Program.cs
+    // **不在**这个目标里。CLI 的可观察面只有真进程的退出码 / stdout / --json-out 文件，
+    // 进程内断言在结构上够不着它（这也正是「CLI 是验收脚本的唯一驱动面」的含义）。
+    //
+    // 与其它 fixture 一致：路径一律**现算**，绝不静态缓存（H.Run 每用例前 Cleanup()）。
+    // ==================================================================
+
+    // 产物 Rerar.exe 的绝对路径：与 tests.exe 同目录（build.ps1 两个目标都编到 dist\）。
+    // 用执行程序集的位置定位，绝不依赖当前工作目录。
+    public static string ExePath
+    {
+        get
+        {
+            string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            return Path.Combine(dir, "Rerar.exe");
+        }
+    }
+
+    // --json-out 的目标文件：Tmp 之下（每用例被 Cleanup 清空）。
+    public static string JsonOut
+    {
+        get { return Path.Combine(Tmp, "cli-report.json"); }
+    }
+
+    // 「参数里带尾空格」的目标：**路径字符串**带尾空格，不是文件名带（Windows 文件名造不出尾空格）。
+    // 规格 §6.3 把「路径含首尾空白」列为不可读的一种；而 Win32 的正常路径形式会把尾空格规整掉
+    //（实测 Path.GetFullPath("C:\Windows\notepad.exe ") 得到的就是去空格后的路径），
+    // 于是这一项**可能**被正常解出、也可能被判成不可读 —— 用例对两种结局都接受。
+    // 唯一不允许的是崩溃，或者**静默丢弃**（它必须逐项出现在结果里）。
+    public static string PathWithTrailingSpace
+    {
+        get { return NestedZip + " "; }
+    }
+
+    // 中文名归档（NestedZip 的副本）：钉住 JSON 与 stdout 的中文、反斜杠转义以及 BOM 解码。
+    // 惰性重建（Cleanup 每用例清空 Tmp），与其它 fixture 同一约定。
+    public static string ChineseNamedZip
+    {
+        get
+        {
+            string path = TmpFile("中文名.zip");
+            if (!File.Exists(path)) { File.Copy(NestedZip, path, true); }
+            return path;
+        }
+    }
+
+    // CLI 的默认输出根是「原地」（RunOptions.OutputRoot 的默认值 = 归档所在目录，规格 §6.11）：
+    // 产物落在归档**旁边**，而不是 OutRoot 之下 —— 所以 OutOf() 在这里不适用。
+    public static string InPlaceOutOf(string archive, params string[] parts)
+    {
+        if (archive == null) { throw new ArgumentNullException("archive"); }
+
+        string path = Path.Combine(
+            Path.GetDirectoryName(archive), PathSanitizer.Sanitize(Path.GetFileName(archive)));
+        if (parts != null)
+        {
+            foreach (string part in parts) { path = Path.Combine(path, part); }
+        }
+        return path;
+    }
+
+    // ------------------------------------------------------------------
+    // CLI 驱动
+    // ------------------------------------------------------------------
+
+    // 单次 CLI 调用的上限。会挂起的 CLI 必须让**用例**失败，绝不能把整套测试挂住。
+    public const int CliTimeoutMs = 120000;
+
+    // 起 dist\Rerar.exe：参数最前面补 `--cli`（无头模式的显式开关），两个输出流都捕获。
+    // 超时即杀（7-Zip 子进程由 Task 10 的 Job Object 兜底）并抛异常 ⇒ 该用例 FAIL。
+    public static CliResult RunCli(params string[] args)
+    {
+        return RunCliWithTimeout(CliTimeoutMs, args);
+    }
+
+    public static CliResult RunCliWithTimeout(int timeoutMs, params string[] args)
+    {
+        string exe = ExePath;
+        if (!File.Exists(exe))
+        {
+            throw new InvalidOperationException(
+                "缺少 " + exe + "：CLI 契约只能驱动真实进程（tests.exe 里没有 src\\App），" +
+                "请先运行 build\\build.ps1");
+        }
+
+        List<string> argv = new List<string>();
+        argv.Add("--cli");
+        if (args != null) { argv.AddRange(args); }
+
+        // 外部残留自愈（见文件末尾 SnapshotJournalLogs 的说明）：CLI 是**真进程**，它的崩溃恢复日志
+        // 写在生产根 %LOCALAPPDATA%\Rerar\journal —— Journal.Root 那个测试接缝只能在本进程内设置，
+        // 而 .NET Framework 的 GetFolderPath 不认 LOCALAPPDATA 环境变量（实测仍返回真实路径），
+        // 子进程没有别的办法重定向它。所以这里快照前后差异，只删本次运行**自己**新建的日志。
+        string journalRoot = null;
+        HashSet<string> before = null;
+        try
+        {
+            journalRoot = Journal.DefaultRoot;
+            before = SnapshotJournalLogs(journalRoot);
+        }
+        catch (Exception)
+        {
+            // 拿不到日志根（例如 %LOCALAPPDATA% 不可用）：CLI 自己会如实报「日志不可用」，测试照跑。
+        }
+
+        CliResult result = new CliResult();
+        result.Arguments = exe + " " + string.Join(" ", QuoteArguments(argv).ToArray());
+
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = exe;
+        psi.Arguments = string.Join(" ", QuoteArguments(argv).ToArray());
+        psi.WorkingDirectory = Tmp;              // 相对路径一律相对 Tmp：绝不在仓库目录里留东西
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = CliEncoding;
+        psi.StandardErrorEncoding = CliEncoding;
+
+        StringBuilder stdOut = new StringBuilder();
+        StringBuilder stdErr = new StringBuilder();
+
+        Process process = new Process();
+        process.StartInfo = psi;
+        // 读事件的挂接放在 Start 之前（进程一起来数据就可能到）。
+        process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) { stdOut.Append(e.Data).Append('\n'); } };
+        process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) { stdErr.Append(e.Data).Append('\n'); } };
+
+        try
+        {
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            if (!process.WaitForExit(timeoutMs))
+            {
+                try { process.Kill(); } catch (Exception) { }
+                process.WaitForExit();
+
+                result.ExitCode = -1;
+                result.StdOut = stdOut.ToString();
+                result.StdErr = stdErr.ToString();
+                throw new InvalidOperationException(
+                    "CLI " + timeoutMs + "ms 未返回（已杀掉）：" + result.Arguments +
+                    "；stdout=[" + Head(result.StdOut) + "]；stderr=[" + Head(result.StdErr) + "]");
+            }
+            process.WaitForExit();               // 无参重载：等异步读事件处理完，输出才是完整的
+
+            result.ExitCode = process.ExitCode;
+            result.StdOut = stdOut.ToString();
+            result.StdErr = stdErr.ToString();
+        }
+        finally
+        {
+            process.Dispose();
+            CleanupNewJournalLogs(journalRoot, before);
+        }
+
+        return result;
+    }
+
+    // CLI 写标准输出用的是 UTF-8（无 BOM），这里按同一编码读回。
+    private static readonly Encoding CliEncoding = new UTF8Encoding(false);
+
+    // ------------------------------------------------------------------
+    // 命令行参数引用（CommandLineToArgvW 的规则）
+    //
+    // 必须自己拼：.NET Framework 没有 ProcessStartInfo.ArgumentList（那是 .NET Core 才有的）。
+    // 两条规则都是必需的：
+    //   * 含空白/引号/空的参数整体加引号 —— 否则「带尾空格的目标」会被当成两个参数或被吃掉尾空格；
+    //   * 引号前的反斜杠按 2n+1、参数末尾的反斜杠按 2n 翻倍 —— 否则 `a\"b` 这类路径会被解析歪。
+    // ------------------------------------------------------------------
+    private static List<string> QuoteArguments(List<string> args)
+    {
+        List<string> quoted = new List<string>();
+        foreach (string arg in args) { quoted.Add(QuoteArgument(arg)); }
+        return quoted;
+    }
+
+    private static string QuoteArgument(string arg)
+    {
+        if (arg == null) { return "\"\""; }
+
+        bool needsQuote = arg.Length == 0;
+        foreach (char c in arg)
+        {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '"') { needsQuote = true; break; }
+        }
+        if (!needsQuote) { return arg; }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append('"');
+        int backslashes = 0;
+        foreach (char c in arg)
+        {
+            if (c == '\\') { backslashes++; continue; }
+            if (c == '"')
+            {
+                sb.Append('\\', backslashes * 2 + 1);
+                backslashes = 0;
+                sb.Append('"');
+                continue;
+            }
+            if (backslashes > 0) { sb.Append('\\', backslashes); backslashes = 0; }
+            sb.Append(c);
+        }
+        sb.Append('\\', backslashes * 2);
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    // ------------------------------------------------------------------
+    // 生产日志根的外部残留自愈（只服务测试的洁净性，绝不参与产品逻辑）
+    //
+    // 生产 runId 形状：yyyyMMdd_HHmmss-<8 位十六进制>（Extractor.OpenJournal 拼出来的）。
+    // 删除的三重条件缺一不可：本次运行前**不存在**、名字是 runId 形状、文件里**有 done 记录**
+    //（正常收尾）。第三条是保险：正在被别人写、或崩在途中的日志一律不碰 —— 测试绝不伪造、
+    // 也绝不删掉别人可能还需要用于崩溃恢复的记录。
+    // ------------------------------------------------------------------
+    private static HashSet<string> SnapshotJournalLogs(string root)
+    {
+        HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) { return names; }
+
+        string[] files;
+        try { files = Directory.GetFiles(root, "*" + Journal.FileExtension); }
+        catch (Exception) { return names; }
+
+        foreach (string file in files) { names.Add(Path.GetFileName(file)); }
+        return names;
+    }
+
+    private static void CleanupNewJournalLogs(string root, HashSet<string> before)
+    {
+        if (root == null || before == null || !Directory.Exists(root)) { return; }
+
+        string[] files;
+        try { files = Directory.GetFiles(root, "*" + Journal.FileExtension); }
+        catch (Exception) { return; }
+
+        bool removed = false;
+        foreach (string file in files)
+        {
+            string name = Path.GetFileName(file);
+            if (before.Contains(name)) { continue; }
+            if (!IsRunIdLogName(name)) { continue; }
+
+            try
+            {
+                string text = File.ReadAllText(file);
+                if (text.IndexOf("\t" + Journal.DoneStep + "\t", StringComparison.Ordinal) < 0) { continue; }
+                File.Delete(file);
+                removed = true;
+            }
+            catch (Exception)
+            {
+                // 删不掉（被占用等）就留着：测试的洁净性不该让用例失败。
+            }
+        }
+
+        // 连目录一起收掉（只在「确实删过自己的日志」且**目录已空**时）：
+        // 测试不该在 Tmp 之外留下任何东西。里面还有别人的日志 / Task 13 释放的内嵌 7-Zip 时，
+        // 目录非空 ⇒ 一律保留。
+        if (!removed) { return; }
+        TryRemoveEmptyDirectory(root);
+        TryRemoveEmptyDirectory(Path.GetDirectoryName(root));
+    }
+
+    private static void TryRemoveEmptyDirectory(string dir)
+    {
+        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) { return; }
+        try
+        {
+            if (Directory.GetFileSystemEntries(dir).Length == 0) { Directory.Delete(dir); }
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private static bool IsRunIdLogName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) { return false; }
+        if (!name.EndsWith(Journal.FileExtension, StringComparison.OrdinalIgnoreCase)) { return false; }
+
+        string stem = name.Substring(0, name.Length - Journal.FileExtension.Length);
+        if (stem.Length != 24) { return false; }              // yyyyMMdd_HHmmss-xxxxxxxx
+        if (stem[8] != '_' || stem[15] != '-') { return false; }
+
+        for (int i = 0; i < stem.Length; i++)
+        {
+            if (i == 8 || i == 15) { continue; }
+            char c = stem[i];
+            bool ok = i < 15
+                ? (c >= '0' && c <= '9')                       // 时间戳段
+                : ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));   // Guid("N") 前缀（小写十六进制）
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+}
+
+// 一次 CLI 调用的结果：退出码 + 两个输出流 + 实际命令行（失败信息里带上它，排错不必猜参数）。
+internal sealed class CliResult
+{
+    public int ExitCode;
+    public string StdOut;
+    public string StdErr;
+    public string Arguments;
+
+    // 两个流合起来看：致命错误写 stderr、结果写 stdout，用例大多只关心「有没有说出来」。
+    public string Output
+    {
+        get { return (StdOut == null ? "" : StdOut) + (StdErr == null ? "" : StdErr); }
     }
 }
