@@ -18,9 +18,12 @@
 //     `new[]{ "i" }` 会当场抛 ArgumentException，所以本文件一律走 Run7z()（它统一补 -p）；
 //   * 哈希一律比**十六进制字符串**，绝不把 byte[] 交给 AssertEq（那是引用比较，永远不等）。
 //
-// 【跳过纪律（最终修复轮 Finding 2）】本文件里的 H.Skip 只允许出现在「本机真的造不出前提」的地方
-// （例如某份待改造的 7z.exe 字节里找不到版本串）。本机 7-Zip 优先这条性质**不能**跳过：harness 的
-// 进程入口已经要求 TestEnv.SevenZip 存在（缺席 ⇒ 整轮 FAIL），所以回落到内嵌只能是探测路径坏了。
+// 【跳过纪律（最终修复轮 Finding 2 + 复审 Minor）】本文件里的 H.Skip 只允许出现在「本机真的造不出
+// 前提」的地方（例如某份待改造的 7z.exe 字节里找不到版本串、或探测位置 dist\7z.exe 已被上一次被杀掉
+// 的运行占着 —— ledger M9）。「本机 7-Zip 优先」这条性质**不能**被跳掉，但也**不能**去读主机布局：
+// 它把一份已知可用的本机 7z.exe 种到 EngineLocator 真的会探测的第 1 步位置再断言优先选中
+//（TestEnv.SevenZip 会探 PATH / %LOCALAPPDATA%，EngineLocator 刻意不探，直接比会把环境差异
+// 报成产品回归）。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -61,30 +64,56 @@ internal sealed class EngineLocatorTests : TestBase
         });
 
         H.Run("Engine.PrefersLocalWhenAtLeast2500", delegate {
-            // 这条用例的前提是**可断言的**，不是可跳过的：harness 的进程入口已经要求本机存在一份
-            // 可用的 7-Zip（TestEnv.SevenZip 缺席 ⇒ 整轮以 FAIL 结束，见 Harness.Main），build.ps1
-            // 也在构建期卡住同一条 25.00 下限。所以「Resolve 回落到内嵌」只可能是本机探测路径坏了
-            // ⇒ 必须 FAIL，绝不能 SKIP（最终修复轮 Finding 2；与 Task 9 round 2 那条「跳过恰好落在
-            // 被测路径坏掉时，回归会静默通过」的裁定同一族）。
-            EngineInfo e = EngineLocator.Resolve();
+            // 【前提必须是确定性的】（最终修复轮 Minor）TestEnv.SevenZip 会去
+            // %LOCALAPPDATA%\Programs\7-Zip 与 PATH 找引擎，而 EngineLocator **刻意**只探规格里那
+            // 5 步（程序目录 / 两个 Program Files / 注册表两视图）。在一台「只有 PATH 或
+            // %LOCALAPPDATA% 上有 7-Zip」的机器上，harness 找得到、EngineLocator 却合理地回落到
+            // 内嵌 —— 于是这条用例 FAIL，而 FAIL 会落在产品断言上、指着错的原因。
+            // 修法：把一份**已知可用**的本机 7z.exe 种到 EngineLocator 真的会探测的位置（第 1 步：
+            // exe 同目录 = dist\，与 OldLocalCandidateIsRejectedAndDegraded 同一手法），再断言它被
+            // 优先选中。这仍是真断言：本机探测路径一坏（第 1 步不再被探、功能性自检失效、内嵌优先），
+            // 它就 FAIL；只是不再因为与本用例无关的主机布局而假失败。
+            string source = TestEnv.SevenZip;         // harness 保证存在（Harness.Main 的预检）
+            AssertTrue(File.Exists(source));
 
-            // 先把「本机确实有一份 ≥ 25.00 且真能跑」这条**环境**前提钉死：不成立时报出的是这一条，
-            // 而不是让下面那几条产品断言替环境背锅（本机那份也不是「文件存在就算数」）。
-            string local = TestEnv.SevenZip;
-            AssertTrue(File.Exists(local));
-            RunResult localProbe = Run7z(local, "i");
-            AssertEq(localProbe.ExitCode, 0);
-            AssertTrue(EngineLocator.MeetsVersionFloor(EngineLocator.ParseVersion(localProbe.StdOut)));
+            string victim = Path.Combine(AppDirectory(), "7z.exe");
+            if (File.Exists(victim))
+            {
+                H.Skip("Engine.PrefersLocalWhenAtLeast2500",
+                    "探测位置 " + victim + " 上已经有文件：本用例不覆盖别人的 7z.exe");
+                return;
+            }
 
-            AssertFalse(e.IsEmbedded);
-            AssertTrue(e.Version >= EngineLocator.MinimumVersion);
+            try
+            {
+                File.Copy(source, victim, false);
 
-            // 自报的版本必须与真跑一次得到的一致（EngineInfo.Version 不是编出来的）。
-            AssertEq(e.Version, EngineLocator.ParseVersion(Run7z(e.Path, "i").StdOut));
+                // 先把「种下去的这份确实可跑、且自报 ≥ 25.00」这条**环境**前提钉死：不成立时报出的
+                // 是这一条，而不是让下面那几条产品断言替环境背锅。
+                RunResult localProbe = Run7z(victim, "i");
+                AssertEq(localProbe.ExitCode, 0);
+                AssertTrue(EngineLocator.MeetsVersionFloor(EngineLocator.ParseVersion(localProbe.StdOut)));
 
-            // 用的是**本机**那份，绝不是我们从资源里释放出来的内嵌副本。
-            AssertFalse(IsUnder(e.Path, EngineLocator.EmbeddedRoot));
-            AssertFalse(IsUnder(e.Path, Path.GetTempPath()));
+                EngineInfo e = EngineLocator.Resolve();
+
+                // 产品性质：第 1 步（exe 同目录）那份本机候选必须被优先选中，绝不回落到内嵌。
+                AssertFalse(e.IsEmbedded);
+                AssertTrue(string.Equals(e.Path, victim, StringComparison.OrdinalIgnoreCase));
+                AssertTrue(e.Version >= EngineLocator.MinimumVersion);
+
+                // 自报的版本必须与真跑一次得到的一致（EngineInfo.Version 不是编出来的）。
+                AssertEq(e.Version, EngineLocator.ParseVersion(Run7z(e.Path, "i").StdOut));
+
+                // 用的是本机那份，绝不是我们从资源里释放出来的内嵌副本。
+                AssertFalse(IsUnder(e.Path, EngineLocator.EmbeddedRoot));
+                AssertFalse(IsUnder(e.Path, Path.GetTempPath()));
+            }
+            finally
+            {
+                // dist 是构建产物目录：本用例放进去的东西必须原样收走（后面的两条用例也依赖这一点）。
+                try { if (File.Exists(victim)) { File.Delete(victim); } }
+                catch (Exception) { }
+            }
         });
 
         H.Run("Engine.FallsBackWhenForcedEmbedded", delegate {

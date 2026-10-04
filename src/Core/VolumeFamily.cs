@@ -21,6 +21,11 @@
 //   * 分组是**终止式 token** + 基名一致（序数忽略大小写）+ 位宽一致 + 无空洞；
 //   * 若每个分片自身都是一份完整归档，则判为**独立文件**（Review Focus #4：同目录的 .zip 与 .z01
 //     各自完整时，用户要的是两个包都被正常解压，而不是被并成一个"缺卷"的分卷集）。
+//     **这条判别对 RAR 族永不适用**：规格 §6.6 明说「RAR 每卷有独立头」，每一卷都以 RAR 签名
+//     开头，所以「每片都有归档签名」在 RAR 上恒真、证明不了任何完整性。若拿它去判 RAR，
+//     真分卷集会被误判成独立文件：part1.rar 被丢弃、part2.rar 被单独交给 7-Zip，一个完好的
+//     分卷集被报成「不是压缩包或已损坏」—— 正是本模块要消弭的误报。故调用方必须先问
+//     IsRarFamily(candidate)：为真时一律不做这条判别（详见 Extractor.AllMembersAreCompleteArchives）。
 //
 // 返回语义（调用方必须照此使用）：
 //   true  —— 候选属于一个**真正的分卷集**（至少两个成员，或确有一卷缺失）。此时调用方**必须**把
@@ -119,6 +124,10 @@ namespace Rerar.Core
             // 本类是纯函数（不读文件系统），所以这件事只能由调用方判定：产品侧的唯一调用点是
             // Extractor.ResolveVolumeMember，它用 Sniffer 逐片闻真实字节后把结论传进来
             //（每一片都认得出格式 = 都是完整归档）。这里不留"没人传"的空保护。
+            //
+            // 【调用方必须遵守的前置条件】allMembersHaveFullSignature 只对**非 RAR 族**才是有效的
+            // 独立性证据。RAR 每卷都有独立头（规格 §6.6），所以调用方必须先查 IsRarFamily(candidate)：
+            // 为真时**必须传 false**，否则真分卷集会被这里一刀切成独立文件。
             if (allMembersHaveFullSignature) { return false; }
 
             string candidateName = Path.GetFileName(candidate);
@@ -231,6 +240,24 @@ namespace Rerar.Core
             result.Missing = missing;
             set = result;
             return true;
+        }
+
+        // 候选名是否属于 RAR 族（新式 <base>.partN.rar / 旧式 <base>.rar + <base>.rNN）。
+        //
+        // 【调用方为什么需要它】allMembersHaveFullSignature 这条独立性判别对 RAR 族**必须关闭**：
+        // 规格 §6.6 明说「RAR 每卷有独立头」—— 每一卷都以 RAR 签名开头，于是「每片都有归档签名」
+        // 对真分卷集**恒真**，证明不了任何完整性。把它当证据用，结果是 part1.rar 被丢弃、
+        // part2.rar 被单独交给 7-Zip，完好的分卷集被报成「不是压缩包或已损坏」，并且
+        // task.VolumeMembers 不会被设上，规格 §9.2④ 的「分卷集全部不处置」删除守卫随之失效。
+        //
+        // 判定**复用 Parse**（族命名规则的唯一实现），绝不在这里复制一套判定：
+        // 解析不出来（不是任何族成员）⇒ false，普通文件照旧。纯函数，不碰文件系统。
+        public static bool IsRarFamily(string candidate)
+        {
+            if (candidate == null) { return false; }
+
+            Item item = Parse(candidate);
+            return item != null && (item.Kind == Kind.ModernRar || item.Kind == Kind.LegacyRar);
         }
 
         // 把一个文件名解析成族成员；不是任何族的成员（或形状不合族规则）时返回 null。

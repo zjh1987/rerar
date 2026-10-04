@@ -24,6 +24,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using Rerar.Core;
@@ -198,6 +199,152 @@ internal sealed class ExtractorTests : TestBase
             AssertFalse(s.Results[1].Message.Contains("分卷集"));
             AssertTrue(File.Exists(first));                // I3：默认不删
             AssertTrue(File.Exists(second));
+        });
+
+        // ------------------------------------------------------------------
+        // 复审 Critical 的回归：分卷集的独立性判别必须**按族**且要求**完整**，
+        // 绝不能是「每片都有一个归档 magic」。
+        //
+        // 7-Zip 造不出 rar（tests\fixtures.ps1 的构造事实 1），所以这里的 rar 夹具是**手写的
+        // 签名正确字节**：解析器的裁决只看头部签名，签名正确就足以钉住分组决定（真正的 rar
+        // 内容与否不影响这条判据）。两片都不是真 rar ⇒ 7-Zip 必然读不出来 ⇒「交给 7-Zip 的是
+        // 哪一片」无法从结局里观察，因此前两条用 ResolveByProduct 直接钉**解析器的裁决**本身。
+        // ------------------------------------------------------------------
+
+        // 真 RAR 分卷集的形状：**每一卷都以 RAR5 签名开头**（规格 §6.6「RAR 每卷有独立头」）。
+        // 旧的判据「每片都有归档签名」在这里恒真，于是真分卷集被切成两个独立文件：part1.rar 被
+        // 丢弃、part2.rar 被单独交给 7-Zip —— 一个完好的集合被报成「不是压缩包或已损坏」。
+        H.Run("Extract.RarVolumePairWithSignaturesIsStillOneSet", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "rar-set");
+            Directory.CreateDirectory(dir);
+            string part1 = Path.Combine(dir, "x.part1.rar");
+            string part2 = Path.Combine(dir, "x.part2.rar");
+
+            WriteRar5Stub(part1, 512);
+            WriteRar5Stub(part2, 512);
+
+            // 前提自检（也是非平凡性证明）：两片都认得出 RAR5 签名 ⇒ 那条错误判据在这份夹具上
+            // 必然为真。若这条前提不成立，本用例证明不了任何东西，所以当场断言、绝不静默弱化。
+            AssertEq(SniffOf(part1), SniffKind.Rar5);
+            AssertEq(SniffOf(part2), SniffKind.Rar5);
+
+            // 产品裁决：仍是一个分卷集，权威成员是 .part1.rar，两片都在集里、不缺卷。
+            ArchiveTask task = new ArchiveTask();
+            string authoritative = ResolveByProduct(part2, task);
+
+            AssertEq(Path.GetFileName(authoritative), "x.part1.rar");
+            AssertTrue(task.VolumeMembers != null);              // null = 被判成了独立文件（就是那个 Critical）
+            AssertEq(task.VolumeMembers.Count, 2);
+            AssertEq(Path.GetFileName(task.VolumeMembers[0]), "x.part1.rar");
+            AssertEq(Path.GetFileName(task.VolumeMembers[1]), "x.part2.rar");
+        });
+
+        // 同一族走**完整产品路径**：三片 RAR5 标记、缺中间卷 ⇒ 必须报「缺具体哪一个」，
+        // 而不是把候选单独交给 7-Zip 得到「不是压缩包或已损坏」。
+        H.Run("Extract.RarVolumeSetReportsMissingVolumeNotCorruption", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "rar-gap");
+            Directory.CreateDirectory(dir);
+            string part1 = Path.Combine(dir, "y.part1.rar");
+            string part2 = Path.Combine(dir, "y.part2.rar");
+            WriteRar5Stub(part1, 64);
+            WriteRar5Stub(part2, 64);
+            WriteRar5Stub(Path.Combine(dir, "y.part4.rar"), 64);      // 故意缺 y.part3.rar
+
+            RunSummary s = TestEnv.RunExtract(part2);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.Contains("缺"));            // 规格 §6.6：报具体缺哪一个
+            AssertTrue(s.Results[0].Message.Contains("y.part3.rar"));
+            AssertFalse(s.Results[0].Message.Contains("已损坏"));        // 这正是要消弭的误报
+            AssertTrue(File.Exists(part1));
+            AssertTrue(File.Exists(part2));
+        });
+
+        // §9.2④ 全不处置守卫必须对**解析出来的分卷集**重新生效：候选是第二卷、删除开关打开，
+        // 权威成员（第一卷）真能读 ⇒ 走得到删除路径 ⇒ 守卫必须把两个成员**都**留下并说明原因。
+        // 两片都是完整 zip 是刻意的：要让删除路径真的被走到（家族由**名字**决定，见规格 §6.6）。
+        H.Run("Extract.RarVolumeSetDeleteGuardKeepsEveryMember", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "rar-delete-guard");
+            Directory.CreateDirectory(dir);
+            string part1 = Path.Combine(dir, "z.part1.rar");
+            string part2 = Path.Combine(dir, "z.part2.rar");
+            File.Copy(TestEnv.PlainZip, part1, true);
+            File.Copy(TestEnv.PlainZip, part2, true);
+
+            RunSummary s = TestEnv.RunExtractWithDelete(part2);        // 以第二卷为候选
+
+            // 交给 7-Zip 的是 .part1.rar（可读）—— 若候选自己被当作独立文件交给 7-Zip，
+            // 这里也会 Completed（它同样是完整 zip）；所以真正的证据是下面那条守卫判词。
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(s.Results[0].Message.Contains("分卷集"));          // §9.2④ 守卫真的触发了
+            AssertTrue(File.Exists(part1));                            // 「全部不处置」：一个都没少
+            AssertTrue(File.Exists(part2));
+            AssertTrue(File.Exists(Path.Combine(s.Results[0].OutputDir, "a.txt")));
+        });
+
+        // 2 分卷 WinZip 形状：.z01 是一份完整 zip，最后的 .zip **只有尾部 EOCD、头部无签名**
+        // （Sniffer 判 DamagedHeader —— 这是合法形状，中央目录就在 .zip 里）。DamagedHeader 绝
+        // 不能算「完整归档」，否则 .z01 + .zip 两片都"有签名"，这个真分卷集会被切成两个独立包。
+        H.Run("Extract.WinZipSplitPairWithEocdOnlyZipIsStillOneSet", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "winzip-set");
+            Directory.CreateDirectory(dir);
+            string z01 = Path.Combine(dir, "w.z01");
+            string zip = Path.Combine(dir, "w.zip");
+
+            File.Copy(TestEnv.PlainZip, z01, true);                    // 完整 zip：带头签名 + 自己的 EOCD
+            WriteEocdOnlyStub(zip, 256);                               // 只有尾部 EOCD、头部无签名
+
+            AssertEq(SniffOf(z01), SniffKind.Zip);
+            AssertEq(SniffOf(zip), SniffKind.DamagedHeader);
+
+            ArchiveTask task = new ArchiveTask();
+            string authoritative = ResolveByProduct(z01, task);        // 以 .z01 为候选
+
+            AssertEq(Path.GetFileName(authoritative), "w.zip");        // WinZip 方案的权威成员是最后的 .zip
+            AssertTrue(task.VolumeMembers != null);                    // null = 被判成独立文件
+            AssertEq(task.VolumeMembers.Count, 2);
+            AssertEq(Path.GetFileName(task.VolumeMembers[0]), "w.z01");
+            AssertEq(Path.GetFileName(task.VolumeMembers[1]), "w.zip");
+        });
+
+        // 同一形状走**完整产品路径**，并额外钉住「一片只有头部签名、没有自己的 EOCD」不算完整归档：
+        // 中间卷 v.z01 带 zip 头签名但没有 EOCD（分卷的中间段就是这样），最后的 v.zip 才是权威成员
+        // 且真能读。旧判据只看"有签名" ⇒ 两片都算完整 ⇒ 切成独立包 ⇒ v.z01 被单独交给 7-Zip 失败。
+        H.Run("Extract.WinZipSplitVolumeUsesZipAsAuthoritative", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "winzip-authoritative");
+            Directory.CreateDirectory(dir);
+            string z01 = Path.Combine(dir, "v.z01");
+            string zip = Path.Combine(dir, "v.zip");
+
+            WriteZipHeadStub(z01, 512);
+            File.Copy(TestEnv.PlainZip, zip, true);
+
+            AssertEq(SniffOf(z01), SniffKind.Zip);
+            AssertEq(SniffOf(zip), SniffKind.Zip);
+
+            RunSummary s = TestEnv.RunExtract(z01);                    // 以中间卷为候选
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);     // 交给 7-Zip 的是 .zip
+            AssertTrue(File.Exists(Path.Combine(s.Results[0].OutputDir, "a.txt")));
+            AssertTrue(File.Exists(z01));
+            AssertTrue(File.Exists(zip));
+        });
+
+        // 复审相邻项：孤零零一个 m.z01（权威成员 m.zip 不在）必须报「缺 m.zip」—— 纯函数
+        // Volume.ZipWithoutLeadIsMissingItself 早就这么判了，产品侧的 `Members.Count < 2` 门槛
+        // 却把它丢掉、把 m.z01 原样交给 7-Zip，于是又变成「不是压缩包或已损坏」。
+        H.Run("Extract.LoneZ01ReportsMissingZipNotCorruption", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "lone-z01");
+            Directory.CreateDirectory(dir);
+            string z01 = Path.Combine(dir, "m.z01");
+            WriteZipHeadStub(z01, 512);
+
+            RunSummary s = TestEnv.RunExtract(z01);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.Contains("m.zip"));
+            AssertFalse(s.Results[0].Message.Contains("已损坏"));
+            AssertTrue(File.Exists(z01));
         });
 
         // I3：删除开着也绝不删「失败」的原包。
@@ -866,6 +1013,66 @@ internal sealed class ExtractorTests : TestBase
         }
         File.Delete(Path.Combine(targetDir, "vol.7z.002"));
         return first;
+    }
+
+    // ------------------------------------------------------------------
+    // 复审 Critical 的夹具小工具（见上面那组用例的说明）
+    // ------------------------------------------------------------------
+
+    // 手写一份「头部带 RAR5 签名」的字节：7-Zip 造不出 rar，而解析器的裁决只看头部签名，
+    // 签名正确就足以钉住分组决定（内容真假不参与这条判据）。
+    // 填 'R' 是刻意的：它不会撞出任何别的签名，也不会撞出 zip 的 EOCD 标记。
+    private static void WriteRar5Stub(string path, int fillerLength)
+    {
+        byte[] signature = TestEnv.B("Rar!\x1a\x07\x01\x00");              // Sniffer 的 8 字节 RAR5 签名
+        byte[] bytes = new byte[signature.Length + fillerLength];
+        Array.Copy(signature, bytes, signature.Length);
+        for (int i = signature.Length; i < bytes.Length; i++) { bytes[i] = (byte)'R'; }
+        File.WriteAllBytes(path, bytes);
+    }
+
+    // 只有尾部 EOCD 标记、头部没有签名的字节（Sniffer → DamagedHeader）：WinZip 2 分卷集里
+    // 最后一卷 .zip 的合法形状（中央目录在它里面，头部被清零/改写）。
+    private static void WriteEocdOnlyStub(string path, int fillerLength)
+    {
+        byte[] eocd = TestEnv.B("PK\x05\x06");
+        byte[] bytes = new byte[fillerLength + eocd.Length];
+        for (int i = 0; i < fillerLength; i++) { bytes[i] = (byte)'Q'; }
+        Array.Copy(eocd, 0, bytes, fillerLength, eocd.Length);
+        File.WriteAllBytes(path, bytes);
+    }
+
+    // 带 zip 头签名、但**没有自己的 EOCD** 的字节：分卷的中间段（.z01/.z02）就是这样。
+    // 填 'A' 保证尾部不会撞出 PK\x05\x06 / PK\x01\x02。
+    private static void WriteZipHeadStub(string path, int fillerLength)
+    {
+        byte[] header = TestEnv.B("PK\x03\x04");
+        byte[] bytes = new byte[header.Length + fillerLength];
+        Array.Copy(header, bytes, header.Length);
+        for (int i = header.Length; i < bytes.Length; i++) { bytes[i] = (byte)'A'; }
+        File.WriteAllBytes(path, bytes);
+    }
+
+    // 用产品自己的 Sniffer 读出结论（与 Extractor.Sniff 同一调用形状：head 前 262 字节、tail 末 64KB；
+    // 夹具都很小，整份文件既是 head 也是 tail）。断言夹具形状本身，避免它悄悄变形成什么也证明不了。
+    private static SniffKind SniffOf(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        return Sniffer.Classify(bytes, bytes.Length, Path.GetFileName(path), bytes);
+    }
+
+    // 通过反射调产品自己的分卷解析器（Extractor.ResolveVolumeMember 是私有实现）。
+    // 为什么必须白盒：上面那份 rar 夹具不是真 rar，7-Zip 必然读不出来，于是「交给 7-Zip 的是
+    // 哪一片」无法从运行结局里观察 —— 这里要钉的正是**解析器的裁决**本身。Task 14 的 GuiProbe
+    // 也是同一族的反射手法。方法被改名/挪走时当场 FAIL（method == null），绝不静默跳过。
+    private static string ResolveByProduct(string sourcePath, ArchiveTask task)
+    {
+        MethodInfo method = typeof(Extractor).GetMethod("ResolveVolumeMember",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        AssertTrue(method != null);
+
+        object[] args = new object[] { sourcePath, task, null };
+        return (string)method.Invoke(null, args);      // task.VolumeMembers 由被调方法就地写入
     }
 
     private static ArchiveIndex Index(int fileCount, long totalBytes, bool listingFailed, bool encryptedHeaders)

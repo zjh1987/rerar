@@ -1681,19 +1681,26 @@ namespace Rerar.Core
                 // 先解析一次，只为拿到候选族的**实际存在成员**清单；随后逐片嗅探它们的真实格式
                 //（不解析这一遍就无从知道「族里还有谁」，而按名字从目录里现猜等于把这套族规则
                 // 复制一份到这里 —— 那正是 VolumeFamily 存在的理由）。
+                //
+                // 【为什么此处**不能**再要求 Members.Count >= 2（复审相邻项）】族只有一个**实际存在**
+                // 成员、却缺着别的卷（例如孤零零一个 m.z01，权威成员 m.zip 不在）时，TryResolve 返回
+                // true 且 Missing 非空 —— 那恰恰是必须报「缺 m.zip」的形状。过去这道 `Count < 2`
+                // 把它当成「不是分卷集」丢掉，候选被原样交给 7-Zip，于是完好的分卷集被报成
+                //「不是压缩包或已损坏」。单成员且不缺卷的情形 TryResolve 自己就返回 false，
+                // 所以这里去掉这条数量门槛不会把普通文件误判成分卷集。
                 VolumeSet probe;
                 if (!VolumeFamily.TryResolve(filesInDir, sourcePath, out probe)) { return sourcePath; }
-                if (probe == null || probe.Members == null || probe.Members.Count < 2) { return sourcePath; }
+                if (probe == null || probe.Members == null) { return sourcePath; }
 
-                // 独立性判别（规格 §6.6 / Review Focus #4，整支复审 Finding 3）：每一片**自身**都是
-                // 一份完整归档时，这是几个碰巧同名的独立压缩包，而不是一个分卷集 —— 把它们并成一个
-                // 「分卷集」会让 .001 之外的包永远解不出来（权威成员恒为 .001），甚至报出并不存在的
-                //「缺卷」。结论交回 VolumeFamily 的参数裁决：这条规则只有那一个实现，这里不另写一份。
-                bool allMembersComplete = AllMembersAreCompleteArchives(probe.Members);
+                // 独立性判别（规格 §6.6 / Review Focus #4，整支复审 Critical）：
+                // RAR 族**永不**走这条判别（每卷都带签名，"有签名"证明不了完整性）；其余族要求
+                // 每一片自身都是**一份完整归档**（不是"有签名"）。详见 AllMembersAreCompleteArchives。
+                bool allMembersComplete = !VolumeFamily.IsRarFamily(sourcePath)
+                    && AllMembersAreCompleteArchives(probe.Members);
 
                 VolumeSet set;
                 if (!VolumeFamily.TryResolve(filesInDir, sourcePath, out set, allMembersComplete)) { return sourcePath; }
-                if (set == null || set.Members == null || set.Members.Count < 2) { return sourcePath; }
+                if (set == null || set.Members == null) { return sourcePath; }
 
                 volumes = set;
                 task.VolumeMembers = set.Members;
@@ -1706,23 +1713,65 @@ namespace Rerar.Core
             }
         }
 
-        // 候选族的成员**逐个**按真实字节嗅探，判断每一片自身是不是一份完整归档。
+        // 候选族的成员**逐个**按真实字节嗅探，判断每一片自身是不是**一份完整归档**。
         //
-        // 判据来自真实产物的形状：7-Zip 切出来的分卷只有**第一卷**带容器签名（.7z / .zip 的头），
-        // 其余卷是流中间的一段，认不出任何格式 —— 于是「每一片都认得出格式」正好把
-        //「几个碰巧同名的独立包」（x.zip.001 / x.zip.002 各自完整）与真分卷集分开。
+        // 【判据必须是「完整」，不能是「有签名」（复审 Critical）】旧判据 IsArchiveKind(Sniff(...))
+        // 只问"头部认不认得出任何归档格式"，于是 RAR 分卷集 100% 命中（规格 §6.6：RAR 每卷有独立头），
+        // 真分卷集被判成独立文件 —— part1.rar 被丢弃、part2.rar 单独交给 7-Zip，
+        //「无法读取归档清单（不是压缩包或已损坏）」，正是 Task 6 存在的意义。故：
+        //   * 调用方先用 VolumeFamily.IsRarFamily 关掉 RAR 族（本函数根本不参与 RAR 的判定）；
+        //   * 其余的族里，"完整"= 带头容器签名**且**（zip）带自己的 EOCD，见 IsCompleteArchiveMember。
         //
-        // 任何一片读不到 / 认不出 ⇒ 返回 false（保留分卷集语义）：安全方向是**不**把一片流中间段
-        // 当成独立压缩包去解，宁可如实报缺卷 —— 那至少是一条用户能据以行动的判词。
+        // 任何一片读不到 / 称不上完整的 ⇒ 返回 false（保留分卷集语义）：安全方向是**不**把一片
+        // 流中间段当成独立压缩包去解，宁可如实报缺卷 —— 那至少是一条用户能据以行动的判词。
         private static bool AllMembersAreCompleteArchives(List<string> members)
         {
             if (members == null || members.Count < 2) { return false; }
 
             foreach (string member in members)
             {
-                if (!IsArchiveKind(Sniff(member))) { return false; }
+                if (!IsCompleteArchiveMember(member)) { return false; }
             }
             return true;
+        }
+
+        // 一片自身是不是一份**完整归档**（规格 §6.6 第 3 条：「若每个分片自身都是一份完整归档，
+        // 则判为独立文件」）：
+        //   * 必须带**容器头签名** —— DamagedHeader **不算**：它只是"尾部有 zip 标记、头部没有
+        //     签名"（Sniffer 的第 5 档），而 WinZip 2 分卷集的最后一卷 .zip 正是这个样子
+        //     （中央目录在它里面）。把 DamagedHeader 算成"完整归档"会让 .z01 + .zip 这两片
+        //     都"有签名"，于是被并成独立包 —— 复审 Critical 的 WinZip 半边。
+        //   * zip 还必须带**自己的 EOCD**：分卷的 .z01/.z02 是流中间的一段，有头部签名却没有
+        //     自己的 EOCD，不能算完整归档。7z/gzip/bzip2/xz/tar 没有 EOCD 这一概念，只看头签名。
+        private static bool IsCompleteArchiveMember(string path)
+        {
+            SniffKind kind = Sniff(path);
+            if (kind == SniffKind.Zip)
+            {
+                return Sniffer.HasEocdInTail(ReadSuffix(path, 64 * 1024));
+            }
+            return IsCompleteArchiveKind(kind);
+        }
+
+        // 「完整归档」可接受的嗅探结论：与 IsArchiveKind 的区别只有一条 —— **不含 DamagedHeader**。
+        // IsArchiveKind 仍保留 DamagedHeader（顶层格式门控要放它过去，让 7-Zip 有机会抢救内容），
+        // 所以这里另立一条，而不是改那条已有语义的谓词。
+        private static bool IsCompleteArchiveKind(SniffKind kind)
+        {
+            switch (kind)
+            {
+                case SniffKind.Zip:
+                case SniffKind.Rar:
+                case SniffKind.Rar5:
+                case SniffKind.SevenZip:
+                case SniffKind.Gzip:
+                case SniffKind.Bzip2:
+                case SniffKind.Xz:
+                case SniffKind.Tar:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         // 归档自身的物理字节数（预检解压比的分母，见 Preflight.CheckExpansion）。
