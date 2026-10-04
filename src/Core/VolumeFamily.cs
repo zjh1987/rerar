@@ -116,6 +116,9 @@ namespace Rerar.Core
 
             // 独立性判别（规格 §6.6 / Review Focus #4）：调用方已确认每一片自身都是一份完整归档，
             // 那就不是分卷集 —— 报"缺卷"会把两个正常的包说成坏的。
+            // 本类是纯函数（不读文件系统），所以这件事只能由调用方判定：产品侧的唯一调用点是
+            // Extractor.ResolveVolumeMember，它用 Sniffer 逐片闻真实字节后把结论传进来
+            //（每一片都认得出格式 = 都是完整归档）。这里不留"没人传"的空保护。
             if (allMembersHaveFullSignature) { return false; }
 
             string candidateName = Path.GetFileName(candidate);

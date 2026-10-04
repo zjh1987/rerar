@@ -18,6 +18,10 @@
 //     `new[]{ "i" }` 会当场抛 ArgumentException，所以本文件一律走 Run7z()（它统一补 -p）；
 //   * 哈希一律比**十六进制字符串**，绝不把 byte[] 交给 AssertEq（那是引用比较，永远不等）。
 //
+// 【跳过纪律（最终修复轮 Finding 2）】本文件里的 H.Skip 只允许出现在「本机真的造不出前提」的地方
+// （例如某份待改造的 7z.exe 字节里找不到版本串）。本机 7-Zip 优先这条性质**不能**跳过：harness 的
+// 进程入口已经要求 TestEnv.SevenZip 存在（缺席 ⇒ 整轮 FAIL），所以回落到内嵌只能是探测路径坏了。
+//
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
 using System;
@@ -57,16 +61,20 @@ internal sealed class EngineLocatorTests : TestBase
         });
 
         H.Run("Engine.PrefersLocalWhenAtLeast2500", delegate {
+            // 这条用例的前提是**可断言的**，不是可跳过的：harness 的进程入口已经要求本机存在一份
+            // 可用的 7-Zip（TestEnv.SevenZip 缺席 ⇒ 整轮以 FAIL 结束，见 Harness.Main），build.ps1
+            // 也在构建期卡住同一条 25.00 下限。所以「Resolve 回落到内嵌」只可能是本机探测路径坏了
+            // ⇒ 必须 FAIL，绝不能 SKIP（最终修复轮 Finding 2；与 Task 9 round 2 那条「跳过恰好落在
+            // 被测路径坏掉时，回归会静默通过」的裁定同一族）。
             EngineInfo e = EngineLocator.Resolve();
 
-            if (e.IsEmbedded)
-            {
-                // 本机没有一份 ≥ 25.00 的独立 7-Zip（或那份被下限拒了）：这条用例的前提不存在。
-                // 如实记一条 SKIPPED（带原因），绝不把它算成 PASS。
-                H.Skip("Engine.PrefersLocalWhenAtLeast2500",
-                    "本机没有可用的独立 7-Zip（Resolve 回落到内置便携版 " + e.Version + "）：无法验证「优先用本机」");
-                return;
-            }
+            // 先把「本机确实有一份 ≥ 25.00 且真能跑」这条**环境**前提钉死：不成立时报出的是这一条，
+            // 而不是让下面那几条产品断言替环境背锅（本机那份也不是「文件存在就算数」）。
+            string local = TestEnv.SevenZip;
+            AssertTrue(File.Exists(local));
+            RunResult localProbe = Run7z(local, "i");
+            AssertEq(localProbe.ExitCode, 0);
+            AssertTrue(EngineLocator.MeetsVersionFloor(EngineLocator.ParseVersion(localProbe.StdOut)));
 
             AssertFalse(e.IsEmbedded);
             AssertTrue(e.Version >= EngineLocator.MinimumVersion);

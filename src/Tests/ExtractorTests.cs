@@ -154,6 +154,52 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(File.Exists(Path.Combine(Path.GetDirectoryName(first), "vol.7z.001")));
         });
 
+        // 最终修复轮 Finding 3：`allMembersHaveFullSignature` 必须真的由产品传进来。
+        //
+        // 形状：x.zip.001 与 x.zip.002 **各自**都是一份完整的独立 zip（不是 7-Zip 切出来的分卷，
+        // 只是名字撞上了分卷命名）。只按名字分组时它们会被并成一个「分卷集」，权威成员恒为 .001，
+        // 于是 .002 里的东西**永远解不出来**（用户看到两个正常的包只解出一个）。产品已经逐片按真实
+        // 字节嗅探（Sniffer），所以这条判据是可得的：每一片自身都是完整归档 ⇒ 按独立文件处理。
+        H.Run("Extract.IndependentArchivesWithVolumeNamesStayIndependent", delegate {
+            string dir = Path.Combine(TestEnv.Tmp, "independent");
+            Directory.CreateDirectory(dir);
+
+            string first = Path.Combine(dir, "x.zip.001");
+            string second = Path.Combine(dir, "x.zip.002");
+            File.Copy(TestEnv.PlainZip, first, true);      // 完整 zip：a.txt / b.txt / docs/readme.md
+            File.Copy(TestEnv.NestedZip, second, true);    // 完整 zip：inner.zip + readme.txt
+
+            // 前提自检：两片**各自**都得是一份真能列出来的完整归档。任一片不是，本用例什么也证明不了
+            // （那种情况下「按分卷集处理」反而是对的）—— 所以这里当场断言，绝不静默弱化。
+            ArchiveIndex firstIndex = SevenZipIndex.Read(TestEnv.SevenZip, first, null);
+            AssertFalse(firstIndex.ListingFailed);
+            AssertTrue(firstIndex.FileCount > 0);
+
+            ArchiveIndex secondIndex = SevenZipIndex.Read(TestEnv.SevenZip, second, null);
+            AssertFalse(secondIndex.ListingFailed);
+            AssertTrue(secondIndex.FileCount > 0);
+
+            RunSummary s = TestEnv.RunExtractMany(first, second);
+
+            // 结果条数 = 2 个目标 + 从 .002 里解出来的内层 inner.zip。第 3 条本身又是一份证据：
+            // 被并成一个「分卷集」时 .002 根本不会被打开，这条递归结果也就不会存在。
+            AssertEq(s.Results.Count, 3);
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertEq(s.Results[1].Status, ArchiveStatus.Completed);
+
+            // 每个包解到**自己的**输出目录：.002 的内容绝不是被并进 .001 的「分卷集」而消失。
+            AssertTrue(File.Exists(Path.Combine(s.Results[0].OutputDir, "a.txt")));
+            AssertTrue(File.Exists(Path.Combine(s.Results[1].OutputDir, "inner", "hello.txt")));
+            AssertFalse(string.Equals(s.Results[0].OutputDir, s.Results[1].OutputDir,
+                StringComparison.OrdinalIgnoreCase));
+
+            // 判词里不得出现「分卷集」：这两个包从来不是一个卷集（更不是「缺卷」）。
+            AssertFalse(s.Results[0].Message.Contains("分卷集"));
+            AssertFalse(s.Results[1].Message.Contains("分卷集"));
+            AssertTrue(File.Exists(first));                // I3：默认不删
+            AssertTrue(File.Exists(second));
+        });
+
         // I3：删除开着也绝不删「失败」的原包。
         H.Run("Extract.FailedArchiveNeverDeleted", delegate {
             RunSummary s = TestEnv.RunExtractWithDelete(TestEnv.CorruptZip);

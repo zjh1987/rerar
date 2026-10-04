@@ -159,6 +159,10 @@ namespace Rerar.Core
         //   * _journalFailures：其中失败的次数（日志没打开记 1 次：本次运行整个没有恢复记录）；
         //   * _journalFailureReason：**第一条**失败的具体原因（中文 + 异常类型），Run 末尾一次性汇报。
         // 三者都只用于「如实汇报」，不参与任何判定。
+        //
+        // 【运行级状态】与 _summary / _verifiedPasswords 等一样，三者在**每次 Run 开头**归零（见 Run）。
+        // 只在字段声明处初始化是不够的：一个被复用的实例会把上一次运行的日志失败算到这一次头上，
+        // 凭空造出一条「崩溃恢复记录不完整」的假警告 —— 而这个单元的全部目的恰恰是如实汇报。
         private int _journalAttempts;
         private int _journalFailures;
         private string _journalFailureReason;
@@ -201,6 +205,14 @@ namespace Rerar.Core
             _verifiedPasswords = new List<string>();
             _processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _resultsByTask = new Dictionary<ArchiveTask, ArchiveResult>();
+
+            // 日志计数同样是**运行级**状态，必须在这里归零（而不是只在字段声明处初始化）：
+            // OpenJournal 自己也会记失败，所以这三行要在它之前。复用一个实例时，上一次运行的
+            // 日志失败否则会以「本次运行」的名义被汇报出去（假警告）。
+            _journalAttempts = 0;
+            _journalFailures = 0;
+            _journalFailureReason = null;
+
             _journal = OpenJournal();
 
             List<ArchiveTask> round = FreezeTargets(targets, summary);
@@ -1664,8 +1676,23 @@ namespace Rerar.Core
                 string directory = Path.GetDirectoryName(sourcePath);
                 if (string.IsNullOrEmpty(directory)) { return sourcePath; }
 
+                string[] filesInDir = Directory.GetFiles(directory);
+
+                // 先解析一次，只为拿到候选族的**实际存在成员**清单；随后逐片嗅探它们的真实格式
+                //（不解析这一遍就无从知道「族里还有谁」，而按名字从目录里现猜等于把这套族规则
+                // 复制一份到这里 —— 那正是 VolumeFamily 存在的理由）。
+                VolumeSet probe;
+                if (!VolumeFamily.TryResolve(filesInDir, sourcePath, out probe)) { return sourcePath; }
+                if (probe == null || probe.Members == null || probe.Members.Count < 2) { return sourcePath; }
+
+                // 独立性判别（规格 §6.6 / Review Focus #4，整支复审 Finding 3）：每一片**自身**都是
+                // 一份完整归档时，这是几个碰巧同名的独立压缩包，而不是一个分卷集 —— 把它们并成一个
+                // 「分卷集」会让 .001 之外的包永远解不出来（权威成员恒为 .001），甚至报出并不存在的
+                //「缺卷」。结论交回 VolumeFamily 的参数裁决：这条规则只有那一个实现，这里不另写一份。
+                bool allMembersComplete = AllMembersAreCompleteArchives(probe.Members);
+
                 VolumeSet set;
-                if (!VolumeFamily.TryResolve(Directory.GetFiles(directory), sourcePath, out set)) { return sourcePath; }
+                if (!VolumeFamily.TryResolve(filesInDir, sourcePath, out set, allMembersComplete)) { return sourcePath; }
                 if (set == null || set.Members == null || set.Members.Count < 2) { return sourcePath; }
 
                 volumes = set;
@@ -1677,6 +1704,25 @@ namespace Rerar.Core
             {
                 return sourcePath;
             }
+        }
+
+        // 候选族的成员**逐个**按真实字节嗅探，判断每一片自身是不是一份完整归档。
+        //
+        // 判据来自真实产物的形状：7-Zip 切出来的分卷只有**第一卷**带容器签名（.7z / .zip 的头），
+        // 其余卷是流中间的一段，认不出任何格式 —— 于是「每一片都认得出格式」正好把
+        //「几个碰巧同名的独立包」（x.zip.001 / x.zip.002 各自完整）与真分卷集分开。
+        //
+        // 任何一片读不到 / 认不出 ⇒ 返回 false（保留分卷集语义）：安全方向是**不**把一片流中间段
+        // 当成独立压缩包去解，宁可如实报缺卷 —— 那至少是一条用户能据以行动的判词。
+        private static bool AllMembersAreCompleteArchives(List<string> members)
+        {
+            if (members == null || members.Count < 2) { return false; }
+
+            foreach (string member in members)
+            {
+                if (!IsArchiveKind(Sniff(member))) { return false; }
+            }
+            return true;
         }
 
         // 归档自身的物理字节数（预检解压比的分母，见 Preflight.CheckExpansion）。

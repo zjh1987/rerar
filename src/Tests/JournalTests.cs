@@ -22,6 +22,10 @@
 //   * Finding 3：RunsWithoutCleanShutdown 的含义是「进程刻意结束，而不是死在途中」（被取消的运行
 //     有 done、不在清单里）—— 只改文档；用例把这个被文档钉住的区别固定下来。
 //
+// 最终修复轮（整支复审 Finding 1）新增：运行级计数（_journalAttempts / _journalFailures /
+// _journalFailureReason）必须在**每次 Run** 重置 —— 同一个实例连跑两次时，第一次的日志失败
+// 绝不能算到第二次头上（那会造出一条「崩溃恢复记录不完整」的假警告）。
+//
 // 全部用例都是「真读写真文件」的端到端形状，没有任何 mock。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
@@ -352,6 +356,53 @@ internal sealed class JournalTests : TestBase
 
             // 刻意结束 ≠ 崩溃：这份清单只回答「进程有没有死在途中」。
             AssertEq(new List<string>(Journal.RunsWithoutCleanShutdown()).Count, 0);
+        });
+
+        // ==================================================================
+        // 最终修复轮 Finding 1：运行级日志计数必须**每次 Run 重置**
+        // ==================================================================
+
+        // 同一个 Extractor 实例连跑两次：第一次日志整个打不开（记 1 次失败），第二次日志恢复可用。
+        // 计数若只在**字段声明**上初始化（而不在 Run() 里重置），第二次运行就会把上一次的失败当成
+        // 自己的 —— 一条「崩溃恢复记录不完整」的**假警告**，恰好出现在这个以「如实汇报」为全部
+        // 目的的单元里（Reporter/CLI/界面都会照它说这一次没有可信的恢复记录）。
+        //
+        // 注意两次运行用的是**同一个** Extractor：这正是「字段声明处初始化」与「Run() 里重置」的
+        // 唯一区别所在，也是本用例存在的全部意义。
+        H.Run("Journal.CountersResetBetweenRunsOnSameInstance", delegate {
+            string goodRoot = TestEnv.JournalRoot;
+            string blockedRoot = Path.Combine(TestEnv.Tmp, "journal-root-blocked-once");
+            File.WriteAllText(blockedRoot, "not a directory");
+
+            RunOptions options = new RunOptions();
+            options.SevenZipPath = TestEnv.SevenZip;
+            options.OutputRoot = TestEnv.OutRoot;
+            options.MaxDepth = 10;
+            options.DiskPollSeconds = 2;
+            Extractor extractor = new Extractor(options, new DriveSpaceProvider(), null);
+
+            // --- 第 1 次：日志整个打不开 ⇒ 必须被数下来并如实汇报（既有行为，这里当前提）---
+            Journal.Root = blockedRoot;
+            RunSummary first = extractor.Run(new string[] { TestEnv.NestedZip });
+
+            AssertEq(first.Results[0].Status, ArchiveStatus.Completed);   // 日志失败绝不改变解压行为
+            AssertEq(first.JournalWriteFailures, 1);                      // 日志整个没打开 = 1 次失败
+            AssertTrue(first.JournalProblem != null);
+
+            // --- 第 2 次：日志恢复可用 ⇒ 计数必须从**零**开始 ---
+            Journal.Root = goodRoot;
+            RunSummary second = extractor.Run(new string[] { TestEnv.NestedZip });
+
+            AssertEq(second.Results[0].Status, ArchiveStatus.Completed);
+            AssertEq(second.JournalWriteFailures, 0);                     // 上一次的失败不算到这一次头上
+            AssertTrue(second.JournalProblem == null);                    // 也就没有「记录不完整」的说明
+            AssertFalse(second.Results[0].Message.Contains("崩溃恢复记录不完整"));
+
+            // 非空性守卫：这一次日志**真的**写下来了。否则「0 次失败」只是因为日志压根没打开过
+            // （例如 Journal.Root 没恢复成功），这条断言就成了空话。
+            AssertTrue(Directory.GetFiles(goodRoot, "*.log").Length > 0);
+
+            Journal.Root = goodRoot;   // 收尾：本用例动过静态根，恢复成测试根
         });
     }
 
