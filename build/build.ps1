@@ -14,6 +14,17 @@
 #   4) 只给**应用目标**加 /resource: —— 测试目标绝不能跟着胖 ~2.4 MB（见 Invoke-CscTarget 的说明）。
 # 找不到可用的 7-Zip 时**直接构建失败**：一个没有内嵌兜底的 Rerar.exe 违背「无 7-Zip 的干净机器
 # 上双击即用」这条产品承诺，绝不能悄悄发出去。
+#
+# Task 16 起本脚本还负责「打包收尾」的资源（由 build\make-res.ps1 现做成 dist\obj\rerar.res，
+# 产物目录已被 gitignore）：
+#   1) Win32 版本资源 VERSIONINFO（中英双语 + 语言中立三张语言表 + Translation）—— in-box 的 csc 没有任何
+#      能写版本信息的开关，rc.exe 又不存在，所以这份 .res 只能**生成**出来；生成器自带回读自检，
+#      自检不过或调用失败都直接构建失败（详见 make-res.ps1 的文件头）；
+#   2) 应用清单（RT_MANIFEST、ID 1）与 3) 应用图标（RT_ICON × N + RT_GROUP_ICON）也一并编进
+#      同一份 .res —— legacy csc 只认「三选一」（CS1564 禁 /win32res: + /win32manifest:、
+#      CS1565 禁 /win32res: + /win32icon:），一份 .res 是唯一的合流办法。
+# 两者与 /resource: 同一条规矩：**只给应用目标**（见 $appSwitches 处的说明）；测试目标一概不带
+# —— 用例 Package.VersionInfoInAppTargetOnly / Package.IconInAppTargetOnly 扫产物字节把这事钉死。
 
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -179,8 +190,8 @@ Write-Host ("内嵌 7-Zip：" + $payloadDir + "（版本 " + ("{0}.{1:00}" -f $p
 # 命令形状见 docs/superpowers/plans/2026-10-02-recursive-extractor-gui.md
 # （相对计划唯一的偏离：统一的 UTF-8 代码页开关，理由见文件头）。
 #
-# $extraSwitches：只给**某一个目标**的额外开关。Task 13 的 /resource: 与 Task 14 的
-# /win32manifest: 都走这里 —— **只给应用目标**。
+# $extraSwitches：只给**某一个目标**的额外开关。Task 13 的 /resource:、Task 14 的
+# /win32manifest: 与 Task 16 的 /win32res: /win32icon: 都走这里 —— **只给应用目标**。
 # 为什么不放进 $cscArgs 的公共部分（那是本任务最容易踩错的一步）：两个目标共享这一段，把
 # /resource: 放进去就等于把 ~2.4 MB 的 7z.exe + 7z.dll 也塞进 dist\tests.exe —— 测试 exe 白白
 # 胖一倍多，而任何人也看不出它为什么胖。测试目标不需要那份载荷：EngineLocator 在测试里从同目录的
@@ -220,6 +231,8 @@ $bclRefs = @('/reference:Microsoft.VisualBasic.dll')
 
 # Task 14：应用清单（asInvoker / PerMonitorV2 / longPathAware）。源文件缺席就**直接构建失败**：
 # 一个没有清单的 exe 在高 DPI 上模糊，而且「绝不提权」这条契约会变成一句没人验证的话。
+# （Task 16 起，这份清单不再经 /win32manifest: 编进产物 —— CS1564 禁止它与 /win32res: 并存 ——
+#   而是作为 RT_MANIFEST 记录编进 make-res.ps1 生成的同一份 .res，见下面的调用。）
 $manifestRelative = 'src\App\app.manifest'
 if (-not (Test-Path -LiteralPath (Join-Path $root $manifestRelative))) {
     Fail ("缺少应用清单 " + (Join-Path $root $manifestRelative) + "：/win32manifest: 需要它")
@@ -230,8 +243,46 @@ if (-not (Test-Path -LiteralPath (Join-Path $root $manifestRelative))) {
 # 而 /win32manifest: 也只跟着应用目标走。
 $appRefs = $bclRefs + @('/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll')
 
-# 应用目标独有的开关：Task 13 的内嵌载荷资源 + Task 14 的应用清单。
-$appSwitches = $appResourceSwitches + @('/win32manifest:' + $manifestRelative)
+# Task 16：应用图标（assets\rerar.ico，随仓库提交的二进制资产）。源文件缺席就**直接构建失败**：
+# 图标与清单同一条性质 —— 说的都是「这个 exe 长什么样」，让构建悄悄退化成无图标的 exe，
+# 「打包收尾」就静默开了倒车。（CS1565 禁止 /win32icon: 与 /win32res: 并存，故图标不单独走
+# /win32icon:，而是拆成 RT_ICON + RT_GROUP_ICON 记录随上面的 .res 编进产物。）
+$iconRelative = 'assets\rerar.ico'
+if (-not (Test-Path -LiteralPath (Join-Path $root $iconRelative))) {
+    Fail ("缺少应用图标 " + (Join-Path $root $iconRelative) + "：版本资源生成器（make-res.ps1 -IconPath）需要它")
+}
+
+# Task 16：版本资源 + 应用清单 + 应用图标，合编成一份 .res（build\make-res.ps1 按 .res 二进制
+# 格式直接生成，无需 rc.exe；脚本先把自检跑完才落盘）。三件资源必须**一起进这份 .res**：
+# legacy csc 只认「三选一」—— CS1564 禁止 /win32res: 与 /win32manifest: 同时使用、CS1565 禁止
+# /win32res: 与 /win32icon: 同时使用，微软文档给的正解就是「把清单/图标放进 Win32 资源文件」。
+# 以**子进程**调用：退出码语义毫不含糊（在进程内 & 调用的话，脚本里的 exit 会混淆「退出脚本」
+# 与「退出本构建」），代价是每次构建约半秒。生成失败 = 构建失败：宁可发不出，也不发一个
+# Properties 页里只有空格描述的 exe。
+# 版本号取 make-res.ps1 的默认值 0.0.0.0 —— 与程序集自报的版本一致（--selftest 的 version=<n>
+# 契约；用例 Package.VersionInfoMatchesAssembly 把这条一致性钉死）。
+$resRelative = 'dist\obj\rerar.res'
+$makeResScript = Join-Path $root 'build\make-res.ps1'
+if (-not (Test-Path -LiteralPath $makeResScript)) {
+    Fail ("缺少版本资源生成器 " + $makeResScript + "：/win32res: 需要它")
+}
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $makeResScript `
+    -OutPath (Join-Path $root $resRelative) -ManifestPath (Join-Path $root $manifestRelative) `
+    -IconPath (Join-Path $root $iconRelative)
+$resCode = $LASTEXITCODE
+if ($resCode -ne 0) {
+    Fail ("build\make-res.ps1 退出码 " + $resCode + "：版本资源没能生成，构建失败")
+}
+
+# 应用目标独有的开关：Task 13 的内嵌载荷资源 + Task 16 的版本资源 / 清单 / 图标（后三者合编在
+# 同一份 .res 里）。legacy csc 只认「三选一」：CS1564 禁止 /win32manifest: 与 /win32res: 并存、
+# CS1565 禁止 /win32icon: 与 /win32res: 并存 —— 所以 Task 14 的 /win32manifest: 自本任务起不再
+# 单独出现（清单由 .res 携带，Gui.ManifestIsEmbeddedInAppTargetOnly 扫产物字节证明它还在）。
+# /win32res: 的路径与 /resource: 同一算法：相对仓库根（Invoke-CscTarget 会 Push-Location 到那里）、
+# 不含空格。
+$appSwitches = $appResourceSwitches + @(
+    ('/win32res:' + $resRelative)
+)
 
 # 目标 1：应用（GUI / CLI 双入口）。$appRefs / $appSwitches 只在这一行出现 —— 见 Invoke-CscTarget。
 $code = Invoke-CscTarget 'winexe' 'Rerar.exe' @('src\Core\*.cs', 'src\App\*.cs', $generatedSource) $appRefs $appSwitches
@@ -276,7 +327,8 @@ Write-Host ("OK: " + $noticesTarget + "（" + (Get-Item -LiteralPath $noticesTar
 
 # 目标 2：单元测试运行器（同一份 src\Core\*.cs，另加 src\Tests\*.cs）
 # 测试目标比应用目标多一条引用：System.IO.Compression（zip 写库，见 Invoke-CscTarget 上的说明）。
-# 第 5 个参数（额外开关）刻意**不传**：/resource: 与 /win32manifest: 都只属于应用目标。
+# 第 5 个参数（额外开关）刻意**不传**：/resource:、/win32manifest:、/win32res: 与 /win32icon:
+# 都只属于应用目标（用例 Package.VersionInfoInAppTargetOnly 等把它们逐个钉住）。
 # 也刻意**不引** System.Windows.Forms / System.Drawing：测试要断言的那个 Form 由
 # src\Tests\GuiProbe.cs 从 dist\Rerar.exe 载入（理由见那里的文件头）。
 $code = Invoke-CscTarget 'exe' 'tests.exe' @('src\Core\*.cs', 'src\Tests\*.cs', $generatedSource) ($bclRefs + @('/reference:System.IO.Compression.dll'))
