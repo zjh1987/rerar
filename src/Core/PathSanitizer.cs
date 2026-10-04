@@ -99,7 +99,9 @@ namespace Rerar.Core
         }
 
         // 目标目录已存在且非空 → "名字 (2)"、"名字 (3)"…（规格 §6.11：绝不覆盖，对应 I2）。
-        // 空目录可以复用；被同名「文件」占用的路径原样返回，由调用方按规格 §6.11 中止该归档。
+        // 空目录可以复用；被同名「文件」占用的路径原样返回，由调用方按规格 §6.11 中止该归档
+        //（**唯一的例外**：那个文件就是源归档自己 —— 伪装后缀的包消毒后目标名等于源归档路径，
+        // Extractor.ResolveTarget 对它换名继续而不是中止，理由见那里）。
         public static string Uniquify(string desiredDir)
         {
             string candidate = desiredDir;

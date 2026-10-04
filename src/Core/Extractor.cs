@@ -18,7 +18,9 @@
 //   I1 成功 = 「磁盘实际结果 vs 索引」的比对，**绝不是退出码**。基线规则见 Preflight.TryGetBaseline
 //      （ListingFailed ⇒ 没有基线；FileCount == 0 ⇒ 退回 x 尾部汇总，只有字节可用）。
 //   I2 任何写入先落**同卷空暂存目录**，校验通过后 Directory.Move 改名提交；目标被同名**文件**
-//      占用时中止该归档（规格 §6.11，不回落父目录）；校验含三条断言：条目数/字节比对、
+//      占用时中止该归档（规格 §6.11，不回落父目录）；**唯一的例外**是占位文件就是源归档自己
+//      （伪装后缀 ⇒ 消毒后的目标名等于源归档路径），那时按 §6.11「输出路径绝不能等于输入归档自身」
+//      换一个不冲突的名字（"photo.jpg (2)"）继续，见 ResolveTarget；校验含三条断言：条目数/字节比对、
 //      零 reparse point（实测 7z 会按 tar 条目建软链）、每条产出路径都是暂存根的严格子项。
 //   I3 删除默认关；只有「完成且校验通过」可删；CompletedWithFailures / 跳过 / 失败一律不删；
 //      回收站删完必须 VerifyInBin 核实，核实不到就如实报「已永久删除」。
@@ -1470,7 +1472,16 @@ namespace Rerar.Core
 
             // 规格 §6.11：目标被**同名文件**占用 ⇒ 中止该归档、不回落父目录、不删原包。
             // PathSanitizer.Uniquify 对「被文件占用」刻意原样返回，这就是那句「必须自己发现」的落实点。
-            if (File.Exists(desired))
+            //
+            // 【修复轮 1 / 发现 1】唯一的例外：占着目标路径的那个文件**就是本归档自己**。
+            // 伪装后缀（photo.jpg / data.zip删 实为 zip）的包，消毒后的目标名正好等于源归档的路径
+            //（PathSanitizer 只剥「真压缩包」后缀，伪装后缀按 §6.11 保留原样），于是原地输出时必然
+            // 撞上自己。那不是「被不相干的文件占用」，而是 §6.11 的另一条禁止项「输出路径绝不能等于
+            // 任何输入归档自身的路径」——正确处置是换一个不冲突的名字（下面 Uniquify/NextFreeName
+            // 会给出 "photo.jpg (2)"，归档与产物因此可区分），而不是把整个包中止掉：中止会让伪装后缀
+            // 这一档功能完全不可用（§9.1 行 5 要求「识别并解压，宿主保留」，而伪装/改名后的网盘包
+            // 正是本工具的目标场景）。判据是**规范全路径相等**；其余任何占位文件一律照旧中止（I2 未放松）。
+            if (File.Exists(desired) && !IsSamePath(desired, sourcePath))
             {
                 return "目标路径「" + desired + "」被同名文件占用：按规格 §6.11 中止该归档（不回落父目录、不删原包）";
             }
@@ -1488,18 +1499,30 @@ namespace Rerar.Core
             }
 
             // 规格 §6.11 的禁止项：输出路径绝不能等于任何输入归档自身的路径。这里至少钉住「自己」。
-            try
+            if (IsSamePath(target, sourcePath))
             {
-                if (string.Equals(Path.GetFullPath(target), Path.GetFullPath(sourcePath), StringComparison.OrdinalIgnoreCase))
-                {
-                    return "输出路径与源归档路径相同（规格 §6.11 禁止边读边写）：已中止该归档，原包保留";
-                }
-            }
-            catch (Exception)
-            {
+                return "输出路径与源归档路径相同（规格 §6.11 禁止边读边写）：已中止该归档，原包保留";
             }
 
             return null;
+        }
+
+        // 两个路径是否指向同一个文件系统对象（只比规范全路径，序数忽略大小写 = Windows 语义）。
+        // 任何异常（非法字符、权限、路径过长…）一律判「不是同一个」—— 于是调用方走**保守**那条路
+        //（「被占用 ⇒ 中止该归档」），绝不因为判不出来就把目标当成源归档自己而换名继续。
+        private static bool IsSamePath(string left, string right)
+        {
+            if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right)) { return false; }
+
+            try
+            {
+                return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private static string NextFreeName(string desired)

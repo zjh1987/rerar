@@ -706,6 +706,75 @@ internal sealed class MainFormTests : TestBase
                 new object[] { wanted, 2 });
             AssertTrue(third != wanted && third != second);
         });
+
+        // ---- 「关于/开源许可」（Task 15 修复轮 / 发现 2：规格 §8 的许可义务在程序内的落地） ----
+        //
+        // 判据与其它界面用例同一立场：控件树里**真的**有这个入口、点下去**真的**把 exe 旁边随包
+        // 分发的 THIRD-PARTY-NOTICES.txt 展示出来、文件缺席/读不动时**真的**给指名期望路径的
+        // 说明文本而不是抛异常。（展示窗口的像素观感不在自动化范围 —— task-14 的立场照旧。）
+
+        H.Run("Gui.LicenseEntryExistsBesideLogTools", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                AssertEq(GuiProbe.FindCount(f, "btnLicense"), 1);
+                object btn = GuiProbe.Find(f, "btnLicense");
+                AssertTrue(GuiProbe.TextOf(btn).IndexOf("开源许可", StringComparison.Ordinal) >= 0);
+                AssertTrue(GuiProbe.IsDescendantOf(btn, f));
+                // 接点：与「打开日志文件」同一个工具条（Task 15 报告 §4 建议的位置）。
+                AssertTrue(ReferenceEquals(GuiProbe.Prop(btn, "Parent"),
+                    GuiProbe.Prop(GuiProbe.Find(f, "btnOpenLog"), "Parent")));
+            }); });
+
+        H.Run("Gui.LicenseClickShowsBundledNoticeWindow", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                GuiProbe.CreateHandle(f);        // Show(this) 需要属主句柄（窗口正常显示时本来就有）
+                object btn = GuiProbe.Find(f, "btnLicense");
+
+                // 为什么不 PerformClick：实测（本轮探针，.NET Framework 4.8 的 Button.PerformClick）
+                // 对「已挂父窗、父窗已建句柄但**未显示**」的按钮会**静默跳过** —— 无父/父窗已显示
+                // 两种情形都会触发，唯独这个组合不触发。那是 WinForms 自己的守门，不是产品的路径
+                // （真实使用中窗口必然可见）。本套件处理这类点击的既有模式是反射直接调**产品自己的**
+                // Click 处理方法（Gui.IdleRetryClickActuallyStartsRetry 的 BtnRetry_Click 同款）。
+                GuiProbe.Call(f, "BtnLicense_Click", new object[] { btn, EventArgs.Empty });
+
+                object dialog = GuiProbe.Prop(f, "_licenseDialog");
+                AssertTrue(dialog != null);
+                AssertTrue(Convert.ToBoolean(GuiProbe.Prop(dialog, "Visible")));
+                string notice = GuiProbe.TextOf(GuiProbe.Find(dialog, "licenseText"));
+
+                // 展示的就是 exe 旁边那份许可文件的原文（BOM 由 ReadAllText 归一）。
+                string bundled = Path.Combine(Path.GetDirectoryName(TestEnv.ExePath),
+                    "THIRD-PARTY-NOTICES.txt");
+                AssertTrue(File.Exists(bundled));   // 缺席时这里 FAIL：随包分发是构建的责任
+                AssertEq(notice, File.ReadAllText(bundled, Encoding.UTF8));
+                AssertTrue(notice.IndexOf("7-Zip", StringComparison.Ordinal) >= 0);
+
+                GuiProbe.Call(dialog, "Dispose", null);   // 收尾，不留窗口
+            }); });
+
+        H.Run("Gui.LicenseMissingFileShowsPathInsteadOfThrowing", delegate {
+            // BuildLicenseNotice 是真实点击路径（Application.StartupPath）的唯一文本来源；
+            // 目录可控 ⇒ 「文件缺席」方向在临时目录上打同一个入口。断言本身就是「不抛」：
+            // 下面的调用若抛异常，用例直接 FAIL。
+            string notice = Convert.ToString(GuiProbe.Static(
+                "Rerar.MainForm", "BuildLicenseNotice", new object[] { TestEnv.Tmp }));
+            string expected = Path.Combine(TestEnv.Tmp, "THIRD-PARTY-NOTICES.txt");
+            AssertFalse(File.Exists(expected));    // 缺席前提自证（夹具自检）
+            AssertTrue(notice.IndexOf("未找到", StringComparison.Ordinal) >= 0);
+            AssertTrue(notice.IndexOf(expected, StringComparison.Ordinal) >= 0);   // 指名期望路径
+
+            // 「文件在但读不动」同方向：独占句柄锁住 ⇒ 仍是说明文本，绝不是异常穿透。
+            string lockedDir = Path.Combine(TestEnv.Tmp, "locked-license");
+            Directory.CreateDirectory(lockedDir);
+            string lockedFile = Path.Combine(lockedDir, "THIRD-PARTY-NOTICES.txt");
+            File.WriteAllText(lockedFile, "占位内容", new UTF8Encoding(false));
+            using (FileStream hold = new FileStream(lockedFile, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                string lockedNotice = Convert.ToString(GuiProbe.Static(
+                    "Rerar.MainForm", "BuildLicenseNotice", new object[] { lockedDir }));
+                AssertTrue(lockedNotice.IndexOf("无法读取", StringComparison.Ordinal) >= 0);
+                AssertTrue(lockedNotice.IndexOf(lockedFile, StringComparison.Ordinal) >= 0);
+            }
+        });
     }
 
     private static bool MenuItemEnabled(object menu, int index)

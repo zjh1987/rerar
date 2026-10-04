@@ -253,6 +253,47 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(File.Exists(target));                      // 原包保留
         });
 
+        // 【修复轮 1 / 发现 1】伪装后缀的包必须**解得开**，不是「中止该项」。
+        // 形状：photo.jpg 是一个真 zip。输出名由归档名消毒而来，而 PathSanitizer 只剥「真压缩包」
+        // 后缀（伪装后缀按 §6.11 保留原样）⇒ 原地输出时消毒后的目标名**正好等于源归档自己的路径**。
+        // 修复前命中「目标被同名文件占用 ⇒ 中止该归档」，于是任何伪装后缀的包都永远解不开 ——
+        // 而伪装/改名后的网盘包正是本工具的目标场景（规格 §9.1 行 5：识别并解压，宿主保留）。
+        // 正确处置：换一个不冲突的名字（"photo.jpg (2)"），归档与产物因此可区分；宿主逐字节保留。
+        H.Run("Extract.CloakedExtensionArchiveExtractsBesideItself", delegate {
+            string cloaked = CopyToTmp(TestEnv.PlainZip, "photo.jpg");
+            long hostBytes = new FileInfo(cloaked).Length;
+
+            RunSummary s = TestEnv.RunExtractInPlace(cloaked);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);
+            AssertEq(s.Results[0].OutputDir, TestEnv.TmpFile("photo.jpg (2)"));
+            AssertTrue(File.Exists(Path.Combine(TestEnv.TmpFile("photo.jpg (2)"), "a.txt")));
+            AssertEq(s.Results[0].OutputDir, Path.Combine(TestEnv.Tmp, "photo.jpg (2)"));   // 绝不等于源归档
+            AssertTrue(File.Exists(cloaked));                                            // 宿主保留
+            AssertEq(new FileInfo(cloaked).Length, hostBytes);                           // 且逐字节原样
+            AssertEq(File.ReadAllText(cloaked, Encoding.UTF8).Length,
+                File.ReadAllText(TestEnv.PlainZip, Encoding.UTF8).Length);               // 内容仍是原包
+        });
+
+        // 反向守门（证明上面那条修复**没有**放松 I2）：目标被一个**不相干的**同名文件占用时，
+        // 照旧「中止该归档、不回落父目录、不覆盖那个文件、不删原包」。
+        H.Run("Extract.UnrelatedOccupantStillAbortsInsteadOfRenaming", delegate {
+            string archive = CopyToTmp(TestEnv.PlainZip, "occupied.zip");
+            string occupant = TestEnv.TmpFile("occupied");      // 消毒后的目标名，被一个**别人**的文件占着
+            File.WriteAllText(occupant, "别人放在这儿的文件", new UTF8Encoding(false));
+
+            RunSummary s = TestEnv.RunExtractInPlace(archive);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(s.Results[0].Message.IndexOf("被同名文件占用", StringComparison.Ordinal) >= 0);
+            // 不回落父目录：Tmp 里既不能多出那个目录，也不能多出任何「(2)」变体。
+            AssertFalse(Directory.Exists(occupant));
+            AssertFalse(Directory.Exists(TestEnv.TmpFile("occupied (2)")));
+            // 占位文件逐字节未变（绝不覆盖、绝不删别人的文件），原包也在。
+            AssertEq(File.ReadAllText(occupant, Encoding.UTF8), "别人放在这儿的文件");
+            AssertTrue(File.Exists(archive));
+        });
+
         // 取消：预置一个已取消的令牌 ⇒ 连试都不试（如实列进 NotAttempted），运行级标成 Cancelled，
         // **绝不当成成功、绝不留下输出、绝不删原包**。
         // （ArchiveStatus 里没有 Cancelled 成员 —— 那是 Task 8 定下的契约 —— 所以「取消」由

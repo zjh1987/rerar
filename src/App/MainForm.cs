@@ -160,6 +160,17 @@ namespace Rerar
         private FlowLayoutPanel _panelLogTools;
         private Button _btnOpenLog;
         private CheckBox _chkAutoScroll;
+
+        // 规格 §8「许可合规」的界面半边：内嵌 7-Zip ⇒ 本程序是 7-Zip 的二进制再分发者，许可义务
+        // 必须能在**程序内** discharge —— 「关于/开源许可」入口展示随包的 THIRD-PARTY-NOTICES.txt
+        //（文件半边由 build.ps1 随 exe 分发，缺失即构建失败；两半缺一不可）。
+        private Button _btnLicense;
+
+        // 随包许可声明文件的固定名字（build.ps1 把它复制到 exe 旁边；验收行 A06d 断言它在）。
+        private const string LicenseFileName = "THIRD-PARTY-NOTICES.txt";
+
+        // 已打开的许可窗口（非模态）：同一时刻最多一份，再点一次把它带到前台；窗口关闭时置 null。
+        private Form _licenseDialog;
         private Label _lblLogHint;
         private ListView _lstItems;
         private FlowLayoutPanel _panelItemActions;
@@ -1113,6 +1124,18 @@ namespace Rerar
             _btnOpenLog.AccessibleName = "打开完整日志文件";
             _btnOpenLog.Click += BtnOpenLog_Click;
 
+            // 规格 §8：UI「关于/开源许可」+ 随包 THIRD-PARTY-NOTICES.txt（Task 15 报告 §4 建议的
+            // 接点：与「打开日志文件」同一个工具条）。文本来自 exe 旁边的许可文件；文件缺席/读不动
+            // 时给指名期望路径的中文说明 —— 这扇入口绝不抛异常（BuildLicenseNotice 把一切读取
+            // 异常都转成了说明文本），更不允许变成一次崩溃。
+            _btnLicense = new Button();
+            _btnLicense.Name = "btnLicense";
+            _btnLicense.Text = "关于/开源许可";
+            _btnLicense.AutoSize = true;
+            _btnLicense.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _btnLicense.AccessibleName = "查看开源许可声明（THIRD-PARTY-NOTICES.txt）";
+            _btnLicense.Click += BtnLicense_Click;
+
             // J4：暂停自动滚动 —— 用户往上翻的时候日志一直往下跳，本身就是个 bug。
             _chkAutoScroll = new CheckBox();
             _chkAutoScroll.Name = "chkAutoScroll";
@@ -1123,6 +1146,7 @@ namespace Rerar
             _chkAutoScroll.CheckedChanged += ChkAutoScroll_CheckedChanged;
 
             _panelLogTools.Controls.Add(_btnOpenLog);
+            _panelLogTools.Controls.Add(_btnLicense);
             _panelLogTools.Controls.Add(_chkAutoScroll);
 
             _lstItems = new ListView();
@@ -2910,6 +2934,111 @@ namespace Rerar
             }
 
             OpenSessionLog(index);
+        }
+
+        // ==================================================================
+        // 「关于/开源许可」（规格 §8：许可义务必须在程序内可 discharge）
+        // ==================================================================
+
+        // 展示 exe 旁边（Application.StartupPath）随包分发的 THIRD-PARTY-NOTICES.txt。
+        // 窗口是**非模态**的：与密码面板/提醒横幅同一立场 —— 绝不阻塞界面线程，用户可以边解压
+        // 边读许可；同一时刻最多一份，再点一次把已有的带到前台。
+        private void BtnLicense_Click(object sender, EventArgs e)
+        {
+            ShowLicenseNotice(BuildLicenseNotice(Application.StartupPath));
+        }
+
+        // 许可声明的**展示文本**：文件在 ⇒ 文件内容（UTF-8，BOM 由 ReadAllText 自动剥离）；
+        // 缺席/读不动 ⇒ 指名期望路径的中文说明。internal static + 目录作参数是有意的接缝：
+        // 真实点击路径传的是 Application.StartupPath（随包分发 ⇒ 文件总在），「缺席」「读不动」
+        // 两个方向由用例在可控目录上经反射打这同一个入口（Gui.LicenseMissingFileShowsPathInsteadOfThrowing）。
+        // 任何异常都在这里转成说明文本 —— 「关于/开源许可」这扇门绝不允许抛异常，更不允许崩溃。
+        internal static string BuildLicenseNotice(string startupDir)
+        {
+            string expected;
+            try
+            {
+                expected = string.IsNullOrEmpty(startupDir)
+                    ? LicenseFileName
+                    : Path.Combine(startupDir, LicenseFileName);
+            }
+            catch (Exception)
+            {
+                expected = LicenseFileName;
+            }
+
+            try
+            {
+                if (!File.Exists(expected))
+                {
+                    return "未找到随包分发的开源许可声明文件 THIRD-PARTY-NOTICES.txt。\n\n" +
+                           "期望位置：\n" + expected + "\n\n" +
+                           "本程序内嵌了 7-Zip；其 LGPL / BSD / unRAR 限制等许可信息应当随程序一同分发" +
+                           "（即上述文件）。文件缺失时请重新获取完整的程序分发包。";
+                }
+
+                string text = File.ReadAllText(expected, Encoding.UTF8);
+                if (string.IsNullOrEmpty(text))
+                {
+                    return "开源许可声明文件存在但内容为空：\n" + expected +
+                           "\n\n请重新获取完整的程序分发包。";
+                }
+                return text;
+            }
+            catch (Exception ex)
+            {
+                return "开源许可声明文件无法读取（" + ex.GetType().Name + "）：\n" + expected +
+                       "\n\n请检查文件的读取权限，或重新获取完整的程序分发包。";
+            }
+        }
+
+        private void ShowLicenseNotice(string notice)
+        {
+            if (_licenseDialog != null && !_licenseDialog.IsDisposed)
+            {
+                if (!_licenseDialog.Visible) { _licenseDialog.Show(this); }
+                _licenseDialog.Activate();
+                return;
+            }
+
+            Form dialog = new Form();
+            dialog.Text = "关于/开源许可 — Rerar";
+            dialog.Font = Font;
+            dialog.ShowInTaskbar = false;
+            dialog.MinimizeBox = false;
+            dialog.StartPosition = FormStartPosition.CenterParent;
+            dialog.Size = new Size(780, 560);
+            dialog.MinimumSize = new Size(420, 300);
+
+            TextBox body = new TextBox();
+            body.Name = "licenseText";
+            body.Multiline = true;
+            body.ReadOnly = true;
+            body.ScrollBars = ScrollBars.Both;
+            body.WordWrap = false;
+            body.Dock = DockStyle.Fill;
+            body.Text = notice;
+
+            FlowLayoutPanel bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.AutoSize = true;
+            bottom.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            bottom.FlowDirection = FlowDirection.RightToLeft;
+            bottom.Padding = new Padding(8);
+
+            Button close = new Button();
+            close.Name = "btnLicenseClose";
+            close.Text = "关闭";
+            close.AutoSize = true;
+            close.Click += delegate { dialog.Close(); };
+            bottom.Controls.Add(close);
+
+            dialog.Controls.Add(body);
+            dialog.Controls.Add(bottom);
+            dialog.FormClosed += delegate { _licenseDialog = null; };
+
+            _licenseDialog = dialog;
+            dialog.Show(this);
         }
 
         private void BtnLoadDict_Click(object sender, EventArgs e)
