@@ -1,4 +1,4 @@
-# 递归解压工具 —— 边界条件与风险登记册
+﻿# 递归解压工具 —— 边界条件与风险登记册
 
 日期：2026-10-02
 状态：**调研笔记（非设计规格）**。设计规格需在方案获批后写入 `docs/superpowers/specs/`。
@@ -34,6 +34,15 @@
 | V18 | **相对 `..` 穿越型软链目标在 26.01 上被遏制**：构造 `link -> ..\target` + 条目 `link\PWNED.txt`，7z `x` 返回 **exit 2**，目标目录零污染、既有文件未变。**但 7z 仍在输出目录内留下了那个 reparse point**。该遏制属**版本相关行为**，不可作为安全保证 | 【实测】 |
 | V19 | 本机**无需管理员即可创建符号链接**（Developer Mode 已启用）→ 软链向量在本环境是"活"的，不是纯理论 | 【实测】 |
 | V20 | 本机 `C:\Windows\System32\tar.exe` **不存在**（该 LTSC 版未含 bsdtar）；GNU tar 1.35 位于 `C:\Program Files\Git\usr\bin\tar.exe`，且 **MSYS tar 不接受 `C:\` 形式的绝对路径**（会被当作远端主机），必须用相对路径或 MSYS 路径 | 【实测】 |
+| V21 | **`DRIVE_REMOTE` 上 `SendToRecycleBin` 是"静默永久删除"**：`net use Z: \\localhost\C$`（`GetDriveType(Z:\)=4`）与 `\\localhost\C$\...`（`GetDriveType=4`）两种写法**都正常返回、不抛异常**，文件确实消失，而回收站计数不动（312→312）、按名核实不到。`GetDriveType` 对 UNC 一律给 `DRIVE_REMOTE(4)`，对不存在的盘符给 `DRIVE_NO_ROOT_DIR(1)`，对光驱给 `DRIVE_CDROM(5)` | 【实测·Task 9】 |
+| V22 | **超配额同样是"静默永久删除"**：一次性挂载的 64 MB NTFS 卷上 `MaxCapacity=2`(MB) + 8 MB 文件 → `DeleteFile` 正常返回、文件消失、计数不变、核实不到；随后 64 KB 文件仍能正常回收（回收站未被毒化，既有项未被清空）。全局计数只因两次成功回收 +2，用户既有 312 项分毫未动（测法与本机影响见第三节第 2 条） | 【实测·Task 9】 |
+| V23 | 本机 7 个 `BitBucket\Volume\{GUID}` 项 `NukeOnDelete` **全为 0**（无"删除时不回收"卷），配额为 3245/3276/7167/10534/12287/27647/54475 MB。**`$Recycle.Bin` 由外壳按需创建**：刚格式化并挂载的新卷可以在数秒内既无 `$Recycle.Bin` 也无 `BitBucket` 项。`GetVolumeNameForVolumeMountPoint("C:\")` 返回的 `{GUID}` 与注册表项名一一对应（转小写） | 【实测·Task 9】 |
+| V24 | **长路径不对称性成立（且比预期更糟）**：zip 里一条 254 字符的条目（落盘后全路径 **317** 字符）被 7-Zip **成功写出（`x` exit 0）**；而 .NET Framework 侧：`File.Exists(长路径)` = **false**、`FileInfo.Length` 与 `Path.GetFullPath` **抛 `PathTooLongException`**、`Directory.GetFiles(root,"*",AllDirectories)` **静默返回 0 个文件**（连异常都没有）、连 `\\?\` 前缀的 `File.Exists` 也抛 `PathTooLongException`。同一时刻 `cmd /c dir /s /b` 能看到 8 个条目（文件真的在盘上）。→ 规格 §10.2 的 v1.0 决策（预检拒绝）被证实是必要且正确的；`Verifier` 若要用 `\\?\` 前缀枚举，还必须同时关掉 .NET 的 legacy path handling | 【实测·Task 10】 |
+| V25 | **hardlink 条目的落盘行为**：`CreateHardLink` 造出真硬链接对后用 GNU tar 打包，`l -slt` 里出现非空 `Hard Link =` 行（无 `Symbolic Link` 行），清单为 `hard.txt size=30 / orig.txt size=0`（FileCount=2、TotalBytes=30）。7-Zip `x` **落盘为真硬链接**（`fsutil hardlink list` 显示两条路径共享同一文件，属性 `Archive`，**不是 reparse point**），而磁盘上是 2 个文件 / **60** 字节。→ 校准：`IndexEntry.IsReparsePoint` 的判定范围**不包括**硬链接（7-Zip 也不为它打 `L` 属性）；同时硬链接包的"索引字节数"天然小于"磁盘字节数"，Task 10 的校验会如实判成 `CompletedWithFailures`（**绝不**静默判成功、绝不删原包） | 【实测·Task 10】 |
+| V26 | **截断 zip 的清单形状正是 I1 最危险的那种**：把 12 KB 的三文件 zip 截到 50%/80%/95%，`l -slt` **一律 exit 2（ListingFailed）+ 非空半截条目表**（FileCount=2/3/3，TotalBytes=8192/12288/12288）。→ 所以基线规则必须是「`ListingFailed` ⇒ 没有基线，**与 FileCount 无关**」；Task 10 在读到这种清单时直接判 `Failed`（原包保留），绝不进入暂存 | 【实测·Task 10】 |
+| V27 | **`x` 的进度输出形状与进度解析契约不一致**：`7z x -bsp1 -bb1` 把百分比与成员名放在**不同的 `\r` 段**里（stdout 实测 `"  0%\r    \r- big.bin\r\n"`、`" 50%\r    \rEverything is Ok\r\n"`），而 `SevenZipRunner.DispatchProgress` 只在**同一段**里同时解析出百分比与成员名时才回调 —— 实测 16 MB 归档解压 **onProgress 回调数 = 0**。→ 任何"靠进度回调做事"的设计（心跳、低水位轮询、超时）在真实 `x` 上都可能一次都不触发；Task 10 的低水位轮询因此改用独立 `System.Threading.Timer`（与回调无关），并保留"解压后复核"作为兜底 | 【实测·Task 10】 |
+| V28 | **低水位中止端到端可用**：注入式磁盘提供者（`FreeBytes` 按调用时序返回 10 GB ×2 后返回 1024）+ `DiskPollSeconds=0` + 64 MB 加密 7z：预检（主线程第 1 次）与开始前复核（主线程第 2 次）都拿到充足值，**第 3 次由 Timer 线程在解压进行中读到低水位** → `linked.Cancel()` → Job Object 打断子进程（退出码 1223）→ 归档 `Failed`、判词「已在解压中途中止」、**没有提交任何输出目录**、原包保留；整轮耗时 213 ms（而该归档的完整解压约 0.7 s），即"干净中止"而非"级联 I/O 报错" | 【实测·Task 10】 |
+| V29 | **删除路径端到端核实通过**：Task 10 的 `Extractor` 在"完成且校验通过"后走 `RecycleBinGuard.Plan → CaptureBin → Recycle → VerifyInBin`，判词为「原包已移入回收站（已核实：回收站里新增了该条目）」；`Plan` 报「该卷回收站可用（配额 3245 MB ≥ 文件 1 MB）」。同一判据下 `Failed`/`SkippedContainer`/`SkippedNeedsPassword`/`CompletedWithFailures` 一律不删原包 | 【实测·Task 10】 |
 
 **推翻的审计结论（重要）**：打包审计断言"7z.exe 无 7z.dll 必然报 Can't load 7z.dll，故必须改用 7za.exe"。该结论对**旧版本**成立，对 7-Zip 26.01 **经实测不成立**（见 V10）。同时，另一审计称 `7za.exe` 不含 RAR —— 我们**不使用 7za.exe**，故该争议对本案无影响。仍建议同时嵌入 `7z.exe`+`7z.dll` 以消除版本差异风险。
 
@@ -174,14 +183,16 @@
 
 ## 三、必须在真机实测才能定论的行为（不可凭推理下结论）
 
-1. **映射网络盘 / UNC 上的回收站语义** —— `FileSystem.DeleteFile(..., SendToRecycleBin)` 是抛异常、失败，还是静默永久删除？
-2. **超过卷回收站配额时**，API 是抛异常还是静默永久删除？（本机已发现 3.2GB 小配额卷，值得直接构造大文件测试）
-3. ~~**非提权 7z.exe 是否真的按 tar/zip 内的 symlink/hardlink 条目创建链接**，还是退化为普通文件？~~ → **已实测结案（V17/V18/V19）**：会创建 reparse point；相对穿越目标在 26.01 上被拒绝（exit 2）但链接本身留在输出树中。**hardlink 条目仍未实测**（手上无可靠构造手段）。
+1. ~~**映射网络盘 / UNC 上的回收站语义** —— `FileSystem.DeleteFile(..., SendToRecycleBin)` 是抛异常、失败，还是静默永久删除？~~ → **已实测结案（V21）**：在 `DRIVE_REMOTE` 上**不抛异常、不报失败，直接静默永久删除**（`net use Z: \\localhost\C$` 的映射盘写法与 `\\localhost\C$\...` 的 UNC 写法都一样：文件消失、回收站计数不变、按名核实不到）。限制：本机没有真实远端主机，用的是回环 SMB；该路径确实经 SMB 重定向器且 `GetDriveType=4`，但"远端主机自己的回收站会不会接住"**仍未验证（UNVERIFIED）**。对本案无影响 —— 本机回收站里核实不到就等于不可恢复。→ `RecycleBinGuard.Plan` 对 `DRIVE_REMOTE` 一律**不走回收站**，不依赖该未知项；处置方式为**同卷隔离文件夹**（`Quarantine`），只有连"同卷移动"都不安全（源目录不可写）时才 `Refuse`。*（该处置是 Task 9 fix 轮控制方的裁定，取代了 brief Step 3 原先"`DRIVE_REMOTE` → `Refuse`"的字面规定；裁定理由：规格 §6.8 要求不满足回收条件时提供隔离文件夹替代，而 `Refuse` 会把它一并堵死。探针实测见 task-9-report.md 的 fix 轮小节。）*
+2. ~~**超过卷回收站配额时**，API 是抛异常还是静默永久删除？（本机已发现 3.2GB 小配额卷，值得直接构造大文件测试）~~ → **已实测结案（V22）**：`DeleteFile` **正常返回、无异常**，文件被**静默永久删除**（回收站计数不变、按名核实不到）。测法刻意避开用户既有内容——不改用户卷的 `MaxCapacity`，而是临时挂载一个 64 MB 的一次性 NTFS 卷（VHD）并在其上设 `MaxCapacity=2` MB 再删 8 MB 文件；测完卸载并删除该 VHD 与其 `BitBucket` 项，用户 7 个卷项与回收站计数逐字节复原（证据见 task-9-report.md）。→ 删前查配额是硬要求，"删后 `VerifyInBin` 核实"是最后的诚实层。
+3. ~~**非提权 7z.exe 是否真的按 tar/zip 内的 symlink/hardlink 条目创建链接**，还是退化为普通文件？~~ → **已实测结案（V17/V18/V19）**：会创建 reparse point；相对穿越目标在 26.01 上被拒绝（exit 2）但链接本身留在输出树中。**hardlink 条目**已由 Task 10 补测结案（见 V25）：7-Zip 落盘为**真硬链接**（非 reparse point），但仍应把 `IndexEntry.IsReparsePoint` 的判定范围限定在"符号链接/联接"，硬链接不计入。
 4. **`-mcp=936` 是否影响解压出的文件名**（文档仅述其影响 ZIP 名代码页，未确认对 extract 的作用）。
-5. **7z.exe 内部 `\\?\` 处理**是否会让它成功写出 >260 路径，而我方 .NET 调用随后失败（V-F4 的不对称性）。
+5. ~~**7z.exe 内部 `\\?\` 处理**是否会让它成功写出 >260 路径，而我方 .NET 调用随后失败（V-F4 的不对称性）。~~ → **已实测结案（V24，Task 10）**：不对称性**成立且比预期更糟** —— 7-Zip 用 `\\?\` 内部处理把 317 字符的条目**写出成功（exit 0）**，而 .NET Framework 4.x 侧 `File.Exists` 回 **false**、`FileInfo`/`Path.GetFullPath` **抛 PathTooLongException**，`Directory.GetFiles(root, "*", AllDirectories)` 更是**静默返回 0 个文件**（连异常都没有）。连 `\\?\` 前缀的 `File.Exists` 也抛 `PathTooLongException`（.NET Framework 需要 `AppContextSwitchOverrides` 关掉 legacy path handling 才认长路径）。→ Task 10 采用规格 §10.2 的 v1.0 决策：**预检拒绝**（预测路径 > 259 字符 ⇒ `SkippedUnreadable` + 明确提示，绝不进入暂存/校验，绝不删除原包）；`\\?\` 全链路留给 v1.1。
 6. **UAC VirtualStore 是否会重定向 7z.exe 的写入**（取决于二进制 manifest 与具体路径）。
 7. **`7za.exe` 是否真的不含 RAR**（本案不使用它，故仅作记录）。
 8. **本构建是否触发 Defender/360/火绒 启发式** —— 只能在真机矩阵上测，无法预先推断。
+9. **`NukeOnDelete=1`（"删除时不回收"）的卷上，回收站 API 的行为** → **本机不存在这种卷（V23：7 个 `BitBucket\Volume` 项全为 0）**，故真机语义无法观察。`RecycleBinGuard` 仍按"该卷不可回收 → 走隔离文件夹"实现该分支，并用一次性 `SetValue(NukeOnDelete,1)` + `finally` 复原 + 事后复核的方式**实测过本实现的行为**（`Plan` 返回 `Quarantine`、`Recycle` 返回 `false` 且文件原地未动、注册表复原成功）。**仍未验证**的是"外壳在 `NukeOnDelete=1` 下遇到删除请求到底怎么处理"，本实现不依赖它（直接在删前拦下）。
+10. **卷上还没有 `$Recycle.Bin` 时**（刚格式化/首次挂载的新卷：外壳**按需创建**该目录，实测新卷数秒内可同时没有 `$Recycle.Bin` 与 `BitBucket` 项，见 V23）→ **Task 9 fix 轮控制方裁定：判 `Quarantine`**（不删，改提供同卷隔离文件夹），只有连"同卷移动"都不安全（源目录不可写 / 目录建不出来）时才 `Refuse`。*（这取代了 brief Step 3 与本文档初版所写的 `Refuse`：规格 §6.8 要求"不满足 3/4 时提供隔离文件夹"，`Refuse` 比规格更保守却也更没用 —— 它把本可行的同卷隔离一并堵死。裁定依据与实测见 task-9-report.md 的 fix 轮小节。）* `Plan` 的其余不确定输入（空/非法路径、盘符不存在、注册表项缺失）分别降级到 `Refuse` / 保守默认配额（1024 MB）+ `Quarantine`，**绝不降级到"照删"**。
 
 ---
 
