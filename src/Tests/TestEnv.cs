@@ -1485,7 +1485,48 @@ internal static class TestEnv
         get { return Fixture("legacy-ole2.doc", BuildOle2Doc); }
     }
 
-    // 大 .7z（约 2 MB 不可压缩内容，AES 加密、头部明文、密码 SECRET）：磁盘空间预检用例。
+    // ------------------------------------------------------------------
+    // 【本轮 Critical】非 zip 容器族：7-Zip 自己报出的 `Type` 不在白名单里
+    //
+    // 事故形状（复审用真文件跑出来的那条）：一份**真 PE**（.dll/.exe）的头部是 4D 5A 90 00、
+    // 尾部 64KB 里恰好有 zip 标记 ⇒ Sniffer 判 DamagedHeader ⇒ IsArchiveKind 故意放它过去
+    //（「防和谐」抢救功能）⇒ 7-Zip 按它的真身打开（`Type = PE`）⇒ 把可执行文件「成功解压」成
+    // `<名字>.dll (2)\`，开删除就把原文件回收。修好之前这一族在**正常路径**（不强制、不删除）上
+    // 也会静默销毁原位文件。
+    // ------------------------------------------------------------------
+
+    // 一份**真 PE** + 尾部 zip 标记。它同时是「事故形状」与「7-Zip 能打开的非白名单容器」：
+    //
+    // 【为什么是 csc 编译出来的真 PE，而不是手搓一个 PE 头】实测（本机 7-Zip 26.01）：手搓的
+    // 最小 PE（MZ + PE\0\0 + COFF + 可选头 + 一个节表）7-Zip **打不开**（退出码 2，
+    // `Cannot open the file as archive`）—— 那样这份夹具就走不到类型门控，回归会变成假通过。
+    // 真编译器产出的 PE 7-Zip 报 `Type = PE` 并列出节（.text/.rsrc）。csc.exe 是本项目**已经硬依赖**
+    // 的构建工具（build\build.ps1 就是用那个固定路径编 dist\），所以这里不是新引入的第三方依赖。
+    // 尾部那 4 个字节是**故意的标记注入**（与 F13 的 tar 软链二进制补丁同一手法），不是为了伪造形状：
+    // 夹具的全部身份就是「真 PE 容器 + 尾部有 zip 标记」，两条下面都当场测量。
+    //
+    // 【为什么改的是文件**末尾** 4 字节而不是在末尾**追加**】实测：7-Zip 的 PE 处理器要求文件长度
+    // 与节表一致，在末尾追加任何字节（哪怕 4 个）都会让它退出码 2；原地改写最后 4 字节则照旧
+    // `Type = PE`、退出码 0。复审那份真 DLL 天然就在尾部 64KB 里带 PK\x05\x06，正是同一形状。
+    public static string PeContainerWithZipTail
+    {
+        get { return Fixture("pe-container-with-zip-tail.dll", BuildPeContainerWithZipTail); }
+    }
+
+    // 「防和谐」抢救形状：一份**真 zip**，头部 1024 字节被清零、中央目录偏移同步修正，于是
+    // 7-Zip 仍然能读它、仍然报 `Type = zip`、仍然能**完整解出来**（退出码 0）。
+    //
+    // 【为什么不是「把第一个局部头清零」】实测：把 zip 开头的字节（哪怕只 1 个）清零会打断**第一个
+    // 成员**的局部文件头，7-Zip 解压退出码 2、那个成员落成 0 字节 —— 产品在 I1 那一档就会判
+    // Failed，根本走不到「抢救成功」这条断言。所以这里造的是一份**仍然可读**的受损 zip：
+    // 头部那段是清零的填充（Sniffer 于是看不到 PK\x03\x04 签名 ⇒ DamagedHeader），zip 本体完好。
+    // 两条（头部无签名 / 7-Zip 仍能列+解）都在构造时当场测量，见 BuildZeroedHeadZip 的自检。
+    public static string ZeroedHeadZip
+    {
+        get { return Fixture("zeroed-head.zip", BuildZeroedHeadZip); }
+    }
+
+    // 大 .7z（约 2 MB 不可压缩内容、AES 加密、头部明文、密码 SECRET）：磁盘空间预检用例。
     // 约 2 MB 是刻意的：够大到「1024 字节可用空间」的预检必然拒绝，又不至于让整套测试变慢。
     public static string BigSevenZip
     {
@@ -1878,6 +1919,277 @@ internal static class TestEnv
         CfbPutU32(directory, offset + 76, child);
         CfbPutU32(directory, offset + 116, start);
         Array.Copy(BitConverter.GetBytes(size), 0, directory, offset + 120, 8);
+    }
+
+    // ------------------------------------------------------------------
+    // 【本轮 Critical】非 zip 容器族的两份夹具（构造理由见属性处的注释）
+    // ------------------------------------------------------------------
+
+    private const int ZipHeadZeroPrefixBytes = 1024;
+
+    private static void BuildPeContainerWithZipTail(string targetPath)
+    {
+        string seedDir = Path.Combine(_root, "fixture-seed", "pe-container");
+        if (Directory.Exists(seedDir)) { Directory.Delete(seedDir, true); }
+        Directory.CreateDirectory(seedDir);
+
+        string source = Path.Combine(seedDir, "probe.cs");
+        File.WriteAllText(source,
+            "internal static class RerarPeFixture { private static void Main() { } }\r\n",
+            new UTF8Encoding(false));
+
+        string compiled = Path.Combine(seedDir, "probe.exe");
+        string[] args = new string[] { "/nologo", "/target:exe", "/out:" + compiled, source };
+        RunTool(LocateCsc(), args, "编译 PE 容器夹具");
+
+        if (!File.Exists(compiled))
+        {
+            throw new InvalidOperationException("PE 容器夹具构造失败：csc 未生成 " + compiled);
+        }
+
+        byte[] bytes = File.ReadAllBytes(compiled);
+        if (bytes.Length < 64) { throw new InvalidOperationException("PE 容器夹具构造失败：编译产物只有 " + bytes.Length + " 字节"); }
+
+        // 尾部 4 字节原地改写成 zip 的 EOCD 标记（追加会让 7-Zip 打不开这份 PE，见属性注释）。
+        byte[] marker = B("PK\x05\x06");
+        Array.Copy(marker, 0, bytes, bytes.Length - marker.Length, marker.Length);
+
+        string parent = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        File.WriteAllBytes(targetPath, bytes);
+
+        // 自检 1：头部必须是 PE（MZ 90 00）—— 这是「事故里那个形状」的字面要求。
+        byte[] head = new byte[4];
+        using (FileStream stream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            if (stream.Read(head, 0, head.Length) != head.Length)
+            {
+                throw new InvalidOperationException("PE 容器夹具构造失败：读不满 4 字节头部");
+            }
+        }
+        byte[] mz = B("MZ\x90\x00");
+        for (int i = 0; i < mz.Length; i++)
+        {
+            if (head[i] != mz[i])
+            {
+                throw new InvalidOperationException("PE 容器夹具构造失败：头部第 " + i + " 字节是 0x" +
+                    head[i].ToString("X2") + "，期望 0x" + mz[i].ToString("X2"));
+            }
+        }
+
+        // 自检 2：产品自己的 Sniffer 必须把它判成 DamagedHeader（走到那一条正是本轮要堵的门）。
+        SniffKind kind = ClassifyByProduct(targetPath);
+        if (kind != SniffKind.DamagedHeader)
+        {
+            throw new InvalidOperationException("PE 容器夹具构造失败：Sniffer 判成 " + kind + "，期望 DamagedHeader");
+        }
+
+        // 自检 3（**关键**）：7-Zip 必须真的打开它，并且**它自己的清单**里写着 `Type = PE`。
+        // 这里刻意直接看 7-Zip 的原始 stdout，而不是走产品的新解析字段 —— 夹具自检要独立于被测代码：
+        // 用被测的东西去证明夹具成立，会让「解析器写错了」与「夹具不对」互相掩盖。
+        // 没有这一条，这份夹具就只是「一段 MZ 开头的字节」，回归会退化成假通过（清单读不出来 ⇒
+        // 早在 I1 那一档就 Failed，永远走不到类型门控）。
+        string[] peListArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult peListed = RunSevenZip(peListArgs);
+        if (!SevenZipRunner.IsSuccess(peListed.ExitCode) ||
+            peListed.StdOut == null || peListed.StdOut.IndexOf("Type = PE", StringComparison.Ordinal) < 0)
+        {
+            FixtureFailed("校验 PE 容器夹具（7-Zip 必须把它报成 Type = PE）", peListArgs, peListed);
+        }
+    }
+
+    private static void BuildZeroedHeadZip(string targetPath)
+    {
+        // 先造一份正常的真 zip：三个成员（含一层子目录），条目数/字节数都非零。
+        string normal = targetPath + ".body.zip";
+        WriteZipFile(normal, delegate(ZipArchive z)
+        {
+            AddZipText(z, "a.txt", "alpha");
+            AddZipText(z, "b.txt", "bravo");
+            AddZipText(z, "docs/readme.md", "# readme");
+        });
+
+        byte[] zip = File.ReadAllBytes(normal);
+        int eocd = FindEocd(zip);
+        if (eocd < 0) { throw new InvalidOperationException("零头 zip 夹具构造失败：找不到 EOCD 记录"); }
+
+        uint centralOffset = BitConverter.ToUInt32(zip, eocd + 16);
+        ushort entryCount = BitConverter.ToUInt16(zip, eocd + 10);
+
+        // 头部补 1024 字节的零（这就是「头部被清零」的全部动作），并把**中央目录里记录的偏移**
+        // 同步 +1024，使归档本体仍然自洽（7-Zip 因此仍能完整解它）。
+        byte[] file = new byte[ZipHeadZeroPrefixBytes + zip.Length];
+        Array.Copy(zip, 0, file, ZipHeadZeroPrefixBytes, zip.Length);
+        Array.Copy(BitConverter.GetBytes((uint)(centralOffset + ZipHeadZeroPrefixBytes)), 0,
+            file, eocd + ZipHeadZeroPrefixBytes + 16, 4);
+
+        int at = (int)centralOffset + ZipHeadZeroPrefixBytes;
+        for (int i = 0; i < entryCount; i++)
+        {
+            if (!(file[at] == 0x50 && file[at + 1] == 0x4B && file[at + 2] == 0x01 && file[at + 3] == 0x02))
+            {
+                throw new InvalidOperationException("零头 zip 夹具构造失败：第 " + i + " 条中央目录记录的签名不在预期位置");
+            }
+            ushort nameLength = BitConverter.ToUInt16(file, at + 28);
+            ushort extraLength = BitConverter.ToUInt16(file, at + 30);
+            ushort commentLength = BitConverter.ToUInt16(file, at + 32);
+            uint localOffset = BitConverter.ToUInt32(file, at + 42);
+            Array.Copy(BitConverter.GetBytes((uint)(localOffset + ZipHeadZeroPrefixBytes)), 0, file, at + 42, 4);
+            at += 46 + nameLength + extraLength + commentLength;
+        }
+
+        string parent = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        File.WriteAllBytes(targetPath, file);
+
+        // 自检 1：头部真的没有 zip 签名（前 4 字节是零），否则这条回归测的就不是那条路。
+        byte[] head = new byte[4];
+        using (FileStream stream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            if (stream.Read(head, 0, head.Length) != head.Length)
+            {
+                throw new InvalidOperationException("零头 zip 夹具构造失败：读不满头部");
+            }
+        }
+        for (int i = 0; i < head.Length; i++)
+        {
+            if (head[i] != 0)
+            {
+                throw new InvalidOperationException("零头 zip 夹具构造失败：头部第 " + i + " 字节是 0x" +
+                    head[i].ToString("X2") + "，期望 0x00（这份夹具要的就是「头部被清零」）");
+            }
+        }
+        if (ClassifyByProduct(targetPath) != SniffKind.DamagedHeader)
+        {
+            throw new InvalidOperationException("零头 zip 夹具构造失败：Sniffer 没把它判成 DamagedHeader");
+        }
+
+        // 自检 2（**关键**）：7-Zip 必须仍能读到它，并且它自己的清单里写着 `Type = zip`
+        //（⇒ 它落在白名单里，不会被类型门控拒掉）。同样直接看原始 stdout（见上一份夹具的说明）。
+        string[] zeroListArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult zeroListed = RunSevenZip(zeroListArgs);
+        if (!SevenZipRunner.IsSuccess(zeroListed.ExitCode) ||
+            zeroListed.StdOut == null || zeroListed.StdOut.IndexOf("Type = zip", StringComparison.Ordinal) < 0 ||
+            zeroListed.StdOut.IndexOf("a.txt", StringComparison.Ordinal) < 0 ||
+            zeroListed.StdOut.IndexOf("b.txt", StringComparison.Ordinal) < 0 ||
+            zeroListed.StdOut.IndexOf("readme.md", StringComparison.Ordinal) < 0)
+        {
+            FixtureFailed("校验零头 zip 夹具（7-Zip 必须仍把它读成一份可用的 zip）", zeroListArgs, zeroListed);
+        }
+
+        // 自检 3（**关键**）：7-Zip 必须能**完整解出来**（退出码 0 且三个成员都落地）。
+        // 少了这一条，「抢救仍然可用」这条断言就可能建立在一份 7-Zip 其实解不了的输入上 ——
+        // 那样它测到的只是「没被类型门控拒掉」，而不是「抢救真的还能用」。
+        string probe = Path.Combine(_root, "zeroed-head-probe");
+        if (Directory.Exists(probe)) { Directory.Delete(probe, true); }
+        Directory.CreateDirectory(probe);
+        string[] zeroExtractArgs = new string[] { "x", targetPath, "-o" + probe, "-p", "-y" };
+        RunResult extracted = RunSevenZip(zeroExtractArgs);
+        try
+        {
+            if (!SevenZipRunner.IsSuccess(extracted.ExitCode))
+            {
+                FixtureFailed("校验零头 zip 夹具（7-Zip 必须能完整解出它）", zeroExtractArgs, extracted);
+            }
+            if (!File.Exists(Path.Combine(probe, "a.txt")) ||
+                !File.Exists(Path.Combine(probe, "b.txt")) ||
+                !File.Exists(Path.Combine(probe, "docs", "readme.md")))
+            {
+                throw new InvalidOperationException("零头 zip 夹具构造失败：7-Zip 解出的成员不全（三个成员必须都落地）");
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(probe, true); }
+            catch (Exception) { }
+        }
+    }
+
+    private static int FindEocd(byte[] zip)
+    {
+        for (int i = zip.Length - 22; i >= 0; i--)
+        {
+            if (zip[i] == 0x50 && zip[i + 1] == 0x4B && zip[i + 2] == 0x05 && zip[i + 3] == 0x06) { return i; }
+        }
+        return -1;
+    }
+
+    // 用产品自己的 Sniffer 读结论（与 Extractor.Sniff 同一调用形状：head = 前 262 字节、tail = 末 64KB）。
+    private static SniffKind ClassifyByProduct(string path)
+    {
+        long length = new FileInfo(path).Length;
+        byte[] head = new byte[(int)Math.Min(length, 262)];
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            int read = stream.Read(head, 0, head.Length);
+            if (read != head.Length) { Array.Resize(ref head, read); }
+        }
+
+        long tailLength = Math.Min(length, 64L * 1024L);
+        byte[] tail = new byte[(int)tailLength];
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            stream.Seek(length - tailLength, SeekOrigin.Begin);
+            int read = stream.Read(tail, 0, tail.Length);
+            if (read != tail.Length) { Array.Resize(ref tail, read); }
+        }
+        return Sniffer.Classify(head, length, Path.GetFileName(path), tail);
+    }
+
+    // csc.exe：与 build\build.ps1 用的是同一个 in-box 编译器（固定路径 + 32 位回退）。
+    private static string LocateCsc()
+    {
+        string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        string[] candidates = new string[] {
+            Path.Combine(windows, @"Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+            Path.Combine(windows, @"Microsoft.NET\Framework\v4.0.30319\csc.exe") };
+
+        foreach (string candidate in candidates)
+        {
+            if (File.Exists(candidate)) { return candidate; }
+        }
+        throw new InvalidOperationException(
+            "未找到 csc.exe（" + string.Join("；", candidates) +
+            "）：PE 容器夹具需要一个**真编译器**产出的真 PE（手搓的最小 PE 实测 7-Zip 打不开，" +
+            "那样这条数据丢失回归会退化成假通过）");
+    }
+
+    // 起一个工具进程并捕获两流（与 RunTar 同一套边界：固定超时、超时即杀、不碰 stdin）。
+    private static void RunTool(string exe, string[] args, string what)
+    {
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = exe;
+        psi.Arguments = string.Join(" ", args);
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+
+        Process process = new Process();
+        process.StartInfo = psi;
+        try
+        {
+            process.Start();
+            string stdOut = process.StandardOutput.ReadToEnd();
+            string stdErr = process.StandardError.ReadToEnd();
+            if (!process.WaitForExit(60000))
+            {
+                try { process.Kill(); } catch (Exception) { }
+                process.WaitForExit();
+                throw new InvalidOperationException(what + "失败：" + exe + " 60 秒未返回（已杀掉）");
+            }
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(what + "失败：" + exe + " 退出码 " + process.ExitCode +
+                    "；stdout=[" + Head(stdOut) + "]；stderr=[" + Head(stdErr) + "]");
+            }
+        }
+        finally
+        {
+            process.Dispose();
+        }
     }
 
     // 条目数上限的夹具：条目数 = MaxEntriesPerArchive + 1（**刚好越界一条**，这样它也顺带钉住边界）。

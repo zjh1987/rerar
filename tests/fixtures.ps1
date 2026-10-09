@@ -1,7 +1,7 @@
 ﻿# Rerar 验收脚本（Task 15）之一：构造规格 §9.1 的 fixture 矩阵。
 #
 # 用法：powershell -NoProfile -File tests\fixtures.ps1
-#   退出 0 = 19 个 fixture 全部构造完成，且**每一个的形状自检**都通过；
+#   退出 0 = 21 个 fixture 全部构造完成，且**每一个的形状自检**都通过；
 #   退出 1 = 任一 fixture 构造或自检失败（中文说明，绝不静默跳过）。
 #
 # 【为什么必须有形状自检】本项目有一条已裁定的教训：Task 2 的 Sniffer 单测是**照着实现的常量**写的，
@@ -79,6 +79,26 @@ function Write-TextFile([string]$path, [string]$text) {
 
 # 找一个可用的 7z.exe（构建期/夹具期工具，与运行期的 EngineLocator 无关）。
 # 找不到就**大声失败**：一堆 fixture 的形状只能由真 7-Zip 产生，绝不能悄悄退化成「用别的东西凑一个」。
+# F20 用的 csc.exe：与 build\build.ps1 是同一个 in-box 编译器。
+#
+# 【为什么 F20 需要一个真编译器】手搓的最小 PE（MZ + PE\0\0 + COFF + 可选头 + 节表）本机 7-Zip 26.01
+# **打不开**（退出码 2，`Cannot open the file as archive`）—— 那样的夹具走不到类型门控，这条数据丢失
+# 回归会退化成假通过。真编译器产出的 PE 7-Zip 报 `Type = PE` 并列出节。csc 是本项目**已经硬依赖**
+# 的构建工具（同一个固定路径编 dist\），所以这里不是新引入的第三方依赖；找不到就大声失败。
+function Find-Csc {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($env:windir) {
+        $candidates.Add((Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'))
+        $candidates.Add((Join-Path $env:windir 'Microsoft.NET\Framework\v4.0.30319\csc.exe'))
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    Fail ("找不到 csc.exe（" + ($candidates -join '；') + "）：F20 需要一个**真编译器**产出的真 PE —— " +
+          "手搓的最小 PE 实测 7-Zip 打不开（退出码 2），那样的夹具走不到类型门控，回归会退化成假通过。")
+    return $null
+}
+
 function Find-SevenZip {
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($env:RERAR_7Z_DIR) { $candidates.Add((Join-Path $env:RERAR_7Z_DIR '7z.exe')) }
@@ -831,6 +851,136 @@ Note 'F19' 'OLE2 复合文档' ("手搓的真 [MS-CFB] 容器（头 + FAT + 目�
     "自检：头部 8 字节是 OLE2 魔数，且 7-Zip 自己把它列出为 Type = Compound 并给出 " + ($cfbStreams -join '/'))
 
 # ==================================================================
+# 20) 非白名单容器类型（真 PE + 尾部 zip 标记）：本轮 Critical 的数据丢失回归
+#
+# 事故形状（复审用一份真 shipped 文件复现，正常路径、不强制、不删除）：
+#   真 PE（头 4D 5A 90 00）的**尾部 64KB 里恰好有 zip 标记** ⇒ Sniffer 判 DamagedHeader
+#（IsArchiveKind 故意保留这一档给「防和谐」抢救）⇒ 7-Zip 按真身打开它（`Type = PE`，条目是
+#   .text/.rsrc/…）⇒ ArchiveGater 的标记全是 zip 内容身份、PE 一个都没有 ⇒ Allow ⇒
+#   可执行文件被「成功解压」成「<名字>.dll (2)\」；开删除即回收、不开删除也原位拆散。
+#
+# 修法是**按 7-Zip 自己报的归档类型放行白名单**（不是再加头部签名）。F20 钉住「非白名单类型被拒」。
+#
+# 【构造事实（本机 7-Zip 26.01 实测，写下来免得后人重复踩）】
+#   * 手搓的最小 PE 7-Zip 打不开（退出码 2）⇒ 必须用真编译器（csc）产出的真 PE；
+#   * 在 PE 末尾**追加**任何字节（哪怕 4 个）7-Zip 也会退出码 2（它的 PE 处理器要求文件长度与节表
+#     一致），所以尾部那 4 个字节是**原地改写**最后一组字节 —— 改完 7-Zip 照旧 `Type = PE`、退出码 0。
+#     复审那份真 DLL 天然就在尾部带 PK\x05\x06，正是同一形状。
+#   * 那 4 个字节是**故意的标记注入**（与 F13 的 tar 软链二进制补丁同一手法）：被测的判定依据就是
+#     「7-Zip 报的类型不在白名单里」，而下面第 3 条自检让**真 7-Zip**把这件事测量出来。
+# ==================================================================
+$f20 = New-FixtureDir 'f20-pe-container'
+$pePath = Join-Path $f20 'legacy-pe.dll'
+
+$script:Csc = Find-Csc
+$peSource = Join-Path $f20 'pe-probe.cs'
+Write-TextFile $peSource "internal static class RerarPeFixture { private static void Main() { } }"
+$peCompiled = Join-Path $f20 'pe-probe.exe'
+$peBuild = Invoke-Native $script:Csc @('/nologo', '/target:exe', ('/out:' + $peCompiled), $peSource) $null
+Assert-True ($peBuild.Code -eq 0) ("F20: csc 编译失败（退出码 " + $peBuild.Code + "）：" + $peBuild.Out)
+Assert-True (Test-Path -LiteralPath $peCompiled) 'F20: csc 没有产出 PE'
+
+$peBytes = [System.IO.File]::ReadAllBytes($peCompiled)
+Assert-True ($peBytes.Length -ge 64) 'F20: 编译产物太小，不像一个 PE'
+[Array]::Copy([byte[]](0x50, 0x4B, 0x05, 0x06), 0, $peBytes, $peBytes.Length - 4, 4)   # 尾部写入 zip 的 EOCD 标记
+[System.IO.File]::WriteAllBytes($pePath, $peBytes)
+
+# 自检 1：头部必须是 PE（MZ 90 00）—— 这是「事故里那个形状」的字面要求。
+$peHead = Get-FirstBytes $pePath 4
+Assert-True ($peHead[0] -eq 0x4D -and $peHead[1] -eq 0x5A -and $peHead[2] -eq 0x90 -and $peHead[3] -eq 0x00) `
+    'F20: 自检失败：头部不是 PE 的 4D 5A 90 00'
+
+# 自检 2：尾部 64KB 里必须真的有 zip 标记（否则 Sniffer 判不出 DamagedHeader，夹具就走不到那扇门）。
+$peAll = [System.IO.File]::ReadAllBytes($pePath)
+$peTailStart = [Math]::Max(0, $peAll.Length - 65536)
+$peTailHasZipMarker = $false
+for ($i = $peTailStart; $i + 4 -le $peAll.Length; $i++) {
+    if ($peAll[$i] -eq 0x50 -and $peAll[$i + 1] -eq 0x4B -and
+        (($peAll[$i + 2] -eq 0x05 -and $peAll[$i + 3] -eq 0x06) -or
+         ($peAll[$i + 2] -eq 0x01 -and $peAll[$i + 3] -eq 0x02))) { $peTailHasZipMarker = $true; break }
+}
+Assert-True $peTailHasZipMarker 'F20: 自检失败：尾部 64KB 里没有 zip 标记（Sniffer 不会判 DamagedHeader）'
+
+# 自检 3（**关键**）：让真 7-Zip 自己把这份文件打开，并报出 `Type = PE`。
+# 少了这一条，这份夹具就只是「一段 MZ 开头的字节」，回归会在 I1 那一档就 Failed、永远走不到类型门控。
+$peListing = Invoke-SevenZip @('l', '-slt', '-p', $pePath)
+Assert-True ($peListing.Code -eq 0) ("F20: 自检失败：7-Zip 打不开这份 PE（退出码 " + $peListing.Code + "）：" + $peListing.Out)
+Assert-True ($peListing.Out.Contains('Type = PE')) ("F20: 自检失败：7-Zip 没把它报成 PE 容器：" + $peListing.Out)
+Note 'F20' '非白名单容器(PE)' ("csc 编译的真 PE（" + $peBytes.Length + " 字节）+ 尾部原地写入 zip 标记 PK\x05\x06；" +
+    "自检：头部 4D 5A 90 00、尾部有 zip 标记，且 7-Zip 自己把它列出为 Type = PE（非白名单 ⇒ 必须被拒）")
+
+# ==================================================================
+# 21) 「防和谐」抢救形状（头部清零、仍能被 7-Zip 完整解出的真 zip）：白名单**不能把功能关死**
+#
+# 头部 1024 字节清零 ⇒ Sniffer 看不到 PK\x03\x04 签名 ⇒ DamagedHeader（IsArchiveKind 故意放行，
+# 给 7-Zip 一次抢救机会）；而中央目录里的偏移同步 +1024 ⇒ 归档本体仍然自洽，7-Zip 照旧
+# `Type = zip`（白名单命中）并**完整解出**三个成员。F21 钉住这条抢救能力活着。
+#
+# 【为什么不是「把第一个局部头清零」】实测：把 zip 开头的字节（哪怕只 1 个）清零会打断**第一个成员**
+# 的局部文件头，7-Zip 解压退出码 2、那个成员落成 0 字节 —— 产品在 I1 那一档就判 Failed，根本走不到
+# 「抢救成功」这条断言。所以这里造的是一份**仍然可读**的受损 zip。
+# ==================================================================
+$f21 = New-FixtureDir 'f21-zeroed-head'
+$zeroedPath = Join-Path $f21 'zeroed-head.zip'
+
+$zeroEntries = @(
+    (New-ZipEntry 'a.txt' 'alpha'),
+    (New-ZipEntry 'b.txt' 'bravo'),
+    (New-ZipEntry 'docs/readme.md' '# readme'))
+$zeroBody = New-ZipBytes $zeroEntries
+
+$zeroEocd = -1
+for ($i = $zeroBody.Length - 22; $i -ge 0; $i--) {
+    if ($zeroBody[$i] -eq 0x50 -and $zeroBody[$i + 1] -eq 0x4B -and
+        $zeroBody[$i + 2] -eq 0x05 -and $zeroBody[$i + 3] -eq 0x06) { $zeroEocd = $i; break }
+}
+Assert-True ($zeroEocd -ge 0) 'F21: 找不到 EOCD 记录'
+
+$zeroPrefix = 1024
+$zeroCentral = [BitConverter]::ToUInt32($zeroBody, $zeroEocd + 16)
+$zeroCount = [BitConverter]::ToUInt16($zeroBody, $zeroEocd + 10)
+$zeroAll = New-Object byte[] ($zeroPrefix + $zeroBody.Length)
+[Array]::Copy($zeroBody, 0, $zeroAll, $zeroPrefix, $zeroBody.Length)
+[Array]::Copy([BitConverter]::GetBytes([uint32]($zeroCentral + $zeroPrefix)), 0, $zeroAll, $zeroEocd + $zeroPrefix + 16, 4)
+
+$zeroAt = [int]$zeroCentral + $zeroPrefix
+for ($k = 0; $k -lt $zeroCount; $k++) {
+    Assert-True ($zeroAll[$zeroAt] -eq 0x50 -and $zeroAll[$zeroAt + 1] -eq 0x4B -and
+                 $zeroAll[$zeroAt + 2] -eq 0x01 -and $zeroAll[$zeroAt + 3] -eq 0x02) `
+        'F21: 自检失败：中央目录记录的签名不在预期位置'
+    $zeroNameLen = [BitConverter]::ToUInt16($zeroAll, $zeroAt + 28)
+    $zeroExtraLen = [BitConverter]::ToUInt16($zeroAll, $zeroAt + 30)
+    $zeroCommentLen = [BitConverter]::ToUInt16($zeroAll, $zeroAt + 32)
+    $zeroLocal = [BitConverter]::ToUInt32($zeroAll, $zeroAt + 42)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]($zeroLocal + $zeroPrefix)), 0, $zeroAll, $zeroAt + 42, 4)
+    $zeroAt += 46 + $zeroNameLen + $zeroExtraLen + $zeroCommentLen
+}
+[System.IO.File]::WriteAllBytes($zeroedPath, $zeroAll)
+
+# 自检 1：头部真的被清零了（前 4 字节是 0x00 ⇒ Sniffer 看不到 zip 签名）。
+$zeroHead = Get-FirstBytes $zeroedPath 4
+Assert-True ($zeroHead[0] -eq 0 -and $zeroHead[1] -eq 0 -and $zeroHead[2] -eq 0 -and $zeroHead[3] -eq 0) `
+    'F21: 自检失败：头部没有被清零'
+
+# 自检 2：7-Zip 必须仍能读它，且报 `Type = zip`（白名单命中 ⇒ 抢救路径必须走通）。
+$zeroListing = Invoke-SevenZip @('l', '-slt', '-p', $zeroedPath)
+Assert-True ($zeroListing.Code -eq 0) ("F21: 自检失败：7-Zip 读不出这份零头 zip（退出码 " + $zeroListing.Code + "）：" + $zeroListing.Out)
+Assert-True ($zeroListing.Out.Contains('Type = zip')) ("F21: 自检失败：7-Zip 没把它报成 zip：" + $zeroListing.Out)
+
+# 自检 3（**关键**）：7-Zip 必须能**完整解出**三个成员（退出码 0）。少了这一条，「抢救仍然可用」
+# 这条断言就可能建立在一份 7-Zip 其实解不了的输入上。
+$zeroProbe = Join-Path $f21 '.probe'
+Assert-True (-not (Test-Path -LiteralPath $zeroProbe)) 'F21: 探测目录已存在（上一轮的残留）'
+$zeroExtract = Invoke-SevenZip @('x', $zeroedPath, ('-o' + $zeroProbe), '-p', '-y')
+Assert-True ($zeroExtract.Code -eq 0) ("F21: 自检失败：7-Zip 解不出这份零头 zip（退出码 " + $zeroExtract.Code + "）：" + $zeroExtract.Out)
+foreach ($zeroMember in @('a.txt', 'b.txt', ('docs' + [System.IO.Path]::DirectorySeparatorChar + 'readme.md'))) {
+    Assert-True (Test-Path -LiteralPath (Join-Path $zeroProbe $zeroMember)) ("F21: 自检失败：7-Zip 没解出成员 " + $zeroMember)
+}
+Remove-Dir $zeroProbe
+Note 'F21' '零头 zip(抢救)' ("真 zip（" + $zeroEntries.Count + " 个成员）头部 1024 字节清零、中央目录偏移同步修正；" +
+    "自检：头部无 zip 签名、7-Zip 报 Type = zip，且**完整解出**三个成员（抢救能力没有被白名单关死）")
+
+# ==================================================================
 # 汇总
 # ==================================================================
 
@@ -840,8 +990,8 @@ foreach ($row in $script:Rows) {
     Write-Host ("  " + $row.Id + "  " + $row.Name.PadRight(18) + $row.Detail)
 }
 Write-Host ''
-if ($script:Rows.Count -ne 19) {
-    Fail ("夹具数不是 19，而是 " + $script:Rows.Count + "（规格 §9.1 的 18 个 + 本轮 OLE2 事故回归的 1 个）")
+if ($script:Rows.Count -ne 21) {
+    Fail ("夹具数不是 21，而是 " + $script:Rows.Count + "（规格 §9.1 的 18 个 + OLE2 事故回归 1 个 + 本轮非 zip 容器回归 2 个）")
 }
-Write-Host ("FIXTURES_OK " + $script:Rows.Count + "/19（每个都做了形状自检；没有任何一个被静默跳过）")
+Write-Host ("FIXTURES_OK " + $script:Rows.Count + "/21（每个都做了形状自检；没有任何一个被静默跳过）")
 exit 0

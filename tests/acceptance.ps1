@@ -543,7 +543,8 @@ $requiredFixtures = @(
     'f12-longpath\long.zip', 'f13-symlink-tar\trav.tar', 'f14-html\fake.zip',
     'f15-zero-volume\zero.7z.002', 'f16-conflict\conflict.zip',
     'f17-existing-target\busy.zip', 'f17-existing-target\busy', 'f18-bulk\bulk.zip',
-    'f19-ole2\legacy.doc'
+    'f19-ole2\legacy.doc',
+    'f20-pe-container\legacy-pe.dll', 'f21-zeroed-head\zeroed-head.zip'
 )
 $missingFixtures = @($requiredFixtures | Where-Object { -not (Test-Path -LiteralPath (Fixture $_)) })
 if ($missingFixtures.Count -gt 0) {
@@ -924,6 +925,61 @@ if (-not $row.Missing) {
     Check-CommonInvariants $row $checks $true $true
 }
 Complete-Row $row 'F19 OLE2 复合文档' $checks ('--delete + OLE2：SkippedContainer（不递归、绝不删除）；原件 SHA-256 逐字节未变；输出根无任何残留') | Out-Null
+
+# ==================================================================
+# F20 非白名单容器类型（真 PE + 尾部 zip 标记）：本轮 Critical 的数据丢失回归
+#
+# 事故路径（复审用一份真 shipped 文件复现，**正常路径**：不强制、不删除）：
+#   head 4D 5A 90 00（PE）、尾部 64KB 里有 PK\x05\x06 ⇒ Sniffer 判 DamagedHeader ⇒ IsArchiveKind
+#   故意放它过去 ⇒ 7-Zip 按真身打开（Type = PE）⇒ 而 ArchiveGater 只按 zip 内容身份判容器文档
+#（PE 一个标记都没有）⇒ Allow ⇒ 可执行文件被「成功解压」成「legacy-pe.dll (2)\」⇒ Completed ⇒
+#   开删除即回收、不开删除也原位拆散。修复后：类型不在白名单 ⇒ SkippedContainer、原件逐字节不动。
+#
+# 这一行用 `--delete`：要证明的正是「删除开关打开时原件也必须活着」——那一条才是能阻止事故的断言。
+# ==================================================================
+$row = New-Row 'F20' @((Fixture 'f20-pe-container\legacy-pe.dll'))
+$checks = New-Checks
+if (-not $row.Missing) {
+    $target = Join-Path $row.Work 'legacy-pe.dll'
+    $peBefore = Get-FileHash -LiteralPath $target -Algorithm SHA256
+    Invoke-Row $row @($target) -ExtraArguments @('--delete') | Out-Null
+    $one = Get-JsonResult $row.Json $target
+    Check $checks ($row.Cli.ExitCode -eq 1) ('退出码 ' + $row.Cli.ExitCode + '，期望 1（跳过，不是 0 也不是 2）')
+    Check $checks ($null -ne $one -and $one.status -eq 'SkippedContainer') ('非白名单容器结局 ' + (Get-StatusOf $row.Json $target) + '，期望 SkippedContainer（类型不在白名单 ⇒ I4 拒绝）')
+    Check $checks ($null -ne $one -and ([string]$one.message).Contains('PE')) ('判词没有点名 7-Zip 报的真实类型（PE）：' + $one.message)
+    Check $checks ($null -ne $one -and ([string]$one.message).Contains('不是压缩包')) ('判词没有说清「不是压缩包」：' + $one.message)
+    Check $checks (Test-Path -LiteralPath $target) '开了 --delete 之后 PE 容器原件不见了 —— 这正是那起数据丢失事故'
+    Check $checks ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $peBefore.Hash) 'PE 容器原件被改动了（必须逐字节原样）'
+    Check $checks (-not (Test-Path -LiteralPath (Join-Path $row.Work 'legacy-pe'))) 'PE 被拆出了输出目录（可执行文件被拆散）'
+    Check $checks (-not (Test-Path -LiteralPath (Join-Path $row.Work 'legacy-pe.dll (2)'))) 'PE 被拆到了「legacy-pe.dll (2)\」（事故里的输出目录名）'
+    Check-CommonInvariants $row $checks $true $true
+}
+Complete-Row $row 'F20 非白名单容器(PE)' $checks ('--delete + Type=PE：SkippedContainer（不递归、绝不删除）；原件 SHA-256 逐字节未变；输出根无任何残留') | Out-Null
+
+# ==================================================================
+# F21 「防和谐」抢救形状（头部清零、7-Zip 仍报 Type = zip）：白名单**不能把功能关死**
+#
+# 反方向的那一半：修法若是「把所有非 zip 头签名都拒掉」，这条会当场变红。头部 1024 字节清零
+# （Sniffer 判 DamagedHeader）但归档本体仍然自洽 ⇒ 7-Zip 报 `Type = zip`（白名单命中）⇒
+# 照旧**完整解出**三个成员 ⇒ Completed（I3 里唯一可删的状态 ⇒ 仍然提取资格完整）。
+# ==================================================================
+$row = New-Row 'F21' @((Fixture 'f21-zeroed-head\zeroed-head.zip'))
+$checks = New-Checks
+if (-not $row.Missing) {
+    $target = Join-Path $row.Work 'zeroed-head.zip'
+    $zeroBefore = Get-FileHash -LiteralPath $target -Algorithm SHA256
+    Invoke-Row $row @($target) | Out-Null
+    $one = Get-JsonResult $row.Json $target
+    Check $checks ($row.Cli.ExitCode -eq 0) ('退出码 ' + $row.Cli.ExitCode + '，期望 0（抢救成功）')
+    Check $checks ($null -ne $one -and $one.status -eq 'Completed') ('零头 zip 结局 ' + (Get-StatusOf $row.Json $target) + '，期望 Completed（Type=zip 在白名单里，抢救路径必须走通）')
+    Check $checks ($null -ne $one -and $one.files -eq 3) ('产出文件数 ' + $one.files + '，期望 3')
+    Check $checks (Test-Path -LiteralPath (Join-Path $row.Work 'zeroed-head\a.txt')) '抢救没有解出 a.txt'
+    Check $checks (Test-Path -LiteralPath (Join-Path $row.Work 'zeroed-head\b.txt')) '抢救没有解出 b.txt'
+    Check $checks (Test-Path -LiteralPath (Join-Path $row.Work 'zeroed-head\docs\readme.md')) '抢救没有解出 docs\readme.md'
+    Check $checks ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $zeroBefore.Hash) '零头 zip 原件被改动了（必须逐字节原样）'
+    Check-CommonInvariants $row $checks $true $false
+}
+Complete-Row $row 'F21 零头 zip 抢救' $checks '头部清零但 Type=zip：照旧完整解出 3 个成员、退出码 0、原件未动（白名单没有把抢救功能关死）' | Out-Null
 
 # ==================================================================
 # A04 干净环境可运行（无本机 7-Zip 时走内嵌兜底）

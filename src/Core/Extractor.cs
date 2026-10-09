@@ -3,8 +3,8 @@
 // 本类是整条流水线的汇聚点，也是安全不变式唯一真正落地的地方。管线顺序（Task 5 的裁定：
 // 规格 §4.2 把 Gater 排在 Indexer 之前是**不可能的**，门控需要清单）：
 //
-//   Sniffer → 分卷族 → 索引(Read) → Gater → 预检(安全上限/空间/长路径/重名) → 密码 → 暂存 → 解压 →
-//   校验 → 提交 → （仅当开启删除且「完成且校验通过」）回收站/隔离
+//   Sniffer → 分卷族 → 索引(Read) → 类型白名单门控 → 内容身份门控(Gater) → 预检(安全上限/空间/长路径/重名) →
+//   密码 → 暂存 → 解压 → 校验 → 提交 → （仅当开启删除且「完成且校验通过」）回收站/隔离
 //
 // 两个逐项开关（都只放开「要不要试」这一层，绝不放开任何安全判定）：
 //   * RunOptions.ForceTreatAsArchive：「强制按压缩包尝试」（规格 §6.1 的逐项动作）跳过**格式门控**；
@@ -24,7 +24,7 @@
 //      零 reparse point（实测 7z 会按 tar 条目建软链）、每条产出路径都是暂存根的严格子项。
 //   I3 删除默认关；只有「完成且校验通过」可删；CompletedWithFailures / 跳过 / 失败一律不删；
 //      回收站删完必须 VerifyInBin 核实，核实不到就如实报「已永久删除」。
-//   I4 门控拒绝（容器文档）⇒ SkippedContainer：不递归、不删除、不留输出目录。
+//   I4 门控拒绝（归档类型不在白名单 / 容器文档）⇒ SkippedContainer：不递归、不删除、不留输出目录。
 //   I5 每一次 7-Zip 调用都带 -p；候选密码只用 `t`（头部加密时用 `l`）验证，绝不用 `x`；
 //      只在验证成功之后缓存密码；密码值绝不写进结果/日志/报告（只记「候选序号 + 来源类别」）。
 //
@@ -137,6 +137,49 @@ namespace Rerar.Core
         private const string Ole2ContainerReason =
             "OLE2 复合文档（.doc/.xls/.ppt/.msi 一类），不是压缩包 —— 不递归、原件一律保留" +
             "（头部签名 D0 CF 11 E0 A1 B1 1A E1：里面的「流」是文档的内部结构，不是可解压的成员）";
+
+        // 【本轮 Critical】本工具**设计上**支持的归档族（规格里的「网盘资源包 + 普通嵌套包」：
+        // zip / rar / 7z / tar / gz / bz2 / xz 这一批）。判定依据不是我们的签名表，而是 **7-Zip
+        // 自己报的**归档类型（ArchiveIndex.Type，从 `7z l -slt` 归档属性段的 `Type = …` 里读出来）。
+        //
+        // 【为什么是白名单，不是黑名单（控制方裁定，逐字记进报告）】黑名单是逐族打地鼠：挡了
+        // Compound 就漏 PE，挡了 PE 就漏 Chm，7-Zip 每学会一个新格式就再开一扇门，而且**失败方向
+        // 是开放的**。这一侧完全不对称（多拒一次的代价是「用户拿不到文件、原件照旧在」，漏拒一次的
+        // 代价是**用户的原文件被拆散甚至被回收**），所以必须失败在**关闭**的一侧。
+        // 接受的代价：`.cab` / `.iso` / `.msi` / `.msg` 等不再能解包 —— 那是一次诚实的跳过，原件保留，
+        // 正是该失败的那一侧（判词把这个代价明说给用户）。
+        //
+        // 比较一律**大小写不敏感**，因为类型名的大小写由 7-Zip 自己决定（实测 `wim` 小写、`Rar` 大写）。
+        private static readonly string[] SupportedArchiveTypes = new string[]
+        {
+            "7z", "zip", "Rar", "Rar5", "tar", "gzip", "bzip2", "xz"
+        };
+
+        // 非白名单容器的判词（用户可见中文）。三件事必须说清：7-Zip 眼里它到底是什么、它不属于本
+        // 工具支持的族、以及「原件一律保留」这条处置。最后一句把**接受的代价**明说给用户（宁可如实
+        // 跳过，也绝不把内部结构当成可解压载荷）—— 不说清的话，用户只会看到「一个 .iso 解不开」。
+        private static string NonSupportedContainerReason(string type)
+        {
+            string shown = string.IsNullOrEmpty(type) ? "（7-Zip 没有报出类型）" : type;
+            return "7-Zip 把这份文件识别为「" + shown + "」容器，不属于本工具支持的压缩包格式" +
+                "（7z / zip / Rar / Rar5 / tar / gzip / bzip2 / xz）——不是压缩包，不递归、原件一律保留" +
+                "（.cab/.iso/.msi/.msg 与可执行文件一类的容器本工具**刻意不解包**：里面的「成员」是它的" +
+                "内部结构，不是可解压的载荷；宁可如实跳过，也绝不把它拆散后当成一次成功）";
+        }
+
+        // 归档类型在不在白名单里。**读不到类型 = 未知 = 不在白名单**（fail safe）：
+        // 「不知道它是什么」绝不能变成「放它过去」——那正是本轮那扇门得以敞开的原因。
+        private static bool IsSupportedArchiveType(string type)
+        {
+            if (string.IsNullOrEmpty(type)) { return false; }
+
+            string trimmed = type.Trim();
+            for (int i = 0; i < SupportedArchiveTypes.Length; i++)
+            {
+                if (string.Equals(SupportedArchiveTypes[i], trimmed, StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
 
         // 目录/文件名的尝试上限：畸形输入（例如目标名全部被占用）不得变成死循环。
         private const int MaxNameAttempts = 500;
@@ -562,6 +605,41 @@ namespace Rerar.Core
             {
                 return Reject(result, ArchiveStatus.Failed,
                     "无法读取归档清单（不是压缩包或已损坏，7-Zip 退出码 " + index.ExitCode + "）：原包保留");
+            }
+
+            // --- 3b) 【本轮 Critical】归档**类型**门控：7-Zip 自己报的 Type 不在白名单里 ⇒ 拒绝 ---
+            // 【关掉的是哪一扇门】复审用一份**真 shipped 文件**复现：真 PE（头 4D 5A 90 00）、尾部
+            // 64KB 里恰好有 zip 标记 ⇒ Sniffer 判 DamagedHeader（这一档被 IsArchiveKind **故意**
+            // 保留给「防和谐」抢救）⇒ 7-Zip 按真身打开它（`Type = PE`，条目 .text/.rsrc/…）⇒
+            // 而 ArchiveGater 的标记全是 **zip 内容身份**，PE 一个都没有 ⇒ Allow ⇒ 可执行文件被
+            // 「成功解压」成「<名字>.dll (2)\」，开删除即回收、不开删除也原位拆散。
+            // 根因不是「少了一个头部签名」（那是打地鼠），而是**没有任何一层问过 7-Zip 它到底是什么**。
+            //
+            // 【为什么在 ListingFailed 之后、gater 之前】类型是 7-Zip 打开文件之后才有的结论，所以只能
+            // 在清单之后；但它比 gater 的**条目名启发式**更本质（gater 对整族非 zip 容器结构性看不见），
+            // 所以排在 gater 之前先按类型做一次硬身份判定。
+            //
+            // 【拒绝语义：与 gater 裁定 ContainerDocument **完全同一条路**】同一个
+            // Reject(SkippedContainer) ⇒ 不递归、不删除、不留输出目录。I4 的三条断言照旧全部成立，
+            // 而且是**平凡**成立的：这一档排在暂存/解压/提交/删除**之前**（删除闸门在第 12 步，
+            // 只认 `Status == Completed`，而这里的状态根本不是 Completed）—— 所以它顺带钉住了
+            // 「类型门控排在删除闸门之前」这条顺序。
+            //
+            // 【「强制按压缩包尝试」刻意**不**覆盖它】与 gater 一致：ForceTreatAsArchive 只放开
+            // **格式识别门控**（§6.1 的逐项动作），从不放开「这一族是不是本工具支持的压缩包」。
+            // 一份 .docx 被强制后照样被 I4 拒绝，一份 .wim/.cab/.iso 被强制后同样在这里被拒绝。
+            // 用户确实点过强制时，判词里仍然如实留下那条记录（Reject 用 AppendMessage 追加）。
+            //
+            // 【保留 round-1 的 OLE2 头部签名那一档】见上面第 1b 步：那一层不需要清单、7-Zip 不在或
+            // 清单读不出来时照样成立；这一层覆盖它覆盖不到的一切其它族。两层都在，是纵深防御。
+            if (!IsSupportedArchiveType(index.Type))
+            {
+                if (forced)
+                {
+                    result.Message = AppendMessage(result.Message,
+                        "已按用户要求「强制按压缩包尝试」（跳过格式识别门控：" + DescribeKind(kind) + "）");
+                }
+                return Reject(result, ArchiveStatus.SkippedContainer, NonSupportedContainerReason(index.Type));
             }
 
             // --- 4) 门控（I4；必须在 Read 之后；拒绝 ⇒ 不递归、不删除）---

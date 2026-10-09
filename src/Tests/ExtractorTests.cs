@@ -677,7 +677,13 @@ internal sealed class ExtractorTests : TestBase
         // 7-Zip 认识的真归档 ⇒ 正常解出；强制一份非归档 ⇒ 如实失败、绝不报成功、原包保留。
         // ==================================================================
 
-        H.Run("Extract.ForcedUnknownFormatIsAttempted", delegate {
+        // 【本轮 Critical 修正了这条用例的期望值】旧名字是 Extract.ForcedUnknownFormatIsAttempted，
+        // 期望「强制一份 Sniffer 不认识的 .wim ⇒ Completed」。本轮裁定把**白名单**立成了权威：
+        // 7-Zip 自己报的 `Type = wim` 不在 `7z/zip/Rar/Rar5/tar/gzip/bzip2/xz` 里 ⇒ 这一族（连同
+        // .cab/.iso/.msi/.msg 与可执行文件）**刻意不再解包**，强制也不放开它（强制只放开**格式识别**
+        // 门控，从不放开容器族的白名单 —— 与「强制一份 .docx 也照样被 I4 拒绝」同一条语义）。
+        // 接受的代价就是「诚实跳过 + 原件保留」，见本轮报告。
+        H.Run("Extract.ForcedNonWhitelistedContainerTypeIsRefused", delegate {
             string wim = TestEnv.UnknownFormatWim;
 
             // 先证明它**默认会被格式门控跳过**（否则这条用例根本没测到「强制」这件事）。
@@ -686,12 +692,18 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(skipped.Results[0].Message.Contains("无法识别"));
             AssertFalse(Directory.Exists(TestEnv.OutOf(wim)));
 
+            // 7-Zip 报的是 Type = wim（不在白名单）⇒ 走与 gater 裁定 ContainerDocument **同一条**
+            // Reject(SkippedContainer)，一个字节都不写盘、原件保留。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, wim, null).Type, "wim");
             RunSummary forced = TestEnv.RunExtractForced(wim);
-            AssertEq(forced.Results[0].Status, ArchiveStatus.Completed);      // 真的被解出来了
-            AssertTrue(forced.Results[0].Message.Contains("强制"));
-            AssertTrue(forced.Results[0].Files > 0);
-            AssertTrue(File.Exists(TestEnv.OutOf(wim, "hello.txt")));         // 产物在盘上（I1 校验通过）
-            AssertTrue(File.Exists(wim));                                    // I3：原包保留
+            AssertEq(forced.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(forced.Results[0].Message.Contains("强制"));            // 用户点过的动作照样留痕
+            AssertTrue(forced.Results[0].Message.Contains("wim"));             // 判词点名真实类型
+            AssertTrue(forced.Results[0].Message.Contains("不是压缩包"));
+            AssertEq(forced.Results[0].OutputDir, "");
+            AssertFalse(Directory.Exists(TestEnv.OutOf(wim)));
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);
+            AssertTrue(File.Exists(wim));
         });
 
         // 强制**不是**「跳过校验」：非归档被强制后 7-Zip 读不出清单 ⇒ 必须 Failed（I1），
@@ -802,6 +814,110 @@ internal sealed class ExtractorTests : TestBase
             AssertTrue(File.Exists(doc));                                // **原件必须还在**
             AssertEq(Sha256(doc), before);
             AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);
+        });
+
+        // ==================================================================
+        // 【本轮 Critical】归档**类型**白名单：7-Zip 自己报的 `Type` 不在白名单里 ⇒ 按容器文档拒绝
+        //
+        // 剩余的那扇门（复审用真文件复现）：一份**真 PE** 的头部是 4D 5A 90 00、尾部 64KB 里恰好
+        // 有 zip 标记 ⇒
+        //   1. Sniffer 的签名表认不出它，尾部有 PK\x05\x06 ⇒ 判 **DamagedHeader**；
+        //   2. IsArchiveKind **故意**包含 DamagedHeader（「防和谐」抢救功能，必须保留）；
+        //   3. 于是它落 7-Zip 兜底，而 7-Zip 按它的真身打开（`Type = PE`，条目是 .text/.rsrc/…）；
+        //   4. ArchiveGater 的标记全是 **zip 内容身份**（[Content_Types].xml/_rels/mimetype…），
+        //      PE 一个都没有 ⇒ Allow；
+        //   5. 校验「成功」⇒ status=Completed ⇒ 开删除就把它回收；不删除也把它**原位拆散**。
+        // 修法不是再加头部签名（那就是打地鼠），而是**按 7-Zip 自己报的归档类型**放行白名单。
+        // ==================================================================
+
+        // 非强制、不删除：真 PE 容器必须走与 gater 裁定 ContainerDocument **完全相同**的收场。
+        H.Run("Extract.NonWhitelistedContainerTypeIsRefused", delegate {
+            string pe = TestEnv.PeContainerWithZipTail;
+            string before = Sha256(pe);
+
+            // 夹具形状自检：它必须真的走到那条门（而不是被签名表提前拦下）。
+            AssertEq(SniffOf(pe), SniffKind.DamagedHeader);
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, pe, null).Type, "PE");
+
+            RunSummary s = TestEnv.RunExtract(pe);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(s.Results[0].Message.Contains("PE"));              // 判词点名 7-Zip 报的真实类型
+            AssertTrue(s.Results[0].Message.Contains("不是压缩包"));
+            AssertEq(s.Results[0].OutputDir, "");                          // 没有输出去向
+            AssertFalse(Directory.Exists(TestEnv.OutOf(pe)));              // 连输出目录都没建
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);   // 一个字节都没写盘
+            AssertEq(Sha256(pe), before);                                  // 原件逐字节不变
+        });
+
+        // 删除开关打开：这一条同时钉住「类型门控排在删除闸门**之前**」——
+        // 修复前它是 Completed（I3 允许删除的唯一状态），于是原件被回收。
+        H.Run("Extract.NonWhitelistedContainerIsNeverDeleted", delegate {
+            string pe = CopyToTmp(TestEnv.PeContainerWithZipTail, "pe-container-delete.dll");
+            string before = Sha256(pe);
+
+            RunSummary s = TestEnv.RunExtractWithDelete(pe);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(File.Exists(pe));                                   // **原件必须还在**
+            AssertEq(Sha256(pe), before);
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);
+        });
+
+        // 白名单本身：本工具**设计上**支持的那几族必须照样被接受。
+        // 真 zip / 真 7z（分卷：属性段里 Type 出现两次，必须取最后那一个）/ 零头抢救 zip 三条都钉。
+        H.Run("Extract.WhitelistedContainerTypesAreStillAccepted", delegate {
+            // ① 真 zip
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.PlainZip, null).Type, "zip");
+            RunSummary zip = TestEnv.RunExtract(TestEnv.PlainZip);
+            AssertEq(zip.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(File.Exists(TestEnv.OutOf(TestEnv.PlainZip, "a.txt")));
+
+            // ② 真 7z（分卷包：清单里先 `Type = Split`、最后才是 `Type = 7z` ⇒ 必须取最后那一个）
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SplitVolume7z, null).Type, "7z");
+            RunSummary seven = TestEnv.RunExtractWithPassword(TestEnv.SplitVolume7z, "SECRET");
+            AssertEq(seven.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(File.Exists(TestEnv.OutOf(TestEnv.SplitVolume7z, "big.bin")));
+
+            // ③ 「防和谐」抢救形状（头部清零、Type 仍是 zip）—— 见下一条用例的完整断言。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.ZeroedHeadZip, null).Type, "zip");
+        });
+
+        // 「防和谐」抢救功能必须活着：一份**头部被清零**的真 zip（Sniffer 判 DamagedHeader、
+        // 7-Zip 仍报 `Type = zip`）必须照样被完整解出来。这条存在的意义就是让「用白名单把门关死」
+        // 这种修法当场变红 —— 抢救能力是**功能**，不是漏洞。
+        // Completed 正是 I3 允许删除的唯一状态，所以「仍然可删」这一半也一并成立。
+        H.Run("Extract.ZeroedHeadZipIsStillSalvaged", delegate {
+            string zip = TestEnv.ZeroedHeadZip;
+            string before = Sha256(zip);
+
+            AssertEq(SniffOf(zip), SniffKind.DamagedHeader);              // 头部没有 PK\x03\x04 签名
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, zip, null).Type, "zip");   // 7-Zip 仍报 zip
+
+            RunSummary s = TestEnv.RunExtract(zip);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.Completed);        // 抢救**成功**，没有被门控拒掉
+            AssertTrue(File.Exists(TestEnv.OutOf(zip, "a.txt")));
+            AssertTrue(File.Exists(TestEnv.OutOf(zip, "b.txt")));
+            AssertTrue(File.Exists(TestEnv.OutOf(zip, "docs", "readme.md")));
+            AssertEq(Sha256(zip), before);
+        });
+
+        // 反向：白名单**不是**把「强制」这项功能关掉。一份后缀是「下载中」（.part）但内容其实是
+        // 完整 zip 的文件，默认被格式门控跳过；强制之后 7-Zip 报 `Type = zip`（白名单命中）
+        // ⇒ 照旧解出来。强制只放开格式识别门控，白名单只按归档类型放行，两者互不吞掉对方。
+        H.Run("Extract.ForcedDownloadSuffixZipIsStillAttempted", delegate {
+            string part = CopyToTmp(TestEnv.PlainZip, "forced-plain.part");
+
+            RunSummary skipped = TestEnv.RunExtract(part);
+            AssertEq(skipped.Results[0].Status, ArchiveStatus.SkippedUnreadable);
+            AssertTrue(skipped.Results[0].Message.Contains("下载"));
+
+            RunSummary forced = TestEnv.RunExtractForced(part);
+            AssertEq(forced.Results[0].Status, ArchiveStatus.Completed);
+            AssertTrue(forced.Results[0].Message.Contains("强制"));
+            AssertTrue(File.Exists(TestEnv.OutOf(part, "a.txt")));
+            AssertTrue(File.Exists(part));
         });
 
         // ==================================================================

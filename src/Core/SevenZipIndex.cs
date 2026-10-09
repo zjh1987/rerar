@@ -64,6 +64,9 @@
 //     用最后一个 '=' 或要求整行只有一个 '=' 都会把名字截断。
 //   * 缺 `Size =`（目录、部分元数据缺失）按 0 处理，绝不因此丢掉条目；负数等畸形值同样按 0。
 //   * 输入末尾没有空行（stdout 被截断、最后一个键写到一半）时，最后一块照样算数。
+//   * 归档属性段里的 `Type = …`（归档**类型**）也要如实带出来（ArchiveIndex.Type）：它是调用方
+//     白名单门控的唯一依据。分卷清单里它出现两次（先 `Type = Split` = 卷容器，最后才是包自己的
+//     类型），所以取**最后**一个；读不到时是 null = 「未知」，调用方必须按**不在白名单**处理。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -117,6 +120,22 @@ namespace Rerar.Core
         // 索引 0 个文件」就会被读成「完整」，接着删除原包 —— 正是本项目最怕的方向。控制方已核准
         // 这一扩展（brief 的四字段是下限，不是上限）。
         public bool ListingFailed;
+
+        // 【本轮 Critical：归档级别的**类型**】7-Zip 自己在归档属性段里报的那一行 `Type = …`
+        //（实测：`zip` / `7z` / `Rar` / `Rar5` / `tar` / `gzip` / `bzip2` / `xz` / `PE` / `Compound` /
+        // `Chm` / `Cab` / `wim` / `Iso` / …，大小写由 7-Zip 自己决定，例如 `wim` 是小写、
+        // `Rar` 是大写）。
+        //
+        // 为什么必须有它：**形态**（头部签名）只能一档一档地补，补一档漏一族；而 7-Zip 已经把它
+        // 眼里的归档类型写在清单里了。调用方（Extractor）据此放行白名单，于是「这一族是不是压缩包」
+        // 由真正打开它的那个引擎回答，而不是由我们的签名表猜。
+        //
+        // 语义（调用方必须按这个用）：
+        //   * 分卷清单里 `Type` 会出现**两次**（先 `Type = Split` = 卷容器属性，最后才是包自己的类型）
+        //     —— 这里保留**最后**那一个，否则分卷 7z 会被 `Split` 顶掉；
+        //   * 读不到清单、或属性段里没有 `Type` 行时是 **null** —— 它是「**未知**」，不是「安全」：
+        //     调用方必须把未知当作**不在白名单**（fail safe），绝不放行。
+        public string Type;
     }
 
     public static class SevenZipIndex
@@ -252,6 +271,9 @@ namespace Rerar.Core
             bool inEntries = false;
             IndexEntry pending = null;
 
+            // 归档属性段里的 `Type = …`（见 ArchiveIndex.Type 的说明：分卷清单里最后那一个才算）。
+            string archiveType = null;
+
             int lineStart = 0;
             for (int i = 0; i <= stdOut.Length; i++)
             {
@@ -276,7 +298,19 @@ namespace Rerar.Core
                     continue;
                 }
 
-                if (!inEntries) { continue; }                                  // 前言 / 归档属性段
+                if (!inEntries)
+                {
+                    // 前言 / 归档属性段：这里唯一关心的东西是归档级别的那一行 `Type = …`。
+                    // 只按第一个 '=' 切分（与条目段同一规则），值去首尾空白。
+                    // 取**最后**一个：分卷清单里先 `Type = Split`、最后才是包自己的类型（实测）。
+                    int typeEquals = line.IndexOf('=');
+                    if (typeEquals > 0 && string.Equals(line.Substring(0, typeEquals).Trim(), "Type", StringComparison.Ordinal))
+                    {
+                        string typeValue = line.Substring(typeEquals + 1).Trim();
+                        if (typeValue.Length > 0) { archiveType = typeValue; }
+                    }
+                    continue;
+                }
 
                 if (line.Trim().Length == 0) { Flush(index, ref pending); continue; }   // 条目块结束
 
@@ -313,6 +347,7 @@ namespace Rerar.Core
             }
 
             Flush(index, ref pending);      // 输入末尾没有空行（stdout 被截断）时，最后一块照样算数
+            index.Type = archiveType;
             return index;
         }
 

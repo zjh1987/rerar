@@ -212,6 +212,30 @@ internal sealed class SevenZipIndexTests : TestBase
             // 两张索引的条目数与字节数一模一样，唯一的区别就是 ListingFailed / ExitCode。
             AssertEq(failed.FileCount, nameless.FileCount);
             AssertEq(failed.TotalBytes, nameless.TotalBytes); });
+
+        // ---- 【本轮 Critical】归档级别的 `Type` 必须能被调用方读到 ----
+        // 它是本轮「按 7-Zip 自己报的归档类型放行白名单」这条门控的**唯一**依据：读不到类型
+        //（或类型不在白名单里）必须走「不在白名单」那一侧 —— 未知绝不是放行的理由。
+        H.Run("Index.SurfacesArchiveType", delegate {
+            // 真 zip / 真 7z：逐字是 7-Zip 报的那个词。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.TwoFileZip, null).Type, "zip");
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.HeaderEncrypted7z, "SECRET").Type, "7z");
+
+            // 单流格式（bzip2）：没有成员名，但归档类型照样有（白名单里的 gzip/bzip2/xz 靠它放行）。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SingleStreamBz2, null).Type, "bzip2");
+
+            // 分卷清单里 `Type` 出现**两次**（先 `Type = Split` = 卷容器，最后才是包自己的类型）
+            // ⇒ 必须取最后那一个，否则分卷 7z 会被 Split 顶掉、落进「不在白名单」。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.SplitVolume7z, null).Type, "7z");
+
+            // 合成清单：属性段里的 Type 被解析出来（解析器本身的覆盖）。
+            AssertEq(SevenZipIndex.ParseListing(Listing("Path = a.txt\nFolder = -\nSize = 10\n")).Type, "zip");
+
+            // 读不到清单（损坏包）：没有 Type ⇒ 调用方必须把它当**未知**（未知 ⇒ 不白名单 ⇒ 拒绝）。
+            AssertEq(SevenZipIndex.Read(TestEnv.SevenZip, TestEnv.CorruptZip, null).Type, null);
+
+            // 属性段里根本没有 Type 行的清单同样没有类型（同样是「未知」，同样不许放行）。
+            AssertEq(SevenZipIndex.ParseListing("Path = x\nSize = 1\n----------\nPath = a.txt\nSize = 10\n").Type, null); });
     }
 
     // ---------------- 辅助 ----------------
