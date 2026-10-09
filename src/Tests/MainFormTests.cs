@@ -775,6 +775,217 @@ internal sealed class MainFormTests : TestBase
                 AssertTrue(lockedNotice.IndexOf(lockedFile, StringComparison.Ordinal) >= 0);
             }
         });
+
+        // ---- 日志尾部的横向滚动（用户报的「内容多的时候显示不全，还没有滚动条」） ----
+        //
+        // 【为什么这组用例不做「只看控件在不在」的空断言】只看控件存在，对一条永远为 0 的滚动范围
+        // 同样成立 —— 那正是这个缺陷活下来的方式。下面每条都作用在**产品自己的**属性上：
+        //   * HScrollBarMaximum / HScrollBarValue / MaxHOffset / HOffset 直接读那个横向滚动条的
+        //     真实 Maximum/Value，以及视图自己算出来的范围与偏移；
+        //   * 触发路径走**产品自己的**公开入口（Width/Height/HOffset 属性、SetLines），
+        //     不走测试侧重算的公式 —— 判据是「不同宽度的文本、不同的可用宽度，范围必须跟着变」，
+        //     而不是「某个数字等于多少像素」（像素随字体与 DPI 变，钉不住）。
+        // 【故意不在这里的】真的把「Shift + 滚轮」事件投进来、真的按住滚动条滑块拖：
+        // 这两种都要一条活的消息循环与真实输入，硬写就是假测试。它们的手工核验见
+        // .superpowers\fixes\log-scroll-report.md 的「无法自动化」一节。
+
+        // 日志行经常是完整的绝对中文路径（用户那次报障里就是），右侧一旦超出就再也读不到。
+        // 这条钉住：**横向滚动条真的在控件树里**，而且就是 HScrollBar 那个类型。
+        H.Run("Gui.LogTailHasAHorizontalScrollBar", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                object bar = FindScrollBar(view, "HScrollBar");
+                AssertEq(GuiProbe.TypeName(bar), "HScrollBar");
+                // 反证：竖向那根**不能**被换成横向的（两根各司其职）。
+                AssertEq(GuiProbe.TypeName(FindScrollBar(view, "VScrollBar")), "VScrollBar");
+
+                // 两根必须同时挂在同一个容器上，且父窗就是日志视图自己。
+                AssertTrue(ReferenceEquals(GuiProbe.Prop(bar, "Parent"), view));
+            }); });
+
+        // 横向范围必须由**当前可见行里最宽的那一行**决定，并且用真实字体量（TextRenderer），
+        // 不是「字符数 × 某个假设的字宽」。两条判据合起来把这件事钉死：
+        //   (a)(b) 范围 = 最宽可见行的实测宽度 - 视口宽度，多一分少一分都红；
+        //   (c)    同一条文本、同一个视口，字号放大 3 倍 ⇒ 量出来的宽度成倍变大
+        //          （按固定字宽算的实现会给出同一个数，这里当场红）。
+        H.Run("Gui.LogTailHorizontalRangeFollowsWidestVisibleLine", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 400);
+                GuiProbe.SetProp(view, "Height", 200);
+                // 两条日志行，正是本项目日志里那种完整中文路径（用户报障那次产出的就是这一条）。
+                // 刻意让两条的实测宽度拉开一大段距离：「夹具太短以致装得下」这种与本缺陷无关的
+                // 失败就不会混进来（前提在下面显式断言出来）。
+                string narrow = "E:\\中国移动广东有限公司采购代理机构工作指导手册20260826(1)\\附件3：采购文件示范文本（试行）.doc";
+                string wide = narrow + "（第二次修订版）";
+
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { "短行", narrow } });
+                int narrowRange = Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset"));
+                int narrowWidest = Convert.ToInt32(GuiProbe.Prop(view, "WidestVisibleLineWidth"));
+                int viewport = Convert.ToInt32(GuiProbe.Prop(view, "HViewportWidth"));
+                AssertTrue(viewport > 0);
+
+                // 前提自证：这个视口确实装不下那两行 —— 否则下面「范围 > 0」会因为夹具没超宽而失败，
+                // 那种失败与产品无关（前提在这里显式写出来，不让读者去猜）。
+                AssertTrue(narrowWidest > viewport);
+
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { "短行", wide } });
+                int wideRange = Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset"));
+                int wideWidest = Convert.ToInt32(GuiProbe.Prop(view, "WidestVisibleLineWidth"));
+                AssertTrue(wideWidest > narrowWidest);
+
+                // (a) 超出视口的行 ⇒ 范围非 0；更宽的行 ⇒ 更大的范围（差值就是多出来的那截字宽）。
+                // 另外：默认**不动** —— 范围是 0 起算的，日志一出来不会自己横着跳到中间。
+                AssertTrue(narrowRange > 0);
+                AssertTrue(wideRange > narrowRange);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), 0);
+
+                // (b) 【范围算得对】范围 = 最宽可见行的实测宽度 - 视口宽度，一分不多一分不少。
+                // 光断言「范围 > 0」的话，把宽度算成「字符数 × 8」这种错也照样是绿的。
+                AssertEq(narrowRange + viewport, narrowWidest);
+                AssertEq(wideRange + viewport, wideWidest);
+                AssertEq(wideRange - narrowRange, wideWidest - narrowWidest);
+
+                // (c) 【量的是「字体渲染出来的宽度」，不是「字符数 × 某个假设的字宽」】
+                // 上面 (b) 三条把「宽度 → 范围」这条算术钉死了，但它管不到「宽度本身是怎么来的」。
+                // 这里改用**同一字体下、字符数同比增减**的两条文本：中文与字母混排时宽度大致随字符数
+                // 线性增长，于是「宽度之比 ≈ 字符数之比」—— 按固定字宽硬算的实现给不出这个比例关系。
+                // 【为什么不用换字体的办法】实测在「反射载入 + 无消息循环的 STA 夹具」里给控件换
+                // Font 后再量，GDI+ 的字体映射会给出 0 宽（产品里换字体的路径由 OnFontChanged →
+                // SyncBar 覆盖；那一条没能自动化，见 .superpowers\fixes\log-scroll-report.md）。
+                double widthRatio = (double)wideWidest / narrowWidest;
+                double charRatio = (double)wide.Length / narrow.Length;
+                AssertTrue(widthRatio > charRatio);
+                AssertTrue(widthRatio < charRatio * 1.5);
+
+                // (d) 滚动条的范围必须真的等于产品算出来的可滚动量：「Maximum - LargeChange + 1」
+                // 正是 WinForms 里滑块能到达的最右位置（裸 Maximum 是文档长度，不是可滚动量）。
+                object bar = FindScrollBar(view, "HScrollBar");
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HScrollBarMaximum")), wideRange);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(bar, "Maximum")) -
+                         Convert.ToInt32(GuiProbe.Prop(bar, "LargeChange")) + 1, wideRange);
+
+                // (e) 视口比那一行还宽 ⇒ 一个字都不用滚：范围归 0，滚动条逻辑上关闭（不做无意义的滚动）。
+                GuiProbe.SetProp(view, "Width", 4000);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset")), 0);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HScrollBarMaximum")), 0);
+                AssertFalse(Convert.ToBoolean(GuiProbe.Prop(FindScrollBar(view, "HScrollBar"), "Enabled")));
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), 0);   // 范围没了 ⇒ 偏移必须回 0
+            }); });
+
+        // 偏移两端的夹取：右端不许超过「最宽可见行 - 视口」，左端不许为负；越界的赋值要被夹回来
+        //（不是静默吞掉），范围一旦不再需要就**回 0**而不是停在半路。
+        H.Run("Gui.LogTailHorizontalOffsetClampsAtBothEnds", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 400);
+                GuiProbe.SetProp(view, "Height", 120);
+                string wide = "E:\\中国移动广东有限公司采购代理机构工作指导手册20260826(1)\\附件3：采购文件示范文本（试行）.doc";
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { wide, "短行" } });
+
+                int max = Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset"));
+                AssertTrue(max > 0);                                  // 前提自证：夹具确实超出了视口
+
+                // 右端：写一个远超范围的偏移 ⇒ 停在范围上，且滚动条的 Value 与它一致。
+                GuiProbe.SetProp(view, "HOffset", max + 5000);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), max);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HScrollBarValue")), max);
+                AssertTrue(Convert.ToInt32(GuiProbe.Prop(view, "HScrollBarValue")) <=
+                           Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset")));   // 「绝不超过范围」这条契约
+
+                // 左端：负数夹回 0。
+                GuiProbe.SetProp(view, "HOffset", -1);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), 0);
+
+                // 内容换短（最宽行变窄）⇒ 原来的偏移失效，必须归 0，绝不留下越界的陈旧值。
+                GuiProbe.SetProp(view, "HOffset", max);
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { "短行" } });
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset")), 0);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), 0);
+
+                // 视口变宽同理（同一个「偏移不再适用 ⇒ 回 0」的规则，走的是另一条路径：Resize）。
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { wide } });
+                GuiProbe.SetProp(view, "HOffset", Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset")));
+                GuiProbe.SetProp(view, "Width", 4000);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), 0);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HScrollBarMaximum")), 0);
+            }); });
+
+        // 竖向那根的行为**不许**被这次改动带坏：范围仍然按「尾部 2000 行」的口径走，并且滚动条
+        // 自己的 Maximum/Value 仍然自洽（Value 不超过 Maximum - LargeChange + 1，用户才拖得到底）。
+        H.Run("Gui.LogTailVerticalScrollBarStillMatchesTailSemantics", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 600);
+                GuiProbe.SetProp(view, "Height", 200);      // 十几行可见
+                int lines = 2000;                            // 就是要钉的那个尾部容量本身
+                string[] all = new string[lines];
+                for (int i = 0; i < all.Length; i++) { all[i] = "第" + i + "行"; }
+                GuiProbe.Call(view, "SetLines", new object[] { all });
+
+                int visible = Convert.ToInt32(GuiProbe.Prop(view, "VisibleLineCount"));
+                AssertTrue(visible >= 2);                    // 200px 的窗口绝不止一行
+                int first = Convert.ToInt32(GuiProbe.Prop(view, "FirstVisibleLine"));
+                AssertEq(first, lines - visible);            // 默认自动滚动 ⇒ 视口停在尾部
+
+                object bar = FindScrollBar(view, "VScrollBar");
+                int maximum = Convert.ToInt32(GuiProbe.Prop(bar, "Maximum"));
+                int large = Convert.ToInt32(GuiProbe.Prop(bar, "LargeChange"));
+                int value = Convert.ToInt32(GuiProbe.Prop(bar, "Value"));
+                AssertEq(maximum, first + visible - 1);      // 旧的 Maximum 语义原样保留
+                AssertEq(value, first);
+                AssertTrue(value <= maximum - large + 1);    // 滑块停得到底（否则最后一屏永远看不见）
+                AssertTrue(Convert.ToBoolean(GuiProbe.Prop(bar, "Enabled")));
+
+                // 行数变化 ⇒ 竖向范围跟着走（不是构造时算一次就不动了）。
+                int rangeWith2000 = maximum - Convert.ToInt32(GuiProbe.Prop(view, "VScrollBarMinimum"));
+                GuiProbe.Call(view, "SetLines", new object[] { new string[1500] });
+                int rangeWith1500 = Convert.ToInt32(GuiProbe.Prop(view, "VScrollBarMaximum")) -
+                                    Convert.ToInt32(GuiProbe.Prop(view, "VScrollBarMinimum"));
+                AssertTrue(rangeWith1500 < rangeWith2000);
+
+                // 行数少于可视行数 ⇒ 竖向范围 0、滚动条关闭（与横向那条的语义一致）。
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { "只有一行" } });
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "VScrollBarMaximum")), 0);
+                AssertFalse(Convert.ToBoolean(GuiProbe.Prop(FindScrollBar(view, "VScrollBar"), "Enabled")));
+            }); });
+
+        // 长行真的能读到末尾：把偏移推到范围上（最右），偏移仍然合法，而且这时候**可见行没有变**
+        // —— 横向滚动不许把纵向视口带跑（用户正在看的那一行必须还在原地）。
+        H.Run("Gui.LogTailLongLineStaysReachableAtFullOffset", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 360);
+                GuiProbe.SetProp(view, "Height", 160);
+                GuiProbe.Call(view, "SetLines", new object[] {
+                    new string[] { "第一行",
+                        "E:\\中国移动广东有限公司采购代理机构工作指导手册20260826(1)\\附件3：采购文件示范文本（试行）.doc",
+                        "第三行" } });
+
+                int firstBefore = Convert.ToInt32(GuiProbe.Prop(view, "FirstVisibleLine"));
+                int max = Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset"));
+                AssertTrue(max > 0);                     // 前提自证：这一行真的超出了视口
+
+                GuiProbe.SetProp(view, "HOffset", max);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), max);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "FirstVisibleLine")), firstBefore);
+
+                // 最右端时「偏移 + 视口宽度」必须**恰好盖住**那一整段文本（= 最宽可见行的实测宽度）：
+                // 这是「末尾可达」的程序化判据 —— 少一像素就说明尾巴还差一点读不到。
+                // 不写像素常量：视口宽度、范围、最宽行宽三者都由产品自己给，判据是它们之间的关系。
+                int viewport = Convert.ToInt32(GuiProbe.Prop(view, "HViewportWidth"));
+                int widest = Convert.ToInt32(GuiProbe.Prop(view, "WidestVisibleLineWidth"));
+                AssertTrue(viewport > 0);
+                AssertEq(max + viewport, widest);        // 不多不少：正好滚到最后一列
+            }); });
+    }
+
+    // 在日志视图的**直接子控件**里按类型名找滚动条（GuiProbe 没有按类型找控件的方法）。
+    // 找不到就抛：控件被换类型/删掉必须算 FAIL，绝不能静默跳过（与 GuiProbe.Find 同一立场）。
+    private static object FindScrollBar(object view, string typeName)
+    {
+        int count = GuiProbe.ControlCount(view);
+        for (int i = 0; i < count; i++)
+        {
+            object child = GuiProbe.PropPath(view, "Controls[" + i + "]");
+            if (string.Equals(GuiProbe.TypeName(child), typeName, StringComparison.Ordinal)) { return child; }
+        }
+        throw new InvalidOperationException("日志视图的直接子控件里没有 " + typeName + "（共 " + count + " 个子控件）");
     }
 
     private static bool MenuItemEnabled(object menu, int index)

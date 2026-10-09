@@ -3264,19 +3264,37 @@ namespace Rerar
     }
 
     // ======================================================================
-    // 界面日志尾部：**自绘虚拟化**环形缓冲视图（J4）。
+    // 界面日志尾部：**自绘虚拟化**环形缓冲视图（J4 + 横向滚动修复）。
     //   * 只绘制可见的那几十行（O(可见行)，与总行数无关）；
     //   * 总容量是 MainForm.LogTailLines（2000），更老的行被丢掉（完整日志在文件里）；
-    //   * AutoScroll 关掉之后，用户往上翻时行位置保持不动（这就是「暂停自动滚动」）。
+    //   * AutoScroll 关掉之后，用户往上翻时行位置保持不动（这就是「暂停自动滚动」）；
+    //   * 右手边一根竖向滚动条、下边一根横向滚动条：本项目的日志行经常是完整的绝对中文路径，
+    //     没有横向滚动条时超出右边缘的部分**永远读不到**（这就是用户报的那个缺陷）。
+    //
+    // 【两杆的分工】横向范围只由**当前可见行里最宽的那一行**决定（用户能读到的就是这几行），
+    // 宽度一律用 TextRenderer.MeasureText 配**真实 Font** 量出来，绝不假设字宽。
+    // 于是纵向滚一下、横向范围就按新的一屏重算 —— 与虚拟化绘制同一个口径。
     // ======================================================================
     internal sealed class LogTailView : Control
     {
+        // 文本区左内边距（与绘制时的 4 像素对齐）；横向视口就是从它到竖滚动条之间。
+        private const int TextPad = 4;
+
         private readonly VScrollBar _bar;
+        private readonly HScrollBar _hbar;
         private string[] _lines = new string[0];
         private int _first;
         private int _lineHeight = 16;
         private bool _syncingBar;
         private bool _autoScroll = true;
+
+        // 横向偏移与「可见行最宽宽度」的缓存。缓存只按（起始行 + 可见行数）失效：
+        // 纵向没动时重绘不必再量一遍文字（每屏几十次 MeasureText 不便宜）。
+        private int _hOffset;
+        private int _hMaxCached;
+        private int _hCacheFirst = -1;
+        private int _hCacheVisible = -1;
+        private bool _hCacheValid;
 
         public LogTailView()
         {
@@ -3286,6 +3304,16 @@ namespace Rerar
             BackColor = Color.White;
             ForeColor = Color.FromArgb(30, 30, 30);
             TabStop = true;
+
+            // 【停靠顺序 = 角上不打架】Controls 里 index 0 是 z 序最前、停靠时**最后**处理。
+            // 所以先加横条、后加竖条 ⇒ 竖条先占满右边缘的整列高度，横条再在**剩下的**宽度里
+            // 铺底 —— 横条自然就短了竖条那一截，角上不会被两根同时认领（反过来加的话，竖条会
+            // 一直伸到控件最底部，把横条的右端压掉一截，滑块的右端就点不到了）。
+            _hbar = new HScrollBar();
+            _hbar.Dock = DockStyle.Bottom;
+            _hbar.Visible = true;
+            _hbar.ValueChanged += HBar_ValueChanged;
+            Controls.Add(_hbar);
 
             _bar = new VScrollBar();
             _bar.Dock = DockStyle.Right;
@@ -3306,10 +3334,50 @@ namespace Rerar
 
         public int LineCount { get { return _lines.Length; } }
         public int FirstVisibleLine { get { return _first; } }
+        public int VisibleLineCount { get { return VisibleLines; } }
+
+        // ---- 横向滚动的只读量（自动化用例直接读它们，见 src\Tests\MainFormTests.cs） ----
+        // 用**产品自己的**算术，而不是测试侧重算一遍公式：重算只能证明测试算得对。
+        public int MaxHOffset { get { return Math.Max(0, MaxLineWidth() - HViewportWidth); } }
+
+        // 横向偏移：**读写**都在这儿，越界一律夹回 [0, MaxHOffset]（这是「偏移绝不超过范围」
+        // 这条契约的唯一执行点；写进来的值不会让滚动条停在一个非法位置上）。
+        public int HOffset
+        {
+            get { return _hOffset; }
+            set { SetHOffset(value); }
+        }
+
+        public int HViewportWidth { get { return TextAreaWidth; } }
+
+        // 当前可见行里最宽的那一行的实测宽度（TextRenderer + 真实 Font 量的）。
+        // 暴露它是为了让「范围算得对」这条判据可断言：MaxHOffset == WidestVisibleLineWidth - HViewportWidth
+        // 应当恒成立（用例 Gui.LogTailHorizontalRangeFollowsWidestVisibleLine 钉住它）。
+        public int WidestVisibleLineWidth { get { return MaxLineWidth(); } }
+        public int HScrollBarMinimum { get { return _hbar.Minimum; } }
+
+        // 【注意这两个名字的语义】WinForms 的 ScrollBar.Maximum 不是「最大可滚动量」，而是
+        // 「文档长度」：滑块最右时 Value = Maximum - LargeChange + 1。本类的口径统一为**可滚动量**
+        //（= Maximum - LargeChange + 1，也就是 HOffset 的上界），所以这里做那次换算 ——
+        // 用例断言的就是用户真正能滚多远，而不是 WinForms 那个容易读错的裸值。
+        public int HScrollBarMaximum { get { return Math.Max(0, _hbar.Maximum - _hbar.LargeChange + 1); } }
+        public int HScrollBarLargeChange { get { return _hbar.LargeChange; } }
+        public int HScrollBarValue { get { return _hbar.Value; } }
+
+        // ---- 竖向滚动条的只读量（把「范围语义没被改坏」变成可断言的事实） ----
+        public int VScrollBarMinimum { get { return _bar.Minimum; } }
+        public int VScrollBarMaximum { get { return _bar.Maximum; } }
+        public int VScrollBarValue { get { return _bar.Value; } }
 
         private int VisibleLines
         {
             get { return Math.Max(1, (ClientSize.Height - 2) / _lineHeight); }
+        }
+
+        // 文本区（不含竖滚动条与 4 像素内边距）的宽度。
+        private int TextAreaWidth
+        {
+            get { return Math.Max(10, ClientSize.Width - (_bar.Visible ? _bar.Width : 0) - TextPad); }
         }
 
         // 只在 **UI 线程**调用（MainForm 的心跳里）。
@@ -3321,6 +3389,7 @@ namespace Rerar
         {
             _lines = lines == null ? new string[0] : lines;
             _lineHeight = Math.Max(12, Font.Height);
+            _hCacheValid = false;          // 行内容变了 ⇒ 最宽行必须重量
 
             if (_autoScroll)
             {
@@ -3348,24 +3417,131 @@ namespace Rerar
 
         private void SyncBar()
         {
+            int max = Math.Max(0, _lines.Length - VisibleLines);
+            _bar.Minimum = 0;
+            _bar.Maximum = max <= 0 ? 0 : max + VisibleLines - 1;
+            _bar.LargeChange = Math.Max(1, VisibleLines);
+            _bar.SmallChange = 1;
+
+            // 【这里原来是一个 `catch (Exception) { }` —— 已删掉，理由如下】
+            // 它把 ArgumentOutOfRangeException（例如 Value 越界）整个吞掉，症状是「滚动条静默停在
+            // 上一次的范围上」——这一整类 bug 就是这样活下来的：任何测试都看不见它。
+            // 现在改成**可证明不会越界**的写法而不是再包一层 catch：
+            //   Minimum ≤ Maximum 恒成立（Maximum ≥ 0 = Minimum）；
+            //   Value = Min(_first, Maximum - LargeChange + 1)，而 _first ≥ 0 且
+            //   Maximum - LargeChange + 1 = max ≥ 0 ⇒ Value 同时也 ≤ Maximum（ScrollBar 的另一条约束）。
+            // 万一将来有人改坏了这段算术，下面这条断言在 Debug 里当场炸出来，而不是悄悄留下陈旧范围。
+            int value = Math.Min(_first, Math.Max(_bar.Minimum, _bar.Maximum - _bar.LargeChange + 1));
+
             _syncingBar = true;
             try
             {
-                int max = Math.Max(0, _lines.Length - VisibleLines);
-                _bar.Minimum = 0;
-                _bar.Maximum = max <= 0 ? 0 : max + VisibleLines - 1;
-                _bar.LargeChange = Math.Max(1, VisibleLines);
-                _bar.SmallChange = 1;
-                _bar.Value = Math.Min(_first, Math.Max(_bar.Minimum, _bar.Maximum - _bar.LargeChange + 1));
-                _bar.Enabled = max > 0;
-            }
-            catch (Exception)
-            {
+                _bar.Value = value;
             }
             finally
             {
                 _syncingBar = false;
             }
+            _bar.Enabled = max > 0;
+
+            System.Diagnostics.Debug.Assert(_bar.Value >= _bar.Minimum && _bar.Value <= _bar.Maximum,
+                "竖向滚动条的值越出了自己的范围：算术被改坏了");
+
+            SyncH();
+        }
+
+        // 横向范围/偏移：只按**当前可见行里最宽的那一行**算，并把它夹进 [0, max - viewport]。
+        // 范围一旦不再需要（内容变窄、视口变宽）偏移必须**回 0** —— 留着陈旧偏移会让用户下次
+        // 打开日志时凭空看不到左边一半。
+        private void SyncH()
+        {
+            int maxOffset = MaxHOffset;
+            if (_hOffset > maxOffset) { _hOffset = maxOffset; }
+            if (_hOffset < 0) { _hOffset = 0; }
+
+            // 【坐标换算 —— 这里有一个不写清楚就必然踩中的坑】WinForms 的 ScrollBar 里
+            // 「滑块能到达的最右位置」是 Maximum - LargeChange + 1，不是 Maximum。所以想让
+            // 滑块正好能在 [0, maxOffset] 里滑动，必须设 Maximum = maxOffset + LargeChange - 1；
+            // 直接把 Maximum 设成 maxOffset、又把 LargeChange 设成视口宽度（视口比 maxOffset 还宽时），
+            // 可滚动量就成了 maxOffset - 视口 + 1 ≤ 0 —— **滑块动不了**，横向滚动条形同虚设。
+            int largeChange = Math.Max(1, HViewportWidth);
+            _hbar.Minimum = 0;
+            _hbar.LargeChange = largeChange;
+            _hbar.Maximum = maxOffset <= 0 ? 0 : maxOffset + largeChange - 1;
+            _hbar.SmallChange = 16;
+
+            _syncingHBar = true;
+            try
+            {
+                // 换算之后 Value ∈ [0, maxOffset] 恒在 [Minimum, Maximum - LargeChange + 1] 之内，
+                // 不会抛 ArgumentOutOfRangeException（这正是以前那个 `catch (Exception) { }` 吞掉的东西）。
+                _hbar.Value = _hOffset;
+            }
+            finally
+            {
+                _syncingHBar = false;
+            }
+            _hbar.Enabled = maxOffset > 0;
+
+            System.Diagnostics.Debug.Assert(_hbar.Value <= _hbar.Maximum - _hbar.LargeChange + 1,
+                "横向滑块能到达的最右位置比重叠范围还小：算术被改坏了");
+        }
+
+        private bool _syncingHBar;
+
+        // 可见行里最宽的那一行有多宽（像素），用真实 Font 量。
+        // 缓存按（起始行 + 可见行数）失效：纵向没动时重复重绘不再量文字。
+        private int MaxLineWidth()
+        {
+            int visible = VisibleLines;
+            if (_hCacheValid && _hCacheFirst == _first && _hCacheVisible == visible)
+            {
+                return _hMaxCached;
+            }
+
+            int widest = 0;
+            bool first = true;
+            for (int i = 0; i < visible; i++)
+            {
+                int index = _first + i;
+                if (index >= _lines.Length) { break; }
+
+                string line = _lines[index];
+                if (string.IsNullOrEmpty(line)) { continue; }
+
+                if (first)
+                {
+                    // 【预热】换过字体的那一刻（OnFontChanged 里紧接着就会调到这里）GDI 的字体映射还
+                    // 没建立，第一次 MeasureText 可能返回 0 宽 —— 那会把「横向范围 = 0」缓存下来，
+                    // 于是滚动条静默消失（正是本缺陷的形态）。先用空串量一次把映射建立起来，再量真的。
+                    TextRenderer.MeasureText(" ", Font, new Size(int.MaxValue, int.MaxValue),
+                        TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                    first = false;
+                }
+
+                Size measured = TextRenderer.MeasureText(line, Font, new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                if (measured.Width > widest) { widest = measured.Width; }
+            }
+
+            _hMaxCached = widest;
+            _hCacheFirst = _first;
+            _hCacheVisible = visible;
+            _hCacheValid = true;
+            return widest;
+        }
+
+        // 把 _hOffset 夹回合法范围并同步滚动条。用例直接调它来钉「两端都夹得住」。
+        public void EnsureHOffsetInRange()
+        {
+            SyncH();
+        }
+
+        private void SetHOffset(int value)
+        {
+            if (value < 0) { value = 0; }
+            _hOffset = value;
+            SyncH();
         }
 
         private void Bar_ValueChanged(object sender, EventArgs e)
@@ -3375,21 +3551,43 @@ namespace Rerar
             ScrollTo(_bar.Value);
         }
 
+        private void HBar_ValueChanged(object sender, EventArgs e)
+        {
+            if (_syncingHBar) { return; }
+            // 横向滚动**不动纵向视口**、也不关掉「跟随尾部」：用户要读的是最新那几行的右半截。
+            _hOffset = _hbar.Value;
+            Invalidate();
+        }
+
         protected override void OnFontChanged(EventArgs e)
         {
             base.OnFontChanged(e);
             _lineHeight = Math.Max(12, Font.Height);
+            _hCacheValid = false;   // 行宽是按字体量的 ⇒ 换字体必须重量
+            // 而且要**当场**把范围与偏移重算一遍：字号变小时原来的横向偏移会越界、范围会变小，
+            // 不重算就会把陈旧的范围留给滚动条（换字体不是 Resize，走不到 OnResize 那条路）。
+            SyncBar();
         }
 
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
-            SyncBar();
+            SyncBar();       // 内部会 SyncH：视口变宽 ⇒ 范围变小 ⇒ 偏移夹回（必要时归 0）
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
+
+            // Shift + 滚轮 = 横向滚动（长行读尾巴的快捷键，与 Windows 上多数文本框一致）。
+            if ((Control.ModifierKeys & Keys.Shift) == Keys.Shift)
+            {
+                EnsureHOffsetInRange();
+                int steps = e.Delta / 120;
+                SetHOffset(_hOffset - steps * 3 * _hbar.SmallChange);
+                return;
+            }
+
             int lines = SystemInformation.MouseWheelScrollLines;
             if (lines <= 0) { lines = 3; }
             int delta = (e.Delta / 120) * lines;
@@ -3407,6 +3605,9 @@ namespace Rerar
                 case Keys.PageDown:
                 case Keys.Home:
                 case Keys.End:
+                // 横向：左右箭头与 Home/End（Shift+左右由它们自己那条分支处理，键码相同）。
+                case Keys.Left:
+                case Keys.Right:
                     return true;
             }
             return base.IsInputKey(keyData);
@@ -3422,34 +3623,56 @@ namespace Rerar
                 case Keys.Down: ScrollTo(_first + 1); e.Handled = true; break;
                 case Keys.PageUp: _autoScroll = false; ScrollTo(_first - page); e.Handled = true; break;
                 case Keys.PageDown: ScrollTo(_first + page); e.Handled = true; break;
-                case Keys.Home: _autoScroll = false; ScrollTo(0); e.Handled = true; break;
-                case Keys.End: _autoScroll = true; ScrollTo(int.MaxValue); e.Handled = true; break;
+                // Home/End 带 Shift 时是**横向**的「回到最左 / 跳到最右」（纵向那两条不带 Shift）。
+                case Keys.Home:
+                    if ((e.Modifiers & Keys.Shift) == Keys.Shift) { SetHOffset(0); }
+                    else { _autoScroll = false; ScrollTo(0); }
+                    e.Handled = true;
+                    break;
+                case Keys.End:
+                    if ((e.Modifiers & Keys.Shift) == Keys.Shift) { EnsureHOffsetInRange(); SetHOffset(int.MaxValue); }
+                    else { _autoScroll = true; ScrollTo(int.MaxValue); }
+                    e.Handled = true;
+                    break;
+                case Keys.Left:
+                    SetHOffset(_hOffset - _hbar.SmallChange);
+                    e.Handled = true;
+                    break;
+                case Keys.Right:
+                    SetHOffset(_hOffset + _hbar.SmallChange);
+                    e.Handled = true;
+                    break;
             }
         }
 
         // **只画可见行**：无论尾部里有多少行，一次重绘的代价都由窗口高度决定。
+        // 横向偏移只作用在这几十行上（画在「平移后的坐标」里，超出文本区的部分被裁掉），
+        // 于是水平滚动的代价同样是 O(可见行)，与总行数无关。
         protected override void OnPaint(PaintEventArgs e)
         {
-            int textRight = ClientSize.Width - (_bar.Visible ? _bar.Width : 0) - 4;
+            int textWidth = TextAreaWidth;
+            int textBottom = Math.Max(0, ClientSize.Height - (_hbar.Visible ? _hbar.Height : 0));
 
             using (SolidBrush back = new SolidBrush(BackColor))
             {
-                e.Graphics.FillRectangle(back, new Rectangle(0, 0, Math.Max(0, textRight + 2), ClientSize.Height));
+                e.Graphics.FillRectangle(back, new Rectangle(0, 0, ClientSize.Width, ClientSize.Height));
             }
 
             if (_lines.Length == 0)
             {
                 using (SolidBrush empty = new SolidBrush(Color.FromArgb(120, 120, 120)))
                 {
-                    e.Graphics.DrawString("（还没有日志）", Font, empty, new PointF(4, 2));
+                    e.Graphics.DrawString("（还没有日志）", Font, empty, new PointF(TextPad, 2));
                 }
                 return;
             }
 
+            // 只画可见行 + 只画文本区：竖滚动条那一列、横滚动条那一条都不许被文字盖住。
+            Region oldClip = e.Graphics.Clip;
+            e.Graphics.SetClip(new Rectangle(0, 0, textWidth, textBottom));
+
             using (SolidBrush fore = new SolidBrush(ForeColor))
-            using (StringFormat format = new StringFormat(StringFormatFlags.NoWrap))
             {
-                format.Trimming = StringTrimming.EllipsisCharacter;
                 int visible = VisibleLines;
                 for (int i = 0; i < visible; i++)
                 {
@@ -3458,10 +3681,15 @@ namespace Rerar
 
                     string line = _lines[index];
                     if (line == null) { continue; }
+
+                    // 整行从「左内边距 - 偏移」处开始画，右端不设裁剪框（负坐标在 GDI+ 里合法），
+                    // 于是偏移 > 0 时左边那截自然落在裁剪区之外。
                     e.Graphics.DrawString(line, Font, fore,
-                        new RectangleF(4, i * _lineHeight, Math.Max(10, textRight - 6), _lineHeight), format);
+                        new PointF(TextPad - _hOffset, i * _lineHeight));
                 }
             }
+
+            e.Graphics.Clip = oldClip;
         }
     }
 
