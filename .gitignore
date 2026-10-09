@@ -1,7 +1,8 @@
-﻿# build output
+# build output
 dist/
 *.user
 # superpowers scratch workspace (ledger, briefs, review packages)
 .superpowers/
 # test scratch
 tests/_fixtures/
+tests/obj/
