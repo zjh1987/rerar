@@ -78,6 +78,21 @@ namespace Rerar.Core
         public int Failed;           // 归档本身已完成，但内部有 N 个文件失败
         public string OutputDir;     // 解压去向（没有则为 ""）
         public string Message;       // 原因 / 诊断文本（没有则为 ""）
+
+        // 【本轮】原包的最终去向。词表与崩溃恢复日志 extract-done 明细里的 `original=` **同一个**
+        //（Extractor.DeleteEligibleOriginal 的返回值，那里是唯一的产生点）：
+        //   "kept"（默认：原包保留 —— 没开删除、没资格删、分卷集按「全部不处置」、或处置未生效）
+        //   "deleted"（已移入回收站） / "quarantined"（已移入同卷隔离文件夹 `_originals_<时间戳>`）。
+        //
+        // 【为什么日志里已经有它，这里还要再放一份】日志是**事后的**、要用户自己去找；而
+        //「退出码非 0」极容易被读成「这次什么都没被销毁」—— 两者可以同时成立（顶层包 Completed
+        // 已被处置、而某个嵌套成员没完成 ⇒ 退出码 1）。把处置带进结果对象之后，汇总行、CLI 的
+        // --json-out 与界面日志都能如实说出「处置了哪些原包」（见 Reporter.DescribeDisposedOriginals
+        // 与 Reporter.DisposedOriginalsWarning）。
+        //
+        // 【它绝不参与任何判定】删不删仍然**只**由 I3 决定（该归档自己的 Completed + 校验通过 +
+        // 用户显式开启删除）。本字段是**汇报**，读错它不会让任何一个文件被多删或少删。
+        public string OriginalDisposition = "kept";
     }
 
     // 冻结后的一个候选归档（Task 10 的「本轮候选清单」元素；PlanPlanner/JobPlanner 的产物形状）。

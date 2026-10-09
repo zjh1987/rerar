@@ -2326,6 +2326,13 @@ namespace Rerar
                           (summary.JournalProblem == null ? "" : summary.JournalProblem));
             }
 
+            // 【本轮】原包处置的诚实面（与 CLI 的汇总行**同一份实现**：Reporter 里那两段文案）。
+            // 界面上尤其不能少这一条：用户看到的是「几个失败」这类计数，而计数行与托盘气泡都不会
+            // 提到原包已经被处置过 —— 于是「有失败」很容易被读成「什么都没被销毁」。
+            AppendLog(Reporter.DescribeDisposedOriginals(summary.Results));
+            string disposedWarning = Reporter.DisposedOriginalsWarning(summary.Results, RunExitCodes.For(summary));
+            if (disposedWarning.Length > 0) { AppendLog(disposedWarning); }
+
             LogSink sink = _log;
             if (sink != null) { sink.Flush(); _logView.SetLines(sink.Snapshot()); }
 
@@ -3348,7 +3355,19 @@ namespace Rerar
             set { SetHOffset(value); }
         }
 
-        public int HViewportWidth { get { return TextAreaWidth; } }
+        public int HViewportWidth { get { return TextViewport.Width; } }
+
+        // ---- 文本视口的绘制几何（自动化用例直接读它们，见 src\Tests\MainFormTests.cs） ----
+        //
+        // 【为什么必须把它们暴露出来】「最新一行只画得出 1 像素」这个缺陷的形态恰恰是
+        //「范围算术」与「绘制裁剪」各算各的几何：只断言 VisibleLineCount > 0 的用例对它恒为绿。
+        // 真正的判据是「可见行数 × 行高 ≤ 文本区下边界」以及「最右那个像素落在裁剪区之内」，
+        // 而这两个数都必须来自**产品自己**（测试侧重算一遍公式只能证明测试算得对）。
+        public int LineHeight { get { return _lineHeight; } }
+        public int TextPadLeft { get { return TextPad; } }
+        public int TextViewportLeft { get { return TextViewport.X; } }
+        public int TextViewportWidth { get { return TextViewport.Width; } }
+        public int TextViewportHeight { get { return TextViewport.Height; } }
 
         // 当前可见行里最宽的那一行的实测宽度（TextRenderer + 真实 Font 量的）。
         // 暴露它是为了让「范围算得对」这条判据可断言：MaxHOffset == WidestVisibleLineWidth - HViewportWidth
@@ -3371,13 +3390,44 @@ namespace Rerar
 
         private int VisibleLines
         {
-            get { return Math.Max(1, (ClientSize.Height - 2) / _lineHeight); }
+            // 【本轮修复】可见行数按**文本视口**的高度算（= 客户区高 - 停靠在下边的横滚动条），
+            // 而不是完整客户区。以前这里读 ClientSize.Height，而绘制裁在横条之上：400×200、
+            // 行高 14、横条 17 时是 14 行 × 14 = 196 > 183，于是最下面那一行只画得出 1 个像素。
+            // 自动滚动又把视口停在尾部（first = 总数 - 可见行数），所以被切掉的恰恰是**最新写下的
+            // 那条日志**（而修复前 OnPaint 没有下边界裁剪，它本来是完整的 —— 这是一次回归）。
+            // 现在范围算术与绘制裁剪读**同一处**几何（TextViewport），「可见」与「画得出来」不可能
+            // 再对不上。
+            get { return Math.Max(1, (TextViewport.Height - 2) / _lineHeight); }
         }
 
-        // 文本区（不含竖滚动条与 4 像素内边距）的宽度。
+        // 文本区（不含竖滚动条与 4 像素内边距）的宽度。它就是文本视口的宽度 —— 算式只在
+        // TextViewport 里写一次（见那里的说明）。
         private int TextAreaWidth
         {
-            get { return Math.Max(10, ClientSize.Width - (_bar.Visible ? _bar.Width : 0) - TextPad); }
+            get { return TextViewport.Width; }
+        }
+
+        // 文本视口的**唯一定义**：范围算术（VisibleLines）与绘制裁剪（OnPaint 的 SetClip）都读这里。
+        //
+        // 【为什么必须只有一处】这两件事一旦各算各的，缺陷就是隐形的：范围说有 N 行可见、绘制却
+        // 只画得出 N-1 行多一点点，而任何「N > 0」的断言都是绿的。
+        //
+        // 【下边界】必须**排除停靠在下边的横滚动条**：它不是文本区，却被以前的 VisibleLines 算了进去，
+        // 于是最后一行只画得出 1 个像素（最新那条日志）。
+        //
+        // 【左边界 = TextPad 而不是 0】整行是从 x = TextPad - 水平偏移 处画起的，所以文本能用的
+        // 横向空间是 [TextPad, TextPad + 宽)。裁剪区必须与它**同一段**：以前裁剪从 x = 0 起算、
+        // 宽度却按「客户区宽 - 竖条 - TextPad」算，于是右边界少了整整一个 TextPad（4 px）——
+        // 偏移拉满时最宽那一行的最后一列永远画不出来，而「偏移 + 视口 == 最宽行宽」那条断言
+        // 对此恒为真（它只说明范围算术自洽）。现在两者都从这个矩形来，差一个像素都不可能。
+        private Rectangle TextViewport
+        {
+            get
+            {
+                int right = ClientSize.Width - (_bar.Visible ? _bar.Width : 0);
+                int bottom = ClientSize.Height - (_hbar.Visible ? _hbar.Height : 0);
+                return new Rectangle(TextPad, 0, Math.Max(10, right - TextPad), Math.Max(0, bottom));
+            }
         }
 
         // 只在 **UI 线程**调用（MainForm 的心跳里）。
@@ -3650,8 +3700,9 @@ namespace Rerar
         // 于是水平滚动的代价同样是 O(可见行)，与总行数无关。
         protected override void OnPaint(PaintEventArgs e)
         {
-            int textWidth = TextAreaWidth;
-            int textBottom = Math.Max(0, ClientSize.Height - (_hbar.Visible ? _hbar.Height : 0));
+            // 裁剪矩形与范围算术取自**同一处**几何（TextViewport）：它们以前是各算一份的，
+            // 于是「可见行数」按完整客户区算、绘制却裁在横条之上，最新那一行只画得出 1 像素。
+            Rectangle viewport = TextViewport;
 
             using (SolidBrush back = new SolidBrush(BackColor))
             {
@@ -3669,7 +3720,7 @@ namespace Rerar
 
             // 只画可见行 + 只画文本区：竖滚动条那一列、横滚动条那一条都不许被文字盖住。
             Region oldClip = e.Graphics.Clip;
-            e.Graphics.SetClip(new Rectangle(0, 0, textWidth, textBottom));
+            e.Graphics.SetClip(viewport);
 
             using (SolidBrush fore = new SolidBrush(ForeColor))
             {

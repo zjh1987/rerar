@@ -944,7 +944,9 @@ namespace Rerar.Core
             }
 
             // --- 12) 删除（默认关；只有「完成且校验通过」才有资格）---
-            // 返回值只喂给下面那条崩溃恢复记录（原包的最终去向），不参与任何安全判定。
+            // 【本轮】返回值现在有两条去路：崩溃恢复记录（原包的最终去向）**以及**结果对象的
+            // OriginalDisposition（汇总行 / --json-out / 界面日志）。两处写的是同一个值。
+            // 它仍然**不参与任何安全判定** —— 删不删只由 I3 决定，读错这个值不会多删也不会少删。
             string originalDisposition = "kept";
             if (_options.DeleteOriginals)
             {
@@ -957,6 +959,10 @@ namespace Rerar.Core
                     result.Message = AppendMessage(result.Message, "未删除原包（只有「完成且校验通过」的归档才允许删除）");
                 }
             }
+
+            // 【本轮】把处置如实带出结果对象（汇总行 / CLI --json-out / 界面日志都要用到它）。
+            // 放在 NoteJournal 之前：日志与结果对象写的是**同一个**值，绝不会出现两种说法。
+            result.OriginalDisposition = originalDisposition;
 
             // --- 13) 提交已经成功 ⇒ 落「这个目的地处理完了」的持久记录（Task 11 不可逆点 ②）---
             // 有这一条就说明这个目的地**有完成记录**（提交成功、校验也跑过了），恢复查询因此不会把它

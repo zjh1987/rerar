@@ -324,6 +324,83 @@ internal sealed class CliTests : TestBase
             AssertTrue(File.Exists(TestEnv.NestedZip));                // 但没给 --delete ⇒ 原包必须还在
         });
 
+        // 【本轮】「顶层包已完成并被回收」与「退出码非 0」可以同时成立 —— 这时
+        //「退出码 != 0 ⇒ 什么都没被销毁」是**假的**。三件事必须同时可见：
+        //   ① 人读的一行：处置了哪个原包、怎么处置的；
+        //   ② --json-out 里每条结果的 originalDisposition（脚本可读，且顶层仍然是那个数组）；
+        //   ③ 退出码非 0 **且**处置过原包 ⇒ 一条显式警告。
+        //
+        // 场景就是复核复现出来的形状：顶层包 Completed（I3 据此把它的原包处置掉），而嵌套成员
+        // 没有完成（这里用 --depth 1 让它成为 NotAttemptedDepthLimit —— 与
+        // Cli.DepthFlagListsUnprocessedWithoutDoubleCounting 走同一条路径）⇒ 退出码 1。
+        H.Run("Cli.ReportsDisposedOriginalsAndWarnsWhenExitCodeIsNotZero", delegate {
+            // 处置的是 **Tmp 里的副本**：fixture 被删会让同一轮里后续的步骤失去输入（与
+            // Journal.ExtractorRecordsAboutToDeleteBeforeDisposal、Extract.DeletesOnlyCompletedOriginal 同一约定）。
+            string target = Path.Combine(TestEnv.Tmp, "del-outer.zip");
+            File.Copy(TestEnv.NestedZip, target, true);
+
+            // 本机这一卷到底走哪条处置路径（回收站 / 隔离 / 拒绝）由 RecycleBinGuard 决定；
+            // 下面按它分支断言 —— 没有处置发生的那一支也照样在断言，不是跳过。
+            string why;
+            DeletePlan plan = RecycleBinGuard.Plan(target, out why);
+
+            CliResult r = TestEnv.RunCli("--depth", "1", "--delete", "--target", target,
+                "--json-out", TestEnv.JsonOut);
+            AssertEq(r.ExitCode, 1);                  // 嵌套项没完成 ⇒ 1（既不是 0，也不是致命的 2）
+
+            string json = ReadJson(TestEnv.JsonOut);
+            AssertJsonIsUtf8WithBomAndCompact(TestEnv.JsonOut, json);   // 顶层仍然是那个数组（契约未变）
+
+            // ① 人读的一行：无论本机走哪条路，这一行都必须存在（否则就是又把它静默了）。
+            AssertTrue(r.StdOut.IndexOf("原包处置：", StringComparison.Ordinal) >= 0);
+
+            if (plan == DeletePlan.Refuse)
+            {
+                // 本机策略连删除都不安全（非破坏性）：一个原包都没被处置 ⇒ ① 明说「没有处置任何原包」，
+                // ③ 绝不出现。JSON 里那两条都必须是 kept。
+                AssertTrue(r.StdOut.IndexOf("没有处置任何原包", StringComparison.Ordinal) >= 0);
+                AssertFalse(r.StdOut.IndexOf("⚠", StringComparison.Ordinal) >= 0);
+                AssertTrue(File.Exists(target));
+                AssertTrue(json.IndexOf("\"originalDisposition\":\"kept\"", StringComparison.Ordinal) >= 0);
+            }
+            else
+            {
+                string expected = plan == DeletePlan.Quarantine ? "quarantined" : "deleted";
+                string expectedText = plan == DeletePlan.Quarantine ? "已移入隔离文件夹" : "已移入回收站";
+
+                // 原包真的没了（回收站 / 隔离），而退出码是 1 —— 这就是那个假推理的现场。
+                AssertFalse(File.Exists(target));
+
+                // ① 清单点名了**这个**原包，并给出中文处置方式。
+                AssertTrue(r.StdOut.IndexOf(target, StringComparison.Ordinal) >= 0);
+                AssertTrue(r.StdOut.IndexOf(expectedText, StringComparison.Ordinal) >= 0);
+
+                // ② JSON：每条结果都带自己的原包去向 —— 被处置的那条是 deleted/quarantined，
+                //    没被处置的那条（嵌套项）必须是 kept。
+                AssertTrue(json.IndexOf("\"originalDisposition\":\"" + expected + "\"", StringComparison.Ordinal) >= 0);
+                AssertTrue(json.IndexOf("\"originalDisposition\":\"kept\"", StringComparison.Ordinal) >= 0);
+
+                // ③ 显式警告：退出码非 0 但已处置原包。
+                AssertTrue(r.StdOut.IndexOf("⚠", StringComparison.Ordinal) >= 0);
+                AssertTrue(r.StdOut.IndexOf("已处置 1 个原包", StringComparison.Ordinal) >= 0);
+            }
+
+            // 反向（与退出码**无关**的那一半）：同一批参数但**不开删除** ⇒ 一个原包都没处置。
+            // 这时无论退出码是不是 1：① 明说「没有处置任何原包」，③ 警告**绝不**出现。
+            // 这一支在本机一定会走到（不依赖本卷的处置策略），所以「没处置就不警告」这条判据
+            // 不靠上面那个 Refuse 分支碰运气。
+            string keep = Path.Combine(TestEnv.Tmp, "keep-outer.zip");
+            File.Copy(TestEnv.NestedZip, keep, true);
+            CliResult noDelete = TestEnv.RunCli("--depth", "1", "--target", keep,
+                "--json-out", TestEnv.JsonOut);
+            AssertEq(noDelete.ExitCode, 1);                            // 嵌套项没完成 ⇒ 同样是 1
+            AssertTrue(noDelete.StdOut.IndexOf("没有处置任何原包", StringComparison.Ordinal) >= 0);
+            AssertFalse(noDelete.StdOut.IndexOf("⚠", StringComparison.Ordinal) >= 0);
+            AssertTrue(File.Exists(keep));                             // 原包一字未动
+            AssertTrue(ReadJson(TestEnv.JsonOut).IndexOf("\"originalDisposition\":\"kept\"",
+                StringComparison.Ordinal) >= 0);                       // JSON 里如实写 kept
+        });
+
         H.Run("Cli.PasswordFlagNeverAppearsInOutput", delegate {
             CliResult r = TestEnv.RunCli("--target", TestEnv.ImportedDictZip, "--password", "ImportedSecret",
                 "--json-out", TestEnv.JsonOut);

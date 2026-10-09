@@ -136,6 +136,84 @@ namespace Rerar.Core
             WriteAllText(path, sb.ToString());
         }
 
+        // ---------------- 原包处置的诚实面（本轮新增） ----------------
+        //
+        // 【要修的是什么】RunExitCodes.For 只要**任何一个**结果不是 Completed 就返回 1（嵌套成员也算），
+        // 而 I3 的删除是**逐包**判定的（那个包自己的 Completed + 校验通过）。于是完全可能：
+        // 顶层包已解出、校验通过、原包**已被移入回收站**，而某个嵌套成员没完成 ⇒ 退出码 1。
+        // 这时「退出码非 0 ⇒ 什么都没被销毁」是**假的**，而用户此前没有任何办法知道这件事。
+        //
+        // 本轮**不改删除门**（I3 的字面语义一字不动，那一侧是复核批准过的），只把已经算出来、
+        // 已经写进崩溃恢复日志的处置**如实说出来**：一行汇总 + CLI 的一条 JSON 字段 + 一条警告。
+        //
+        // 【绝不说反话】没有处置过任何原包时也**明确写出来**（「没有处置任何原包」），而不是把那行
+        // 省掉 —— 省掉的话，「真的没处置」与「这条信息根本没打印」在用户眼里长得一样。
+
+        // 处置的中文文案。词表与 Journal 的 `original=` 字段一字对应（kept / deleted / quarantined）：
+        // 同一件事在日志与用户可见文本里必须能对上，读者不必做一次心算翻译。
+        public static string DispositionText(string disposition)
+        {
+            if (disposition == DispositionDeleted) { return "已移入回收站"; }
+            if (disposition == DispositionQuarantined) { return "已移入隔离文件夹"; }
+            return "未处置（原包保留）";
+        }
+
+        // 真的被处置掉了吗？**只有**这两个值算「已处置」：kept（以及任何未知写法）一律按「原包还在」
+        // 处理 —— 这一侧选错会把「原包还在」说成「已被销毁」，那是本项目最不能犯的错。
+        public static bool IsDisposed(string disposition)
+        {
+            return disposition == DispositionDeleted || disposition == DispositionQuarantined;
+        }
+
+        // 一次运行的原包处置汇总（人读一行）。空/null 结果集 = 没有处置任何原包。
+        public static string DescribeDisposedOriginals(IEnumerable<ArchiveResult> results)
+        {
+            List<ArchiveResult> disposed = new List<ArchiveResult>();
+            foreach (ArchiveResult r in Enumerate(results))
+            {
+                if (IsDisposed(r.OriginalDisposition)) { disposed.Add(r); }
+            }
+
+            if (disposed.Count == 0)
+            {
+                return "原包处置：本次运行没有处置任何原包（原包一律保留）";
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("原包处置：共 ").Append(Int(disposed.Count))
+              .Append(" 个原包已被处置（处置不可逆，如需找回请按下面的方式查）：");
+            for (int i = 0; i < disposed.Count; i++)
+            {
+                sb.Append(i == 0 ? "「" : "；「")
+                  .Append(Cell(disposed[i].Path)).Append("」")
+                  .Append(DispositionText(disposed[i].OriginalDisposition));
+            }
+            return sb.ToString();
+        }
+
+        // 【本轮的诚实信号】退出码非 0，但本次运行**确实处置过**原包 ⇒ 返回一条警告；否则返回 ""。
+        //
+        // 这条警告关掉的正是那个假推理：「退出码 != 0 ⇒ 什么都没被销毁」。数量与清单在
+        // DescribeDisposedOriginals 那一行里（「见上」），这里只负责把两者**同时**摆到读者眼前。
+        public static string DisposedOriginalsWarning(IEnumerable<ArchiveResult> results, int exitCode)
+        {
+            if (exitCode == RunExitCodes.Success) { return ""; }   // 退出码 0 时没有这个歧义
+
+            int disposed = 0;
+            foreach (ArchiveResult r in Enumerate(results))
+            {
+                if (IsDisposed(r.OriginalDisposition)) { disposed++; }
+            }
+            if (disposed == 0) { return ""; }                      // 没处置过就没什么可提醒的
+
+            return "⚠ 本次运行退出码非 0，但已处置 " + Int(disposed) +
+                " 个原包（见上）；如需确认，请核对其处置方式";
+        }
+
+        // 处置的词表（与 Extractor.DeleteEligibleOriginal 的返回值、Journal 的 `original=` 逐字一致）。
+        private const string DispositionDeleted = "deleted";
+        private const string DispositionQuarantined = "quarantined";
+
         // ---------------- 内部 ----------------
 
         // null 结果集按空处理、序列里的 null 元素跳过：调用方（GUI/CLI）在「什么都没解」或某个

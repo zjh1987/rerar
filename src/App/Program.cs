@@ -12,6 +12,9 @@
 //     --json-out：机器可读的结果数组，对象的键逐字是
 //                 path,status,layers,files,failed,outputDir,message（= ArchiveResult 的字段名小写）。
 //                 数组**每个归档恰好一个对象**：致命中止后没轮到的候选也在里面（修复轮 Finding 1）。
+//                 【本轮新增（加法）】每个对象末尾多一个 originalDisposition（"kept"/"deleted"/
+//                 "quarantined"）：原包的去向。既有 7 个键的名字与顺序一字未动 —— 顶层仍然是
+//                 那个数组（不改成对象），所以按数组读的脚本、验收脚本与 CliTests 全都不受影响。
 //
 // 【本文件必须自己负责的三件事】
 //   1) `--cli --selftest` 打印 version=<n> 并退出 0 —— tests\smoke.ps1 依赖的既有契约，绝不能改坏；
@@ -351,7 +354,12 @@ namespace Rerar
             // 机器读方只读 --json-out 时，否则会完全看不到这部分。
             AddUnprocessedRemainder(summary);
 
-            PrintSummary(summary);
+            // 【本轮】退出码在打印汇总**之前**算出来：汇总里那条「退出码非 0 但已处置原包」的警告
+            // 用的就是它。映射仍然只有一份实现（Rerar.Core.RunExitCodes），下面的返回值也用它 ——
+            // 打印出去的那条警告与进程真正返回的退出码因此不可能不一致。
+            int exitCode = RunExitCodes.For(summary);
+
+            PrintSummary(summary, exitCode);
 
             if (reportPath != null)
             {
@@ -373,7 +381,7 @@ namespace Rerar
                 }
             }
 
-            return RunExitCodes.For(summary);
+            return exitCode;
         }
 
         // ------------------------------------------------------------------
@@ -577,7 +585,7 @@ namespace Rerar
         // 汇总（人读）+ JSON 报告（机器读）
         // ------------------------------------------------------------------
 
-        private static void PrintSummary(RunSummary summary)
+        private static void PrintSummary(RunSummary summary, int exitCode)
         {
             Console.WriteLine(Reporter.RenderTable(summary.Results));
             Console.WriteLine("----");
@@ -644,6 +652,18 @@ namespace Rerar
                 Console.WriteLine("警告：崩溃恢复日志有 " + Int(summary.JournalWriteFailures) +
                     " 次写入失败：" + (summary.JournalProblem == null ? "" : summary.JournalProblem));
             }
+
+            // 【本轮】原包处置的诚实面（两条，顺序固定）。
+            //
+            // ① 本次运行**到底处置了哪些原包**：逐条点名 + 中文处置方式。没有处置时也明说
+            //   「没有处置任何原包」—— 一行都不打印的话，「真没处置」与「这条信息没实现」在用户
+            //   眼里长得一样，而这恰恰是本轮要修的那个静默。
+            Console.WriteLine(Reporter.DescribeDisposedOriginals(summary.Results));
+
+            // ② 退出码非 0 但处置过原包 ⇒ 明确警告。关掉的正是「退出码 != 0 ⇒ 什么都没被销毁」
+            //   这个假推理（顶层包可能已经 Completed 并被回收，而某个嵌套成员没完成）。
+            string disposedWarning = Reporter.DisposedOriginalsWarning(summary.Results, exitCode);
+            if (disposedWarning.Length > 0) { Console.WriteLine(disposedWarning); }
         }
 
         // 机器可读的结果数组。键名与顺序是跨任务契约（与 Task 8 的 CSV 列名逐字一致）。
@@ -669,6 +689,12 @@ namespace Rerar
                       .Append(",\"failed\":").Append(Int(result.Failed))
                       .Append(",\"outputDir\":").Append(JsonString(result.OutputDir))
                       .Append(",\"message\":").Append(JsonString(result.Message))
+                      // 【本轮新增（加法）】原包去向："kept" / "deleted"（已移入回收站）/ "quarantined"
+                      // （已移入隔离文件夹）。**加在末尾**：既有 7 个键的名字与顺序一字未动，按键名
+                      // 读取的脚本不受影响（Cli.JsonKeysMatchTheCrossTaskContract 钉住那 7 个键）。
+                      // 它让只读 JSON 的脚本也能看出「这次运行处置过哪些原包」——退出码非 0 与
+                      // 原包已被处置可以同时成立（见 Reporter.DisposedOriginalsWarning）。
+                      .Append(",\"originalDisposition\":").Append(JsonString(result.OriginalDisposition))
                       .Append('}');
                 }
             }

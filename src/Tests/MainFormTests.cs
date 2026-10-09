@@ -789,6 +789,52 @@ internal sealed class MainFormTests : TestBase
         // 这两种都要一条活的消息循环与真实输入，硬写就是假测试。它们的手工核验见
         // .superpowers\fixes\log-scroll-report.md 的「无法自动化」一节。
 
+        // 【本轮】原包处置的诚实面必须也落到**界面**的日志里（与 CLI 的汇总行是同一份实现：
+        // Reporter.DescribeDisposedOriginals / Reporter.DisposedOriginalsWarning）。
+        //
+        // 走产品自己的 FinishRun（与 Gui.CountersCarryTheirOwnScopeAndLogsStayReachable 同一条路径）：
+        // 造一批「顶层包已完成且原包已被处置 + 嵌套成员失败」的结果，断言那两行真的进了界面日志
+        // —— 界面上用户看到的是「几个失败」这类计数，而计数行与托盘气泡都不会提到原包已经被处置过。
+        H.Run("Gui.LogReportsDisposedOriginalsAndWarnsOnNonZeroExit", delegate {
+            GuiProbe.WithForm(delegate(object f) {
+                // 起一轮（缺路径的那一项会很快收尾）—— 只为让界面这一轮真的有日志汇。
+                GuiProbe.Call(f, "EnqueueRetry", new object[] { MissingSourcePath("处置轮.zip"), "重试" });
+                string[] logs = (string[])GuiProbe.Call(f, "SessionLogPaths", null);
+                AssertEq(logs.Length, 1);                    // 前提自证：这一轮真的起来了（日志文件已建）
+                AssertTrue(File.Exists(logs[0]));
+
+                object summary = GuiProbe.New("Rerar.Core.RunSummary", null);
+                System.Collections.IList results = (System.Collections.IList)GuiProbe.Prop(summary, "Results");
+
+                string outerPath = MissingSourcePath("外层已完成.zip");
+                object outer = GuiProbe.NewResult(outerPath, "Completed", 3);
+                GuiProbe.SetProp(outer, "OriginalDisposition", "deleted");    // I3 已处置它的原包
+                results.Add(outer);
+
+                object inner = GuiProbe.NewResult(MissingSourcePath("嵌套失败.zip"), "Failed", 0);
+                GuiProbe.SetProp(inner, "OriginalDisposition", "kept");       // 它自己的原包按 I3 保留
+                results.Add(inner);
+
+                GuiProbe.Call(f, "FinishRun", new object[] { summary });
+                AssertFalse(IsRunning(f));
+
+                // 读**产品自己**交给日志视图的那份内容（FinishRun 里就是 _logView.SetLines(sink.Snapshot())）：
+                // 盘上那份日志文件此刻正被 LogSink 持有写句柄，而这里要断言的恰是「界面上看得见什么」。
+                // 不用 File.ReadAllText 读盘还有第二个理由：它会让用例依赖写句柄的共享模式，
+                // 那不是被测行为。
+                object sink = GuiProbe.Prop(f, "_log");
+                AssertTrue(sink != null);                     // 前提自证：这一轮确实有日志汇
+                string text = string.Join("\n", (string[])GuiProbe.Call(sink, "Snapshot", null));
+
+                AssertTrue(text.IndexOf("原包处置：", StringComparison.Ordinal) >= 0);
+                AssertTrue(text.IndexOf(outerPath, StringComparison.Ordinal) >= 0);
+                AssertTrue(text.IndexOf("已移入回收站", StringComparison.Ordinal) >= 0);
+                // 退出码非 0（嵌套成员失败）而原包已被处置 ⇒ 显式警告。
+                AssertTrue(text.IndexOf("⚠", StringComparison.Ordinal) >= 0);
+                AssertTrue(text.IndexOf("已处置 1 个原包", StringComparison.Ordinal) >= 0);
+            });
+        });
+
         // 日志行经常是完整的绝对中文路径（用户那次报障里就是），右侧一旦超出就再也读不到。
         // 这条钉住：**横向滚动条真的在控件树里**，而且就是 HScrollBar 那个类型。
         H.Run("Gui.LogTailHasAHorizontalScrollBar", delegate {
@@ -972,6 +1018,89 @@ internal sealed class MainFormTests : TestBase
                 int widest = Convert.ToInt32(GuiProbe.Prop(view, "WidestVisibleLineWidth"));
                 AssertTrue(viewport > 0);
                 AssertEq(max + viewport, widest);        // 不多不少：正好滚到最后一列
+
+                // 【本轮修复：上面那条断言看不见的东西】`max + viewport == widest` 只说明**范围算术**
+                // 自洽（它由 HViewportWidth 定义推出，改坏绘制裁剪它照样成立）。真正决定用户能不能
+                // 读到末尾的是**绘制裁剪区**：整行从 x = TextPad - 偏移 处画起，所以最右那个像素的
+                // 屏幕坐标是 TextPad + widest - 1 - max，它必须落在裁剪区之内。修复前裁剪区从 x = 0
+                // 起算，比视口少一个 TextPad（实测 4 px）—— 末尾那 4 px 永远画不出来，而上面那条断言
+                // 依旧是绿的。
+                int pad = Convert.ToInt32(GuiProbe.Prop(view, "TextPadLeft"));
+                int clipLeft = Convert.ToInt32(GuiProbe.Prop(view, "TextViewportLeft"));
+                int clipRight = clipLeft + Convert.ToInt32(GuiProbe.Prop(view, "TextViewportWidth"));
+                AssertTrue(pad + widest - 1 - max < clipRight);
+            }); });
+
+        // 【本轮修复的回归判据】最新那一行必须**整行**画得出来。
+        //
+        // 缺陷形态：VisibleLines 按完整客户区高度算（400×200、Font.Height=14、横条 17 px 时是 14 行），
+        // 而绘制只裁到横条之上（183 px）—— 14 × 14 = 196 > 183，于是最下面那一行只画得出 1 像素。
+        // 自动滚动又把视口停在尾部（first = 总数 - 可见行数），所以那一行**就是最新写下的那条日志**：
+        // 用户读到的最新一行是残缺的，而修复前 OnPaint 没有下边界裁剪，它是完整的（回归）。
+        //
+        // 【为什么判据是「可见行数 × 行高 ≤ 文本区下边界」而不是「VisibleLineCount > 0」】后者对
+        // 上面那个几何恒为真 —— 一条永远不会因为几何坏掉而变红的断言在这里等于没有。这两个数
+        // （行高、下边界）都由产品自己给出，判据是它们之间的关系，不写像素常量。
+        H.Run("Gui.LogTailNewestLineIsFullyInsideTheTextArea", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 400);
+                GuiProbe.SetProp(view, "Height", 200);
+
+                string[] lines = new string[50];
+                for (int i = 0; i < lines.Length; i++) { lines[i] = "第" + i + "行 的日志内容"; }
+                GuiProbe.Call(view, "SetLines", new object[] { lines });
+
+                int visible = Convert.ToInt32(GuiProbe.Prop(view, "VisibleLineCount"));
+                int first = Convert.ToInt32(GuiProbe.Prop(view, "FirstVisibleLine"));
+                int lineHeight = Convert.ToInt32(GuiProbe.Prop(view, "LineHeight"));
+                int textBottom = Convert.ToInt32(GuiProbe.Prop(view, "TextViewportHeight"));
+
+                AssertTrue(visible >= 2);                       // 前提自证：200px 的窗口绝不止一行
+                AssertTrue(lineHeight > 0);
+                // 自动滚动 ⇒ 视口停在尾部，于是最后一条可见行就是**最新**那条日志。
+                AssertEq(first, lines.Length - visible);
+
+                // (a) 绘制下边界真的把横滚动条排除在外（否则下面那条判据会被一个虚高的下边界假通过）。
+                int clientHeight = Convert.ToInt32(GuiProbe.PropPath(view, "ClientSize.Height"));
+                AssertTrue(textBottom < clientHeight);
+
+                // (b) 本缺陷的判据：最下面那一行的绘制下边界必须落在文本区之内。
+                AssertTrue(visible * lineHeight <= textBottom);
+            }); });
+
+        // 【本轮修复：横向的同一族缺陷】范围算术的视口与绘制裁剪必须**同一处几何**。
+        //
+        // 修复前：HViewportWidth = 客户区宽 - 竖条 - TextPad，而裁剪矩形从 x = 0 起算、宽度也是
+        // 客户区宽 - 竖条 - TextPad —— 于是裁剪区右边界比「文本最右像素」允许到达的位置少一个
+        // TextPad（实测 4 px）。400×200、偏移拉满时：textRight = 383、clipRight = 379，最宽那一行
+        // 的最后一列永远画不出来。
+        H.Run("Gui.LogTailWidestLineRightEdgeIsInsideThePaintClip", delegate {
+            GuiProbe.WithStaObject("Rerar.LogTailView", null, delegate(object view) {
+                GuiProbe.SetProp(view, "Width", 400);
+                GuiProbe.SetProp(view, "Height", 200);
+                string wide = "E:\\中国移动广东有限公司采购代理机构工作指导手册20260826(1)\\附件3：采购文件示范文本（试行）.doc";
+                GuiProbe.Call(view, "SetLines", new object[] { new string[] { "短行", wide } });
+
+                int pad = Convert.ToInt32(GuiProbe.Prop(view, "TextPadLeft"));
+                int clipLeft = Convert.ToInt32(GuiProbe.Prop(view, "TextViewportLeft"));
+                int clipRight = clipLeft + Convert.ToInt32(GuiProbe.Prop(view, "TextViewportWidth"));
+
+                int max = Convert.ToInt32(GuiProbe.Prop(view, "MaxHOffset"));
+                int widest = Convert.ToInt32(GuiProbe.Prop(view, "WidestVisibleLineWidth"));
+                AssertTrue(max > 0);                             // 前提自证：这一行真的超出了视口
+                AssertTrue(widest > clipRight - clipLeft);
+
+                // 裁剪区必须从文本的左内边距处开始（左端同理：偏移 0 时首字符从 TextPad 画起，
+                // 裁剪区从 0 起算会连带把不该画的那一列留成背景色 —— 但它不会切掉首字符，
+                // 所以这里钉的是「一处定义」，真正的缺陷判据是下面那条）。
+                AssertEq(clipLeft, pad);
+
+                GuiProbe.SetProp(view, "HOffset", max);
+                AssertEq(Convert.ToInt32(GuiProbe.Prop(view, "HOffset")), max);
+
+                // 整行从 x = pad - 偏移 画到 pad - 偏移 + widest - 1；偏移拉满时最右那个像素的
+                // 屏幕坐标就是这个值。它必须**小于**裁剪区右边界 —— 一个像素都不许被裁掉。
+                AssertTrue(pad + widest - 1 - max < clipRight);
             }); });
     }
 

@@ -148,8 +148,102 @@ internal sealed class ReporterTests : TestBase
             AssertTrue(s.Contains("未处理（已取消）"));        // 取消**绝不**与「整批中止」共用一行文案
             AssertFalse(s.Contains("\uFFFD")); });
 
+        // ==================================================================
+        // 本轮：原包处置的诚实面（汇总行 + 退出码非 0 时的警告）
+        // ==================================================================
+
+        // 处置了哪些原包、每一种处置的中文说法：用户不必去读崩溃恢复日志就能知道这次运行
+        // 究竟销毁了什么。
+        H.Run("Reporter.ListsDisposedOriginalsWithTheirDisposition", delegate {
+            ArchiveResult recycled = TestEnv.SampleResult("已回收.zip");
+            recycled.Status = ArchiveStatus.Completed;
+            recycled.OriginalDisposition = "deleted";
+
+            ArchiveResult quarantined = TestEnv.SampleResult("已隔离.rar");
+            quarantined.Status = ArchiveStatus.Completed;
+            quarantined.OriginalDisposition = "quarantined";
+
+            ArchiveResult kept = TestEnv.SampleResult("保留.7z");
+            kept.Status = ArchiveStatus.Completed;                 // 默认 = kept（没处置）
+
+            string line = Reporter.DescribeDisposedOriginals(new ArchiveResult[] { recycled, quarantined, kept });
+
+            AssertTrue(line.Contains("原包处置："));
+            AssertTrue(line.Contains("共 2 个"));                  // 只数真的被处置的那两个
+            AssertTrue(line.Contains(recycled.Path));
+            AssertTrue(line.Contains(quarantined.Path));
+            AssertTrue(line.Contains("已移入回收站"));
+            AssertTrue(line.Contains("已移入隔离文件夹"));
+            AssertFalse(line.Contains(kept.Path));                 // 没处置的原包**绝不**出现在这一行里
+
+            // 词表与崩溃恢复日志的 `original=` 逐字对应：同一件事在日志与用户可见文本里能对上。
+            AssertEq(Reporter.DispositionText("deleted"), "已移入回收站");
+            AssertEq(Reporter.DispositionText("quarantined"), "已移入隔离文件夹");
+            AssertEq(Reporter.DispositionText("kept"), "未处置（原包保留）");
+            // 未知 / 空写法一律按「原包还在」处理：这一侧绝不能把「原包还在」说成「已被销毁」。
+            AssertFalse(Reporter.IsDisposed("kept"));
+            AssertFalse(Reporter.IsDisposed(""));
+            AssertFalse(Reporter.IsDisposed(null));
+            AssertTrue(Reporter.IsDisposed("deleted"));
+            AssertTrue(Reporter.IsDisposed("quarantined"));
+        });
+
+        // 一个原包都没处置时，那一行必须**明说**「没有处置任何原包」，而不是干脆不打印：
+        // 不打印的话，「真的没处置」与「这条信息根本没实现」在用户眼里长得一样。
+        H.Run("Reporter.DisposedOriginalsLineIsExplicitWhenNothingWasDisposed", delegate {
+            ArchiveResult kept = TestEnv.SampleResult("保留.zip");
+            kept.Status = ArchiveStatus.Completed;
+
+            string line = Reporter.DescribeDisposedOriginals(new ArchiveResult[] { kept });
+            AssertTrue(line.Contains("没有处置任何原包"));
+            AssertTrue(line.Contains("原包一律保留"));
+            AssertFalse(line.Contains(kept.Path));                 // 没处置就不点名
+
+            // 空集合与 null 集合同样给出那句话（调用方不必先判空）。
+            AssertTrue(Reporter.DescribeDisposedOriginals(new ArchiveResult[0]).Contains("没有处置任何原包"));
+            AssertTrue(Reporter.DescribeDisposedOriginals(null).Contains("没有处置任何原包"));
+
+            // 处置清单为空 ⇒ 警告**绝不**出现：没有原包被处置时，退出码非 0 没有任何歧义。
+            AssertEq(Reporter.DisposedOriginalsWarning(new ArchiveResult[] { kept }, RunExitCodes.FailedOrSkipped), "");
+            AssertEq(Reporter.DisposedOriginalsWarning(new ArchiveResult[0], RunExitCodes.Fatal), "");
+            AssertEq(Reporter.DisposedOriginalsWarning(null, RunExitCodes.FailedOrSkipped), "");
+        });
+
+        // 复核复现出来的那个形状：顶层包 Completed（I3 据此把它的原包处置掉），而嵌套成员**失败**
+        // ⇒ RunExitCodes.For 返回 1。两者同时成立时，「退出码 != 0 ⇒ 什么都没被销毁」是**假的** ——
+        // 这条警告就是那句假推理的反面。
+        H.Run("Reporter.WarnsWhenAnOriginalWasDisposedAndTheExitCodeIsNotZero", delegate {
+            ArchiveResult outer = TestEnv.SampleResult("外层.zip");
+            outer.Status = ArchiveStatus.Completed;
+            outer.OriginalDisposition = "deleted";
+            outer.Layers = 2;
+
+            ArchiveResult inner = TestEnv.SampleResult("内层.zip");
+            inner.Status = ArchiveStatus.Failed;
+            inner.OriginalDisposition = "kept";                    // 它自己的原包按 I3 保留
+            inner.Layers = 1;
+
+            ArchiveResult[] results = new ArchiveResult[] { outer, inner };
+            int exitCode = RunExitCodes.For(SummaryOf(results));
+            AssertEq(exitCode, RunExitCodes.FailedOrSkipped);      // 前提自证：这次运行确实是非 0
+
+            string warning = Reporter.DisposedOriginalsWarning(results, exitCode);
+            AssertTrue(warning.Contains("⚠"));                     // 显式的警告，不是夹在正文里的一句话
+            AssertTrue(warning.Contains("退出码非 0"));
+            AssertTrue(warning.Contains("已处置 1 个原包"));         // 数量 = 清单里那几个
+            AssertTrue(warning.Contains("见上"));                   // 与上面那行清单互相指认
+            AssertTrue(warning.Contains("请核对其处置方式"));
+
+            // 退出码 0（全部成功）时没有这个歧义 ⇒ 不出警告（否则警告会因为天天出现而被无视）。
+            AssertEq(Reporter.DisposedOriginalsWarning(results, RunExitCodes.Success), "");
+
+            // 只有「没完成的那一项自己的原包被处置」时同样要警告：判据是「处置过」，
+            // 不是「处置的是哪一项」。
+            AssertTrue(Reporter.DisposedOriginalsWarning(
+                new ArchiveResult[] { outer }, RunExitCodes.FailedOrSkipped).Contains("已处置 1 个原包"));
+        });
+
         // ---- 枚举里**每一个**结局都要有自己的中文文案（漏一个就会在表里露出英文枚举名）----
-        //
         // 【Task 12 修复轮 #2 Finding 2】覆盖**必须**由 Enum.GetValues 迭代来保证。上一版把 7 个成员
         // 手写成一个数组，于是第 8 个成员 NotAttemptedFatal 静默漏过：用例仍然全绿，而英文枚举名
         // 一路走到了用户看到的表格里（CLI 的 Program.PrintSummary 打印的就是 RenderTable）。
@@ -202,6 +296,15 @@ internal sealed class ReporterTests : TestBase
                 }
             }
             AssertEq(problem, ""); });
+    }
+
+    // 一批结果 → RunSummary（只为了用**产品自己的** RunExitCodes.For 算退出码：本轮的警告
+    // 判据是「退出码非 0」，测试里自己写一个 1 就只能证明测试猜得对）。
+    private static RunSummary SummaryOf(ArchiveResult[] results)
+    {
+        RunSummary summary = new RunSummary();
+        if (results != null) { summary.Results.AddRange(results); }
+        return summary;
     }
 
     // 汇总表「结果」列（第 2 格）的文案：表格是纯文本，按分隔符 " | " 分格读**这一格**。
