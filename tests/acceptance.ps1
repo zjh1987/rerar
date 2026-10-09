@@ -542,7 +542,8 @@ $requiredFixtures = @(
     'f08-ooxml\trap.docx', 'f09-apk\trap.apk', 'f10-bomb\bomb.zip', 'f11-quine\quine.zip',
     'f12-longpath\long.zip', 'f13-symlink-tar\trav.tar', 'f14-html\fake.zip',
     'f15-zero-volume\zero.7z.002', 'f16-conflict\conflict.zip',
-    'f17-existing-target\busy.zip', 'f17-existing-target\busy', 'f18-bulk\bulk.zip'
+    'f17-existing-target\busy.zip', 'f17-existing-target\busy', 'f18-bulk\bulk.zip',
+    'f19-ole2\legacy.doc'
 )
 $missingFixtures = @($requiredFixtures | Where-Object { -not (Test-Path -LiteralPath (Fixture $_)) })
 if ($missingFixtures.Count -gt 0) {
@@ -893,6 +894,36 @@ if (-not $row.Missing) {
     Check-CommonInvariants $row $checks $true $false
 }
 Complete-Row $row 'F18 大输出量' $checks ('4000 个成员全部解出（' + $row.Cli.ElapsedMs + ' ms），子进程管道没有死锁') | Out-Null
+
+# ==================================================================
+# F19 OLE2 复合文档（.doc/.xls/.ppt/.msi 一族）：数据丢失事故回归（I4 的头部签名那一半）
+#
+# 真事故：用户的一批传统 Office 文档被判成 Unknown ⇒ 落到 7-Zip 兜底 ⇒ **7-Zip 26.01 会打开 CFB**
+#（Type = Compound，条目是 Data / 1Table / WordDocument / [5]SummaryInformation…）⇒ 看着像一次
+# 干净成功的解压 ⇒ ArchiveGater 只按 **zip 内容身份**判容器文档，CFB 里一个那样的标记都没有 ⇒
+# 一路 Allow ⇒ 文档被拆成「<名字>.doc (2)\」，开了删除就把**用户文档本身**回收掉，每一步 exit 0。
+#
+# 这一行刻意用 `--delete`：要证明的正是「删除开关打开时原件也必须活着」——那一条才是能阻止事故的断言。
+# 同时逐字节比对 SHA-256（只断言「文件还在」放得过「文件还在但被改写了」）。
+# ==================================================================
+$row = New-Row 'F19' @((Fixture 'f19-ole2\legacy.doc'))
+$checks = New-Checks
+if (-not $row.Missing) {
+    $target = Join-Path $row.Work 'legacy.doc'
+    $docBefore = Get-FileHash -LiteralPath $target -Algorithm SHA256
+    Invoke-Row $row @($target) -ExtraArguments @('--delete') | Out-Null
+    $one = Get-JsonResult $row.Json $target
+    Check $checks ($row.Cli.ExitCode -eq 1) ('退出码 ' + $row.Cli.ExitCode + '，期望 1（跳过，不是 0 也不是 2）')
+    Check $checks ($null -ne $one -and $one.status -eq 'SkippedContainer') ('OLE2 结局 ' + (Get-StatusOf $row.Json $target) + '，期望 SkippedContainer（I4：拒绝递归）')
+    Check $checks ($null -ne $one -and ([string]$one.message).Contains('OLE2')) ('判词没有说明真实原因（OLE2 复合文档）：' + $one.message)
+    Check $checks ($null -ne $one -and ([string]$one.message).Contains('不是压缩包')) ('判词没有说清「不是压缩包」：' + $one.message)
+    Check $checks (Test-Path -LiteralPath $target) '开了 --delete 之后 OLE2 原件不见了 —— 这正是那起数据丢失事故'
+    Check $checks ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $docBefore.Hash) 'OLE2 原件被改动了（必须逐字节原样）'
+    Check $checks (-not (Test-Path -LiteralPath (Join-Path $row.Work 'legacy'))) 'OLE2 被拆出了输出目录（文档被拆散）'
+    Check $checks (-not (Test-Path -LiteralPath (Join-Path $row.Work 'legacy.doc (2)'))) 'OLE2 被拆到了「legacy.doc (2)\」（事故里的输出目录名）'
+    Check-CommonInvariants $row $checks $true $true
+}
+Complete-Row $row 'F19 OLE2 复合文档' $checks ('--delete + OLE2：SkippedContainer（不递归、绝不删除）；原件 SHA-256 逐字节未变；输出根无任何残留') | Out-Null
 
 # ==================================================================
 # A04 干净环境可运行（无本机 7-Zip 时走内嵌兜底）

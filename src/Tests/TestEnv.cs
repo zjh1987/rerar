@@ -1468,6 +1468,23 @@ internal static class TestEnv
         get { return Fixture("docx.docx", BuildExtractDocx); }
     }
 
+    // 传统 OLE2/CFB 复合文档（.doc / .xls / .ppt / .msi / .msg / .vsd 一族）的**真**容器夹具：
+    // 数据丢失事故（用户文档被当成压缩包拆散、开删除后被回收）里那个形状的回归。
+    //
+    // 【为什么这一份必须手搓字节，而不是让真 7-Zip 造】7-Zip 26.01 **只能解不能造** Compound
+    //（`7z i` 的格式表里 Compound 那一行没有创建标志；实测 `7z a -tCompound out.doc x` 报不支持的格式），
+    // 所以这一族形状在「夹具一律由真打包器产生」这条规矩下**根本造不出来**。
+    // 这与 fixtures.ps1 头部第 1 条（绝不硬造 `.part1.rar`/`.z01`）**不冲突**：那条规矩针对的是
+    // **分卷语义** —— 「哪一片是权威成员、缺的是哪一卷」只有真 WinRAR 造的 rar 才能证明，手搓的假
+    // rar 只能证明「程序对着一段编出来的字节做了我编出来的那件事」。这里被测的判定依据是
+    // 「头部 8 字节等于 D0 CF 11 E0 A1 B1 1A E1」，而那 8 个字节**就是**手搓出来的全部身份；
+    // 而且下面还用 7-Zip 自己把这份手搓 CFB **真打开一次**（列得出 WordDocument / 1Table 才算数）——
+    // 于是「它是 7-Zip 眼里的 Compound 容器」是被**测量**过的，不是被假定的。自检见 BuildOle2Doc。
+    public static string Ole2Doc
+    {
+        get { return Fixture("legacy-ole2.doc", BuildOle2Doc); }
+    }
+
     // 大 .7z（约 2 MB 不可压缩内容，AES 加密、头部明文、密码 SECRET）：磁盘空间预检用例。
     // 约 2 MB 是刻意的：够大到「1024 字节可用空间」的预检必然拒绝，又不至于让整套测试变慢。
     public static string BigSevenZip
@@ -1716,6 +1733,153 @@ internal static class TestEnv
         File.WriteAllBytes(targetPath, new byte[4096]);
     }
 
+    // ------------------------------------------------------------------
+    // OLE2/CFB（[MS-CFB]）复合文档：手搓一个**真**容器（头 + FAT + 目录 + 3 条流）。
+    //
+    // 手搓的理由见 Ole2Doc 的注释。构造事实（本机 7-Zip 26.01 实测，写下来免得后人重复踩）：
+    //   * 扇区 512 字节、major version 3 ⇒ 头里 `numDirSectors` 必须是 **0**（写成 1 会被 7-Zip
+    //     判成「Headers Error」）；
+    //   * 文件必须**恰好**是 头 + 被 FAT 覆盖的那些扇区：头 + FAT + 目录 + 各条流；
+    //     在 FAT 之外多挂空闲扇区会让 7-Zip 报「Headers Error」（这也是本夹具最终定型的那一步）；
+    //   * 流长度取 4096 == mini stream cutoff ⇒ 走**普通扇区**，于是不需要 mini FAT / mini stream；
+    //   * 目录项名按 [MS-CFB] 的排序规则（先比名字长度、再比大写后的名字）排成右倾树即可被读出。
+    // ------------------------------------------------------------------
+
+    private const int CfbSectorSize = 512;
+    private const uint CfbFreeSector = 0xFFFFFFFF;
+    private const uint CfbEndOfChain = 0xFFFFFFFE;
+    private const uint CfbFatSector = 0xFFFFFFFD;
+
+    private static void BuildOle2Doc(string targetPath)
+    {
+        string[] streamNames = new string[] { "WordDocument", "1Table", "[1]CompObj" };
+        int streamBytes = 4096;
+        int sectorsPerStream = streamBytes / CfbSectorSize;                  // 8
+        int totalSectors = 2 + sectorsPerStream * streamNames.Length;        // 扇区 0 = FAT、扇区 1 = 目录
+
+        // ---- 头（512 字节）----
+        byte[] header = new byte[CfbSectorSize];
+        byte[] signature = new byte[] { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+        Array.Copy(signature, 0, header, 0, signature.Length);
+        CfbPutU16(header, 24, 0x003E);              // minor version
+        CfbPutU16(header, 26, 0x0003);              // major version 3（512 字节扇区）
+        CfbPutU16(header, 28, 0xFFFE);              // byte order mark
+        CfbPutU16(header, 30, 0x0009);              // sector shift（2^9 = 512）
+        CfbPutU16(header, 32, 0x0006);              // mini sector shift（2^6 = 64）
+        CfbPutU32(header, 40, 0);                   // v3 的目录扇区数必须是 0
+        CfbPutU32(header, 44, 1);                   // FAT 扇区数
+        CfbPutU32(header, 48, 1);                   // 目录起始扇区
+        CfbPutU32(header, 52, 0);                   // 事务签名
+        CfbPutU32(header, 56, 4096);                // mini stream cutoff
+        CfbPutU32(header, 60, CfbEndOfChain);       // 第一条 mini FAT 扇区（本夹具没有 mini 流）
+        CfbPutU32(header, 64, 0);
+        CfbPutU32(header, 68, CfbEndOfChain);       // 第一条 DIFAT 扇区（109 项以内够用）
+        CfbPutU32(header, 72, 0);
+        for (int i = 0; i < 109; i++)
+        {
+            CfbPutU32(header, 76 + i * 4, i == 0 ? (uint)0 : CfbFreeSector);
+        }
+
+        // ---- FAT（扇区 0）----
+        byte[] fat = new byte[CfbSectorSize];
+        for (int i = 0; i < CfbSectorSize / 4; i++) { CfbPutU32(fat, i * 4, CfbFreeSector); }
+        CfbPutU32(fat, 0, CfbFatSector);            // 扇区 0 就是 FAT 自己
+        CfbPutU32(fat, 4, CfbEndOfChain);           // 扇区 1 是单扇区目录
+        for (int k = 0; k < streamNames.Length; k++)
+        {
+            int start = 2 + k * sectorsPerStream;
+            for (int s = 0; s < sectorsPerStream - 1; s++)
+            {
+                CfbPutU32(fat, (start + s) * 4, (uint)(start + s + 1));
+            }
+            CfbPutU32(fat, (start + sectorsPerStream - 1) * 4, CfbEndOfChain);
+        }
+
+        // ---- 目录（扇区 1）----
+        byte[] directory = new byte[CfbSectorSize];
+        CfbSetDirEntry(directory, 0, "Root Entry", 5, 1, CfbFreeSector, CfbFreeSector, 1, CfbEndOfChain, 0);
+        for (int k = 0; k < streamNames.Length; k++)
+        {
+            uint right = (k + 1 < streamNames.Length) ? (uint)(k + 2) : CfbFreeSector;
+            CfbSetDirEntry(directory, k + 1, streamNames[k], 2, 1,
+                CfbFreeSector, right, CfbFreeSector, (uint)(2 + k * sectorsPerStream), (ulong)streamBytes);
+        }
+
+        // ---- 流数据（扇区 2 起）----
+        byte[] payload = new byte[(totalSectors - 2) * CfbSectorSize];
+        for (int i = 0; i < payload.Length; i++) { payload[i] = (byte)('0' + (i % 10)); }
+
+        byte[] file = new byte[CfbSectorSize + totalSectors * CfbSectorSize];
+        int offset = 0;
+        Array.Copy(header, 0, file, offset, header.Length); offset += header.Length;
+        Array.Copy(fat, 0, file, offset, fat.Length); offset += fat.Length;
+        Array.Copy(directory, 0, file, offset, directory.Length); offset += directory.Length;
+        Array.Copy(payload, 0, file, offset, payload.Length);
+
+        string parent = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        File.WriteAllBytes(targetPath, file);
+
+        // 自检 1：头部 8 字节必须**逐字节**等于 OLE2/CFB 魔数（这是本夹具的全部身份）。
+        byte[] head = new byte[8];
+        using (FileStream stream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            if (stream.Read(head, 0, head.Length) != head.Length)
+            {
+                throw new InvalidOperationException("Ole2Doc fixture 构造失败：读不满 8 字节的头部签名");
+            }
+        }
+        for (int i = 0; i < signature.Length; i++)
+        {
+            if (head[i] != signature[i])
+            {
+                throw new InvalidOperationException("Ole2Doc fixture 构造失败：头部第 " + i + " 字节是 0x" +
+                    head[i].ToString("X2") + "，期望 0x" + signature[i].ToString("X2"));
+            }
+        }
+
+        // 自检 2（**关键**）：让 7-Zip 自己把它当 Compound 容器打开并列出目录里的流。
+        // 少了这一步，这份夹具就只是「一段以 CFB 魔数开头的字节」—— 那样一来「强制后会被解压出来」
+        // 这条回归就变成了假通过（7-Zip 读不出清单 ⇒ 早在 I1 那一档就失败了，根本走不到拆散文档）。
+        string[] listArgs = new string[] { "l", "-slt", targetPath, "-p", "-y" };
+        RunResult listed = RunSevenZip(listArgs);
+        if (!SevenZipRunner.IsSuccess(listed.ExitCode)) { FixtureFailed("校验 Ole2Doc fixture（7-Zip 打不开）", listArgs, listed); }
+        foreach (string name in streamNames)
+        {
+            if (listed.StdOut == null || listed.StdOut.IndexOf(name, StringComparison.Ordinal) < 0)
+            {
+                throw new InvalidOperationException("Ole2Doc fixture 构造失败：7-Zip 的清单里没有流「" + name +
+                    "」；stdout=[" + Head(listed.StdOut) + "]");
+            }
+        }
+    }
+
+    private static void CfbPutU16(byte[] buffer, int offset, ushort value)
+    {
+        Array.Copy(BitConverter.GetBytes(value), 0, buffer, offset, 2);
+    }
+
+    private static void CfbPutU32(byte[] buffer, int offset, uint value)
+    {
+        Array.Copy(BitConverter.GetBytes(value), 0, buffer, offset, 4);
+    }
+
+    private static void CfbSetDirEntry(byte[] directory, int index, string name, byte type, byte color,
+        uint left, uint right, uint child, uint start, ulong size)
+    {
+        int offset = index * 128;
+        byte[] nameBytes = Encoding.Unicode.GetBytes(name);
+        Array.Copy(nameBytes, 0, directory, offset, nameBytes.Length);
+        CfbPutU16(directory, offset + 64, (ushort)(nameBytes.Length + 2));   // 名字长度含结尾的 UTF-16 NUL
+        directory[offset + 66] = type;                                       // 0=空 1=存储 2=流 5=根
+        directory[offset + 67] = color;                                      // 0=红 1=黑
+        CfbPutU32(directory, offset + 68, left);
+        CfbPutU32(directory, offset + 72, right);
+        CfbPutU32(directory, offset + 76, child);
+        CfbPutU32(directory, offset + 116, start);
+        Array.Copy(BitConverter.GetBytes(size), 0, directory, offset + 120, 8);
+    }
+
     // 条目数上限的夹具：条目数 = MaxEntriesPerArchive + 1（**刚好越界一条**，这样它也顺带钉住边界）。
     // 每条都是零长度文件：伤害不在字节（总共 0 字节，空间预检完全拦不住），而在 MFT/配额 —— 正是这条上限的理由。
     private static void BuildEntryFloodZip(string targetPath)
@@ -1837,6 +2001,14 @@ internal static class TestEnv
     public static RunSummary RunExtractForced(string archive)
     {
         return RunExtractCore(archive, null, 10, null, false, 2, archive);
+    }
+
+    // 事故现场的选项组合：「强制按压缩包尝试」+「解压成功后删除原包」同时打开。
+    // 单有其中任何一个都还不足以复现文档被销毁（强制仍会被 I4 门控拦下、删除只挂在 Completed 上），
+    // 两个一起打开才是那条**每一步 exit 0 却把用户文档销毁**的路径 —— 所以它必须被单独钉住。
+    public static RunSummary RunExtractForcedWithDelete(string archive)
+    {
+        return RunExtractCore(archive, null, 10, null, true, 2, archive);
     }
 
     // 一次 Run 跑多个目标：钉住「预检安全上限只跳过**那一个**归档、整批继续」（不是致命中止）。

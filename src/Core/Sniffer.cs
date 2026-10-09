@@ -7,10 +7,22 @@
 //   2. 文件名后缀是「下载中」→ InProgressDownload：必须早于签名表，
 //      因为没下完的文件常常已经以 PK 开头，但它此刻还不是可用的压缩包
 //      （brief 用例 Sniffer.InProgressSuffix 正是钉这一点）
-//   3. 偏移 0 的签名表（tar 的魔数在偏移 257）
+//   3. 偏移 0 的签名表（tar 的魔数在偏移 257）；OLE2/CFB 复合文档也在这张表里（见下）
 //   4. 网页陷阱（跳过前导空白、大小写不敏感）
 //   5. 尾部有 zip 结尾标记 → DamagedHeader（头部被清零/改写的「防和谐」包，审计 C4）
 //   6. 其余 → Unknown
+//
+// 【OLE2/CFB 为什么是**签名**而不是门控身份（不变式 I4 的补洞，数据丢失事故回归）】
+// 传统 Office 文档（.doc/.xls/.ppt）与 .msi/.msg/.vsd 都是 **OLE2 复合文档**，头部是
+// D0 CF 11 E0 A1 B1 1A E1 —— 不是 zip。加了这一档之前，它们的结局是：
+//   Sniffer 判 Unknown ⇒ 按设计落到 7-Zip 兜底 ⇒ **7-Zip 26.01 会打开 CFB**
+//   （`Type = Compound`，条目名是 Data / 1Table / WordDocument / [5]SummaryInformation…），
+//     看起来像一次干净成功的解压 ⇒ ArchiveGater 按**zip 内容身份**判定，而 CFB 条目里
+//     一个 zip 标记都没有 ⇒ 一路 Allow ⇒ 文档被拆散；开了「解压成功后删除原包」就把用户
+//     文档本身回收掉，而每一步都 exit 0。**这是本项目最危险的静默错误结果路径。**
+// 判定放在这里（而不是 ArchiveGater）的理由：这 8 个字节是**确定性**的，不需要清单 ——
+// 列表读不出来、7-Zip 不在、头部之后的字节全坏时，这一档照样成立；而 gater 只能看
+// ArchiveIndex 的条目名，对整族非 zip 容器结构性地**看不见**。
 //
 // C# 5 语法；源码一律 UTF-8 带 BOM。
 
@@ -19,10 +31,19 @@ using System;
 namespace Rerar.Core
 {
     // 嗅探结论。除 Unknown 外每种结论都对应一句要如实告诉用户的话（规格 §6.3）。
-    public enum SniffKind { Zip, Rar, Rar5, SevenZip, Gzip, Bzip2, Xz, Tar, Html, InProgressDownload, Empty, DamagedHeader, Unknown }
+    //
+    // Ole2 **追加在末尾**（绝不插进中间）：这是公开枚举，插队会给已有成员换号码；
+    // 没有任何地方按数值持久化它，但「加成员只往队尾加」是零成本的纪律。
+    public enum SniffKind { Zip, Rar, Rar5, SevenZip, Gzip, Bzip2, Xz, Tar, Html, InProgressDownload, Empty, DamagedHeader, Unknown, Ole2 }
 
     public static class Sniffer
     {
+        // OLE2/CFB 复合文档的头部签名（[MS-CFB]：D0 CF 11 E0 A1 B1 1A E1）。
+        // 覆盖 .doc / .xls / .ppt / .msi / .msg / .vsd 等**同一个容器族**的全部格式。
+        // 必须 8 个字节**全等**（不做前缀猜测）：只差一个字节的头部仍然要落到 Unknown，
+        // 好让 7-Zip 兜底去试 —— 「像它」不是「是它」。
+        private const string Ole2Signature = "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+
         // 「下载未完成」后缀集（brief Step 3；规格 §6.3）。含前导点，避免误伤 .part1.rar 这类分卷名。
         private static readonly string[] InProgressSuffixes = new string[]
         {
@@ -76,8 +97,14 @@ namespace Rerar.Core
 
         // 偏移 0（tar 为偏移 257）的签名表。Rar5 必须先于 Rar 判定：
         // 两者的前 7 字节完全相同，只有第 8 字节区分（\x01\x00 vs \x00）。
+        //
+        // OLE2/CFB 与这张表里其它成员**互斥**（首字节 0xD0 不属于任何一个归档族：
+        // PK=0x50、Rar=0x52、7z=0x37、gzip=0x1f、BZh=0x42、xz=0xfd、ustar=0x75），
+        // 所以它放在表里的哪个位置都不改变其它档的结论 —— 放在最前面只是让「先判最需要早收场的那一族」
+        // 读起来更直白。
         private static SniffKind MatchHeaderSignature(byte[] head)
         {
+            if (StartsWith(head, Ole2Signature)) { return SniffKind.Ole2; }
             if (StartsWith(head, "PK\x03\x04")) { return SniffKind.Zip; }
             if (StartsWith(head, "Rar!\x1a\x07\x01\x00")) { return SniffKind.Rar5; }
             if (StartsWith(head, "Rar!\x1a\x07\x00")) { return SniffKind.Rar; }

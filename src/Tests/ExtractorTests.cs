@@ -23,6 +23,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text;
@@ -721,6 +722,89 @@ internal sealed class ExtractorTests : TestBase
         });
 
         // ==================================================================
+        // OLE2/CFB 复合文档（.doc/.xls/.ppt/.msi/.msg/.vsd 一族）：数据丢失事故回归
+        //
+        // 真事故的完整形状（用户机器上实测）：
+        //   1. 这些文件是**传统 OLE2 复合文档**，头部是 D0 CF 11 E0 A1 B1 1A E1 —— 不是 zip；
+        //   2. Sniffer 的签名表里当时没有这一族，于是判 Unknown；
+        //   3. Unknown 按设计落到 7-Zip 兜底，而 **7-Zip 26.01 会打开 CFB**（`Type = Compound`，
+        //      条目名是 Data / 1Table / WordDocument / [5]SummaryInformation…），看起来像一次
+        //      干净成功的解压；
+        //   4. ArchiveGater 只按**zip 内容身份**判容器文档（[Content_Types].xml / _rels / mimetype…），
+        //      CFB 里一个这样的标记都没有 ⇒ 一路 Allow；
+        //   5. 输出目录名由归档名派生，和源文件自己撞名 ⇒ 被改名成「<名字>.doc (2)」；
+        //   6. 校验「成功」（磁盘结果与索引一致）⇒ status=Completed ⇒ 开了删除就把原文件回收。
+        //
+        // 下面 4 条用例把这一族**钉死在 Sniffer 的头部签名**这一档上（与 gater 裁定 ContainerDocument
+        // 完全同一条拒绝路径）：
+        //   * 非强制 / 强制 两条钉「结局 = SkippedContainer、零输出、原件逐字节不变」；
+        //   * 「+ 删除开关」两条钉「原件必须还在」（这正是能阻止那起事故的那条断言）。
+        // 刻意**两个方向都钉**（非强制与强制）：强制那条才是真正会复现事故的入口 —— 只有它是
+        // 「用户明确要求对这份 .doc 试一次」的那条路，也正是它必须在 I4 面前停下。
+        // ==================================================================
+
+        // 非强制：OLE2 复合文档必须走与 gater 裁定 ContainerDocument **完全相同**的收场 ——
+        // 不递归、不删除、不留输出目录，判词如实说清身份。
+        H.Run("Extract.Ole2DocIsRefusedAsContainerDocument", delegate {
+            string doc = TestEnv.Ole2Doc;
+            string before = Sha256(doc);
+
+            RunSummary s = TestEnv.RunExtract(doc);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(s.Results[0].Message.Contains("OLE2"));           // 判词点名真实原因
+            AssertEq(s.Results[0].OutputDir, "");                        // 没有输出去向
+            AssertFalse(Directory.Exists(TestEnv.OutOf(doc)));           // 连输出目录都没建
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);   // 一个字节都没写盘
+            AssertEq(Sha256(doc), before);                               // 原件逐字节不变
+        });
+
+        // 强制：**这是真正会复现事故的入口**。修复前它一路走到 Completed 并把文档的内部流
+        // 解到「legacy-ole2.doc (2)\」里；修复后必须在 I4 面前停下（与「强制一份 .docx 也照样
+        // 被门控拒绝」同一条语义：ForceTreatAsArchive 只放开**格式识别**门控，从不放开 I4）。
+        H.Run("Extract.ForcedOle2DocIsStillRefused", delegate {
+            string doc = TestEnv.Ole2Doc;
+            string before = Sha256(doc);
+
+            RunSummary s = TestEnv.RunExtractForced(doc);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(s.Results[0].Message.Contains("OLE2"));
+            AssertTrue(s.Results[0].Message.Contains("强制"));            // 用户点过的动作照样如实留痕
+            AssertEq(s.Results[0].OutputDir, "");
+            AssertFalse(Directory.Exists(TestEnv.OutOf(doc)));
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);
+            AssertEq(Sha256(doc), before);
+        });
+
+        // 删除开关打开（默认关，这里显式打开）：OLE2 原件必须还在 —— 这一条就是能阻止那起事故的断言。
+        H.Run("Extract.Ole2DocSurvivesDeleteEnabled", delegate {
+            string doc = CopyToTmp(TestEnv.Ole2Doc, "legacy-ole2-delete.doc");
+            string before = Sha256(doc);
+
+            RunSummary s = TestEnv.RunExtractWithDelete(doc);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(File.Exists(doc));                                // **原件必须还在**
+            AssertEq(Sha256(doc), before);
+            AssertFalse(Directory.Exists(TestEnv.OutOf(doc)));
+        });
+
+        // 事故现场的**完整**选项组合：强制 + 删除。修复前这一条会真的把副本回收掉
+        //（status=Completed ⇒ I3 允许删除），修复后原件逐字节留在原地。
+        H.Run("Extract.ForcedOle2DocSurvivesDeleteEnabled", delegate {
+            string doc = CopyToTmp(TestEnv.Ole2Doc, "legacy-ole2-forced-delete.doc");
+            string before = Sha256(doc);
+
+            RunSummary s = TestEnv.RunExtractForcedWithDelete(doc);
+
+            AssertEq(s.Results[0].Status, ArchiveStatus.SkippedContainer);
+            AssertTrue(File.Exists(doc));                                // **原件必须还在**
+            AssertEq(Sha256(doc), before);
+            AssertEq(Directory.GetFileSystemEntries(TestEnv.OutRoot).Length, 0);
+        });
+
+        // ==================================================================
         // 修复轮 #3（Finding 1–4）
         // ==================================================================
 
@@ -1091,6 +1175,20 @@ internal sealed class ExtractorTests : TestBase
             index.Entries.Add(entry);
         }
         return index;
+    }
+
+    // 原件的 SHA-256（十六进制小写）。用例用「运行前后哈希相等」钉住「原件逐字节未变」——
+    // 比 AssertTrue(File.Exists(...)) 强：后者放得过「文件还在但被改写了」。
+    private static string Sha256(string path)
+    {
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+        {
+            byte[] hash = sha.ComputeHash(stream);
+            StringBuilder text = new StringBuilder(hash.Length * 2);
+            foreach (byte b in hash) { text.Append(b.ToString("x2", CultureInfo.InvariantCulture)); }
+            return text.ToString();
+        }
     }
 
     private static IndexEntry Entry(string path, long size)

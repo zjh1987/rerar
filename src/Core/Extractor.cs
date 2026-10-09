@@ -130,6 +130,14 @@ namespace Rerar.Core
         private const string SentinelName = "_RERAR_INCOMPLETE.txt";
         private const string OriginalsPrefix = "_originals_";
 
+        // I4 的**头部签名**那一档（OLE2/CFB 容器文档）的判词。与 gater 的容器文档判词同一条口径：
+        // 点名身份（用户要据此知道这到底是什么文件）、点名「不是压缩包」、点名「不递归」与
+        // 「原件一律保留」。刻意**不**说「已跳过」以外的处置细节 —— 处置由状态（SkippedContainer）
+        // 决定，判词只负责说清原因。
+        private const string Ole2ContainerReason =
+            "OLE2 复合文档（.doc/.xls/.ppt/.msi 一类），不是压缩包 —— 不递归、原件一律保留" +
+            "（头部签名 D0 CF 11 E0 A1 B1 1A E1：里面的「流」是文档的内部结构，不是可解压的成员）";
+
         // 目录/文件名的尝试上限：畸形输入（例如目标名全部被占用）不得变成死循环。
         private const int MaxNameAttempts = 500;
 
@@ -461,6 +469,39 @@ namespace Rerar.Core
             // I3（失败绝不删）、I4（容器文档门控）与预检安全上限全部照旧适用（见 RunOptions 的注释）。
             bool forced = _options.IsForcedTreatAsArchive(sourcePath);
             SniffKind kind = Sniff(sourcePath);
+
+            // --- 1b) I4 的**头部签名**那一半：OLE2/CFB 复合文档（.doc/.xls/.ppt/.msi/.msg/.vsd 一族）---
+            // 【数据丢失事故回归】真事故的形状：用户的一批传统 Office 文档被判成 Unknown，按设计落到
+            // 7-Zip 兜底；**7-Zip 26.01 会打开 CFB**（`Type = Compound`，条目名是 Data / 1Table /
+            // WordDocument / [5]SummaryInformation…），看起来像一次干净成功的解压；而 ArchiveGater
+            // 只按 **zip 内容身份**认容器文档（[Content_Types].xml / _rels / mimetype …），CFB 条目里
+            // 这些标记一个都没有 ⇒ 一路 Allow ⇒ 文档被拆成「<名字>.doc (2)\」；校验「成功」⇒
+            // status=Completed ⇒ 开了删除就把**用户文档本身**回收掉，而每一步 exit 0。
+            //
+            // 【拒绝语义：与 gater 裁定 ContainerDocument **完全同一条路**】同一个
+            // Reject(SkippedContainer)，于是收场一字不差：不递归、不删除、不留输出目录。
+            // I4 的三条断言照旧全部成立，而且是**平凡**成立的：这一档在任何 7-Zip 调用（清单、暂存、
+            // 解压）之前就 return 了 —— 没有暂存树，就没有提交、没有删除、没有 reparse point 可言。
+            //
+            // 【为什么在 Sniffer 而不在 gater】头部 8 字节是确定性的，不需要清单：7-Zip 不在、
+            // 列表读不出来、头部之后全坏时这一档照样成立；gater 只能看 ArchiveIndex 的条目名，
+            // 对整族非 zip 容器结构性地看不见。（因此**不**另加 gater 规则：那既晚于这次收场、
+            // 又只能覆盖「清单恰好读得出来」的子集，是更弱的一层，加了只是重复。）
+            //
+            // 【「强制按压缩包尝试」刻意**不**覆盖它】与 gater 一致：ForceTreatAsArchive 只放开
+            // **格式识别门控**（§6.1 的逐项动作），从不放开 I4 —— 强制一份 .docx 也照样被门控拒绝。
+            // 用户确实点过强制时，判词里仍然如实留下那条记录（Reject 用 AppendMessage 追加，
+            // 绝不覆盖），免得他看到一条与自己动作对不上的记录。
+            if (kind == SniffKind.Ole2)
+            {
+                if (forced)
+                {
+                    result.Message = AppendMessage(result.Message,
+                        "已按用户要求「强制按压缩包尝试」（跳过格式识别门控：" + DescribeKind(kind) + "）");
+                }
+                return Reject(result, ArchiveStatus.SkippedContainer, Ole2ContainerReason);
+            }
+
             if (!IsArchiveKind(kind))
             {
                 if (!forced)
@@ -1810,6 +1851,7 @@ namespace Rerar.Core
                 case SniffKind.Html: return "这是网页";
                 case SniffKind.Empty: return "0 字节";
                 case SniffKind.InProgressDownload: return "下载未完成";
+                case SniffKind.Ole2: return "OLE2 复合文档";
                 default: return kind.ToString();
             }
         }

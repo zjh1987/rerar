@@ -1,7 +1,7 @@
 ﻿# Rerar 验收脚本（Task 15）之一：构造规格 §9.1 的 fixture 矩阵。
 #
 # 用法：powershell -NoProfile -File tests\fixtures.ps1
-#   退出 0 = 18 个 fixture 全部构造完成，且**每一个的形状自检**都通过；
+#   退出 0 = 19 个 fixture 全部构造完成，且**每一个的形状自检**都通过；
 #   退出 1 = 任一 fixture 构造或自检失败（中文说明，绝不静默跳过）。
 #
 # 【为什么必须有形状自检】本项目有一条已裁定的教训：Task 2 的 Sniffer 单测是**照着实现的常量**写的，
@@ -24,6 +24,10 @@
 #      `/e/...` 绝对形式，而穿越测试要的是**相对**目标（`..\..\escape-target`），所以打完之后把
 #      linkname 字段原地改成相对路径并重算校验和 —— 再让 tar 自己读回来验证，才算改对了。
 #   5) MSYS tar **拒绝 `C:\` 形式的绝对路径**（它把 `C:` 当成远程主机），所以一律用**相对路径 + 工作目录**。
+#   6) 7-Zip 26.01 **只能解不能造** Compound（OLE2/CFB）形状：`7z i` 的格式表里 Compound 那一行
+#      没有创建标志，实测 `7z a -tCompound out.doc x` 报不支持的格式。所以 fixture 19 的 CFB
+#      只能**手搓字节**（见该节的说明：第 1 条「绝不硬造」的规矩针对的是**分卷语义**，
+#      而这一份的身份就是那 8 个签名字节，且下面让 7-Zip 自己把它打开来**测量**这一点）。
 #
 # 【安全边界】本脚本只写 tests\_fixtures\ 下的东西，不删任何别处的文件，不提权，不碰注册表 / 回收站。
 
@@ -701,6 +705,132 @@ Assert-True ($entries.Count -eq $bulkCount) ("F18: 自检失败：条目数是 "
 Note 'F18' '大输出量' ($bulkCount.ToString() + " 个成员（每个约 1 KB）；自检：7-Zip 列出的条目数恰好 " + $bulkCount)
 
 # ==================================================================
+# 19) OLE2/CFB 复合文档：真 .doc/.xls/.ppt/.msi 一族的容器形状（数据丢失事故回归）
+#
+# 【为什么这一份必须手搓字节】7-Zip 26.01 只能**解**不能**造** Compound（见文件头第 6 条），
+# 所以「夹具一律由真打包器产生」这条规矩对这一族根本执行不了。
+# 这与文件头第 1 条（绝不硬造 .part1.rar / .z01）**不冲突**，两者的差别是**证明力**：
+#   * 假 rar 证明不了任何事 —— 分卷语义（哪一片权威、缺哪一卷）只有真 WinRAR 造的包才携带；
+#   * 这一份被测的判定依据**就是**头部 8 字节 D0 CF 11 E0 A1 B1 1A E1，而那 8 个字节正是
+#     手搓出来的全部身份；并且下面第 2 条自检让 **7-Zip 自己**把这份手搓容器真打开一次
+#     （列得出 WordDocument / 1Table / [1]CompObj 才算数）—— 于是「它是 7-Zip 眼里的
+#     Compound 容器、它的条目会被当成可解压成员」是**测量**出来的，不是假定的。
+# 换句话说：这里不是「用手搓的东西假装有真工具的证明力」，而是「手搓就是这一族唯一的构造方式，
+# 再用真工具把它的形状复核一遍」。
+#
+# 手搓时的构造事实（本机 7-Zip 26.01 实测，写下来免得后人重复踩）：
+#   * 扇区 512 字节、major version 3 ⇒ 头里 `numDirSectors` 必须是 **0**（写 1 => Headers Error）；
+#   * 文件必须**恰好**是 头 + 被 FAT 覆盖的那些扇区：头 + FAT + 目录 + 各条流；
+#     在 FAT 之外多挂空闲扇区会让 7-Zip 报 Headers Error（这是定型前的最后一步）；
+#   * 流长度取 4096 == mini stream cutoff ⇒ 走普通扇区，于是不需要 mini FAT / mini stream；
+#   * 目录项名按 [MS-CFB] 的排序规则（先比名字长度、再比大写后的名字）排成右倾树即可被读出。
+# ==================================================================
+$f19 = New-FixtureDir 'f19-ole2'
+$ole2Path = Join-Path $f19 'legacy.doc'
+
+$cfbSectorSize = 512
+$cfbFreeSector = [uint32]'0xFFFFFFFF'
+$cfbEndOfChain = [uint32]'0xFFFFFFFE'
+$cfbFatSector = [uint32]'0xFFFFFFFD'
+
+function Set-CfbU16([byte[]]$buffer, [int]$offset, [uint16]$value) {
+    [Array]::Copy([BitConverter]::GetBytes($value), 0, $buffer, $offset, 2)
+}
+function Set-CfbU32([byte[]]$buffer, [int]$offset, [uint32]$value) {
+    [Array]::Copy([BitConverter]::GetBytes($value), 0, $buffer, $offset, 4)
+}
+function Set-CfbDirEntry([byte[]]$buffer, [int]$index, [string]$name, [byte]$type, [byte]$color,
+                         [uint32]$left, [uint32]$right, [uint32]$child, [uint32]$start, [uint64]$size) {
+    $offset = $index * 128
+    $nameBytes = [System.Text.Encoding]::Unicode.GetBytes($name)
+    [Array]::Copy($nameBytes, 0, $buffer, $offset, $nameBytes.Length)
+    Set-CfbU16 $buffer ($offset + 64) ([uint16]($nameBytes.Length + 2))   # 名字长度含结尾的 UTF-16 NUL
+    $buffer[$offset + 66] = $type                                        # 0=空 1=存储 2=流 5=根
+    $buffer[$offset + 67] = $color                                       # 0=红 1=黑
+    Set-CfbU32 $buffer ($offset + 68) $left
+    Set-CfbU32 $buffer ($offset + 72) $right
+    Set-CfbU32 $buffer ($offset + 76) $child
+    Set-CfbU32 $buffer ($offset + 116) $start
+    [Array]::Copy([BitConverter]::GetBytes($size), 0, $buffer, $offset + 120, 8)
+}
+
+$cfbStreams = @('WordDocument', '1Table', '[1]CompObj')
+$cfbStreamBytes = 4096
+$cfbSectorsPerStream = $cfbStreamBytes / $cfbSectorSize                 # 8
+$cfbTotalSectors = 2 + $cfbSectorsPerStream * $cfbStreams.Count          # 扇区 0 = FAT、扇区 1 = 目录
+
+# ---- 头（512 字节）----
+$cfbHeader = New-Object byte[] $cfbSectorSize
+[Array]::Copy([byte[]](0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1), 0, $cfbHeader, 0, 8)
+Set-CfbU16 $cfbHeader 24 ([uint16]0x003E)          # minor version
+Set-CfbU16 $cfbHeader 26 ([uint16]0x0003)          # major version 3（512 字节扇区）
+Set-CfbU16 $cfbHeader 28 ([uint16]0xFFFE)          # byte order mark
+Set-CfbU16 $cfbHeader 30 ([uint16]0x0009)          # sector shift（2^9 = 512）
+Set-CfbU16 $cfbHeader 32 ([uint16]0x0006)          # mini sector shift（2^6 = 64）
+Set-CfbU32 $cfbHeader 40 ([uint32]0)               # v3 的目录扇区数必须是 0
+Set-CfbU32 $cfbHeader 44 ([uint32]1)               # FAT 扇区数
+Set-CfbU32 $cfbHeader 48 ([uint32]1)               # 目录起始扇区
+Set-CfbU32 $cfbHeader 52 ([uint32]0)               # 事务签名
+Set-CfbU32 $cfbHeader 56 ([uint32]4096)            # mini stream cutoff
+Set-CfbU32 $cfbHeader 60 $cfbEndOfChain            # 第一条 mini FAT 扇区（本夹具没有 mini 流）
+Set-CfbU32 $cfbHeader 64 ([uint32]0)
+Set-CfbU32 $cfbHeader 68 $cfbEndOfChain            # 第一条 DIFAT 扇区（109 项以内够用）
+Set-CfbU32 $cfbHeader 72 ([uint32]0)
+for ($i = 0; $i -lt 109; $i++) {
+    Set-CfbU32 $cfbHeader (76 + $i * 4) $(if ($i -eq 0) { [uint32]0 } else { $cfbFreeSector })
+}
+
+# ---- FAT（扇区 0）----
+$cfbFat = New-Object byte[] $cfbSectorSize
+for ($i = 0; $i -lt 128; $i++) { Set-CfbU32 $cfbFat ($i * 4) $cfbFreeSector }
+Set-CfbU32 $cfbFat 0 $cfbFatSector                 # 扇区 0 就是 FAT 自己
+Set-CfbU32 $cfbFat 4 $cfbEndOfChain                # 扇区 1 是单扇区目录
+for ($k = 0; $k -lt $cfbStreams.Count; $k++) {
+    $start = 2 + $k * $cfbSectorsPerStream
+    for ($s = 0; $s -lt $cfbSectorsPerStream - 1; $s++) {
+        Set-CfbU32 $cfbFat (($start + $s) * 4) ([uint32]($start + $s + 1))
+    }
+    Set-CfbU32 $cfbFat (($start + $cfbSectorsPerStream - 1) * 4) $cfbEndOfChain
+}
+
+# ---- 目录（扇区 1）----
+$cfbDir = New-Object byte[] $cfbSectorSize
+Set-CfbDirEntry $cfbDir 0 'Root Entry' 5 1 $cfbFreeSector $cfbFreeSector ([uint32]1) $cfbEndOfChain ([uint64]0)
+for ($k = 0; $k -lt $cfbStreams.Count; $k++) {
+    $cfbRight = if ($k + 1 -lt $cfbStreams.Count) { [uint32]($k + 2) } else { $cfbFreeSector }
+    Set-CfbDirEntry $cfbDir ($k + 1) $cfbStreams[$k] 2 1 $cfbFreeSector $cfbRight $cfbFreeSector `
+        ([uint32](2 + $k * $cfbSectorsPerStream)) ([uint64]$cfbStreamBytes)
+}
+
+# ---- 流数据（扇区 2 起）----
+$cfbPayload = New-Object byte[] (($cfbTotalSectors - 2) * $cfbSectorSize)
+for ($i = 0; $i -lt $cfbPayload.Length; $i++) { $cfbPayload[$i] = [byte](0x30 + ($i % 10)) }
+
+$cfbAll = New-Object System.Collections.Generic.List[byte]
+$cfbAll.AddRange($cfbHeader); $cfbAll.AddRange($cfbFat); $cfbAll.AddRange($cfbDir); $cfbAll.AddRange($cfbPayload)
+[System.IO.File]::WriteAllBytes($ole2Path, $cfbAll.ToArray())
+
+# 自检 1：头部 8 字节逐字节等于 OLE2/CFB 魔数 —— 这是这份夹具的**全部身份**。
+$cfbHead = Get-FirstBytes $ole2Path 8
+Assert-True ($cfbHead[0] -eq 0xD0 -and $cfbHead[1] -eq 0xCF -and $cfbHead[2] -eq 0x11 -and $cfbHead[3] -eq 0xE0 -and
+             $cfbHead[4] -eq 0xA1 -and $cfbHead[5] -eq 0xB1 -and $cfbHead[6] -eq 0x1A -and $cfbHead[7] -eq 0xE1) `
+    'F19: 自检失败：头部不是 OLE2/CFB 签名 D0 CF 11 E0 A1 B1 1A E1'
+
+# 自检 2（**关键**）：让 7-Zip 自己把它当 Compound 容器打开，并列出目录里的流。
+# 少了这一条，这份夹具就只是「一段以 CFB 魔数开头的字节」—— 那样「被强制后会真的被解压出来」
+# 这条回归就变成假通过（7-Zip 读不出清单 ⇒ 早在 I1 那一档就失败了）。
+$cfbListing = Invoke-SevenZip @('l', '-slt', '-p', $ole2Path)
+Assert-True ($cfbListing.Code -eq 0) ("F19: 自检失败：7-Zip 打不开这份 CFB（退出码 " + $cfbListing.Code + "）：" + $cfbListing.Out)
+Assert-True ($cfbListing.Out -like '*Type = Compound*') ("F19: 自检失败：7-Zip 没把它识别成 Compound 容器：" + $cfbListing.Out)
+foreach ($cfbName in $cfbStreams) {
+    # 用 .Contains 而不是 -like：流名 `[1]CompObj` 里的方括号在 PowerShell 的 -like 里是**通配符**
+    #（`[1]` 匹配单个字符 '1'），拿它当模式会假失败 —— 这里要的是字面子串匹配。
+    Assert-True ($cfbListing.Out.Contains($cfbName)) ("F19: 自检失败：7-Zip 的清单里没有流「" + $cfbName + "」")
+}
+Note 'F19' 'OLE2 复合文档' ("手搓的真 [MS-CFB] 容器（头 + FAT + 目录 + " + $cfbStreams.Count + " 条 4096 字节的流）；" +
+    "自检：头部 8 字节是 OLE2 魔数，且 7-Zip 自己把它列出为 Type = Compound 并给出 " + ($cfbStreams -join '/'))
+
+# ==================================================================
 # 汇总
 # ==================================================================
 
@@ -710,8 +840,8 @@ foreach ($row in $script:Rows) {
     Write-Host ("  " + $row.Id + "  " + $row.Name.PadRight(18) + $row.Detail)
 }
 Write-Host ''
-if ($script:Rows.Count -ne 18) {
-    Fail ("夹具数不是 18，而是 " + $script:Rows.Count + "（规格 §9.1 要求 18 个）")
+if ($script:Rows.Count -ne 19) {
+    Fail ("夹具数不是 19，而是 " + $script:Rows.Count + "（规格 §9.1 的 18 个 + 本轮 OLE2 事故回归的 1 个）")
 }
-Write-Host ("FIXTURES_OK " + $script:Rows.Count + "/18（每个都做了形状自检；没有任何一个被静默跳过）")
+Write-Host ("FIXTURES_OK " + $script:Rows.Count + "/19（每个都做了形状自检；没有任何一个被静默跳过）")
 exit 0
