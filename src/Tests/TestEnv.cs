@@ -1088,8 +1088,12 @@ internal static class TestEnv
         {
             foreach (string rawDir in pathEnv.Split(';'))
             {
-                string dir = rawDir.Trim();
+                // PATH 上允许带引号的条目（`"C:\some dir"` 是合法写法），先剥引号再用；
+                // 剥完仍含非法路径字符的条目直接跳过 —— 绝不能让一个无关条目把整轮测试炸掉
+                //（.NET Framework 的 Path.Combine 会校验非法字符并抛 ArgumentException）。
+                string dir = rawDir.Trim().Trim('"').Trim();
                 if (dir.Length == 0) { continue; }
+                if (dir.IndexOfAny(Path.GetInvalidPathChars()) >= 0) { continue; }
                 string candidate = Path.Combine(dir, "tar.exe");
                 if (File.Exists(candidate)) { return candidate; }
                 tried.Add(candidate);
@@ -1386,6 +1390,11 @@ internal static class TestEnv
     {
         List<string> candidates = new List<string>();
 
+        // 与 build\build.ps1 / tests\fixtures.ps1 同款的环境变量覆盖：没装 7-Zip 的机器上
+        // 把一份解压出来的 7-Zip 目录指过来即可（CI / 便携工作流的正规用法）。
+        string rerar7zDir = Environment.GetEnvironmentVariable("RERAR_7Z_DIR");
+        if (!string.IsNullOrEmpty(rerar7zDir)) { candidates.Add(Path.Combine(rerar7zDir, "7z.exe")); }
+
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
         if (programFiles.Length > 0) { candidates.Add(Path.Combine(programFiles, @"7-Zip\7z.exe")); }
 
@@ -1411,8 +1420,12 @@ internal static class TestEnv
         {
             foreach (string rawDir in pathEnv.Split(';'))
             {
-                string dir = rawDir.Trim();
+                // PATH 上允许带引号的条目（`"C:\some dir"` 是合法写法），先剥引号再用；
+                // 剥完仍含非法路径字符的条目直接跳过 —— 绝不能让一个无关条目把整轮测试炸掉
+                //（.NET Framework 的 Path.Combine 会校验非法字符并抛 ArgumentException）。
+                string dir = rawDir.Trim().Trim('"').Trim();
                 if (dir.Length == 0) { continue; }
+                if (dir.IndexOfAny(Path.GetInvalidPathChars()) >= 0) { continue; }
                 string candidate = Path.Combine(dir, "7z.exe");
                 if (File.Exists(candidate)) { return candidate; }
                 tried.Add(candidate);

@@ -25,6 +25,13 @@
 #      CS1565 禁 /win32res: + /win32icon:），一份 .res 是唯一的合流办法。
 # 两者与 /resource: 同一条规矩：**只给应用目标**（见 $appSwitches 处的说明）；测试目标一概不带
 # —— 用例 Package.VersionInfoInAppTargetOnly / Package.IconInAppTargetOnly 扫产物字节把这事钉死。
+#
+# -Version：发布版本号（默认 0.0.0.0，与历史行为一致）。同一字符串同时传给 make-res.ps1（写进
+# VERSIONINFO 资源）与生成的 EmbeddedEngine.g.cs（[assembly: AssemblyVersion] 特性）——
+# in-box csc 没有 /version: 开关（那是 Roslyn 的），程序集版本只能靠特性；而
+# Package.VersionInfoMatchesAssembly 要求两边逐字一致，故必须同源。发布 Release 时传 4 段式
+# 版本，如 -Version 0.1.0.0。
+param([string]$Version = '0.0.0.0')
 
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -153,6 +160,7 @@ $generatedLines = @(
     '// 内嵌 7-Zip 载荷的**期望 SHA-256**：运行期每次释放/使用前都拿它校验盘上那份实际文件，',
     '// 于是「被 AV 隔离、被截断、被替换」会当场暴露，而不是悄悄跑一个未经验证的二进制。',
     '// 值来自构建时真正被 /resource: 嵌进去的那两个文件。',
+    ('[assembly: System.Reflection.AssemblyVersion("' + $Version + '")]'),
     'namespace Rerar.Core',
     '{',
     '    public static partial class EngineLocator',
@@ -268,7 +276,7 @@ if (-not (Test-Path -LiteralPath $makeResScript)) {
 }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $makeResScript `
     -OutPath (Join-Path $root $resRelative) -ManifestPath (Join-Path $root $manifestRelative) `
-    -IconPath (Join-Path $root $iconRelative)
+    -IconPath (Join-Path $root $iconRelative) -Version $Version
 $resCode = $LASTEXITCODE
 if ($resCode -ne 0) {
     Fail ("build\make-res.ps1 退出码 " + $resCode + "：版本资源没能生成，构建失败")

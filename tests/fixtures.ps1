@@ -546,9 +546,19 @@ Note 'F12' '深嵌套长路径' ("单条目 " + $longName.Length + " 字符 / 20
 $f13 = New-FixtureDir 'f13-symlink-tar'
 $escapeTarget = Join-Path $f13 'escape-target'
 Ensure-Dir $escapeTarget
+# GNU tar 位置：默认装在 C:\Program Files\Git；Git 在 PATH 上时从 git.exe 反推
+# （<git>\cmd\git.exe → <git>\usr\bin\tar.exe，覆盖便携版 / 非标准盘符的安装）。
 $tarExe = 'C:\Program Files\Git\usr\bin\tar.exe'
 if (-not (Test-Path -LiteralPath $tarExe)) {
-    Fail ("F13 无法构造：找不到 GNU tar（" + $tarExe + "）。tar 软链 fixture 只能用真 tar 造，" +
+    $gitExe = (Get-Command git.exe -ErrorAction SilentlyContinue).Source
+    if ($gitExe) {
+        $gitRoot = Split-Path -Parent (Split-Path -Parent $gitExe)   # ...\git\cmd\git.exe → ...\git
+        $nearbyTar = Join-Path $gitRoot 'usr\bin\tar.exe'
+        if (Test-Path -LiteralPath $nearbyTar) { $tarExe = $nearbyTar }
+    }
+}
+if (-not (Test-Path -LiteralPath $tarExe)) {
+    Fail ("F13 无法构造：找不到 GNU tar（试过 C:\Program Files\Git\usr\bin\tar.exe 与 PATH 上 git.exe 同源的 usr\bin\tar.exe）。tar 软链 fixture 只能用真 tar 造，" +
           "绝不用手拼字节凑一个「看起来像」的 tar（那证明不了 7-Zip 会怎么处理它）。" +
           "请安装 Git for Windows（含 usr\bin\tar.exe）。")
 }
